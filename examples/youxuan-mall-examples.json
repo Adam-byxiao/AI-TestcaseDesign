@@ -1,0 +1,151 @@
+[
+  {
+    "module": "AUTH",
+    "title": "账号体系：登录/停用拦截/输入校验",
+    "keywords": ["登录", "注册", "手机号", "密码", "停用", "账号", "校验", "拦截"],
+    "requirement": "手机号+密码登录；错误密码/未注册手机号给出明确提示；停用账号登录被拦截；非法手机号被前端校验拦截；登录成功跳转首页。",
+    "design_logic": "主链路（登录成功）为 P0 必带 @smoke；反向（错误密码/未注册）用「可见性 + 文案」双层断言；账号状态（停用）是状态类重点，断言文案兼容「停用|不可用」；非法输入走前端校验层，不与账号库交互。",
+    "cases": [
+      {
+        "id": "TC-AUTH-LOGIN-001",
+        "design_method": "场景法",
+        "module": "AUTH",
+        "subModule": "LOGIN",
+        "title": "正确凭据登录成功并跳转首页",
+        "priority": "P0",
+        "tags": ["@smoke", "@auth"],
+        "requirement": ["REQ-AUTH-002"],
+        "preconditions": ["系统中存在 normal 状态账号"],
+        "testData": {"phone": "13800138000", "password": "123456"},
+        "steps": [
+          {"action": "goto", "target": "/login", "data": ""},
+          {"action": "fill", "target": "手机号输入框", "data": "13800138000"},
+          {"action": "fill", "target": "密码输入框", "data": "123456"},
+          {"action": "click", "target": "登录按钮", "data": ""},
+          {"action": "expectUrl", "target": "/", "data": ""},
+          {"action": "expectText", "target": "导航栏用户昵称", "data": "优选体验官"}
+        ],
+        "expected": ["登录成功后跳转首页", "导航栏显示当前用户昵称"]
+      },
+      {
+        "id": "TC-AUTH-LOGIN-004",
+        "design_method": "状态迁移",
+        "module": "AUTH",
+        "subModule": "LOGIN",
+        "title": "停用账号登录被拦截",
+        "priority": "P0",
+        "tags": ["@smoke", "@auth"],
+        "requirement": ["REQ-AUTH-003"],
+        "preconditions": ["存在 disabled 状态账号"],
+        "testData": {"phone": "13700137000", "password": "123456"},
+        "steps": [
+          {"action": "goto", "target": "/login", "data": ""},
+          {"action": "fill", "target": "手机号输入框", "data": "13700137000"},
+          {"action": "fill", "target": "密码输入框", "data": "123456"},
+          {"action": "click", "target": "登录按钮", "data": ""},
+          {"action": "expectVisible", "target": "账号级错误提示", "data": ""},
+          {"action": "expectText", "target": "账号级错误提示", "data": "停用或不可用"}
+        ],
+        "expected": ["停用账号登录被拒绝并提示账号不可用", "不进入登录态"]
+      }
+    ]
+  },
+  {
+    "module": "CART",
+    "title": "购物车：数量联动与状态变更",
+    "keywords": ["购物车", "数量", "加购", "小计", "合计", "删除", "勾选", "空态"],
+    "requirement": "加购后购物车行展示商品/规格/单价/数量/小计；数量修改小计合计联动；删除单项后展示空态；未登录点结算跳登录。",
+    "design_logic": "金额联动断言要等异步商品加载完成（有 loading 态）；数量断言用输入框 value 而非文本；删除后必须断言空态文案；结算入口要覆盖「未登录 → 登录 → 回结算」完整跳转链。",
+    "cases": [
+      {
+        "id": "TC-CART-001",
+        "design_method": "边界值分析",
+        "module": "CART",
+        "title": "购物车展示加购商品并修改数量",
+        "priority": "P0",
+        "tags": ["@smoke", "@cart"],
+        "requirement": ["REQ-CART-001", "REQ-CART-002"],
+        "preconditions": ["购物车已有 1 件商品"],
+        "testData": {"productId": "p1001"},
+        "steps": [
+          {"action": "goto", "target": "/product/p1001", "data": ""},
+          {"action": "click", "target": "规格 颜色 曜石黑", "data": ""},
+          {"action": "click", "target": "规格 版本 8GB+128GB", "data": ""},
+          {"action": "click", "target": "加入购物车", "data": ""},
+          {"action": "goto", "target": "/cart", "data": ""},
+          {"action": "click", "target": "数量加", "data": ""},
+          {"action": "expectText", "target": "数量输入", "data": "2"},
+          {"action": "expectText", "target": "已选数量", "data": "2"}
+        ],
+        "expected": ["数量 1→2", "小计与合计联动更新"]
+      },
+      {
+        "id": "TC-CART-004",
+        "design_method": "场景法",
+        "module": "CART",
+        "title": "删除购物车单项后展示空态",
+        "priority": "P1",
+        "tags": ["@regression", "@cart"],
+        "requirement": ["REQ-CART-004"],
+        "preconditions": ["购物车已有 1 件商品"],
+        "testData": {"productId": "p1001"},
+        "steps": [
+          {"action": "goto", "target": "/cart", "data": ""},
+          {"action": "click", "target": "删除行", "data": ""},
+          {"action": "expectVisible", "target": "空态", "data": ""},
+          {"action": "expectText", "target": "空态", "data": "购物车是空的"}
+        ],
+        "expected": ["删除最后一行后展示空态", "合计归零"]
+      }
+    ]
+  },
+  {
+    "module": "CHECKOUT",
+    "title": "结算：金额计算与优惠券边界",
+    "keywords": ["结算", "金额", "运费", "优惠券", "满减", "门槛", "应付", "提交订单"],
+    "requirement": "应付总额=Σ小计+运费−优惠券抵扣；标准配送免运费、次日达运费10元；优惠券满100减20，不满足门槛不可用；提交订单成功跳转订单成功页。",
+    "design_logic": "金额用例必须给精确预期值（含千分位格式 ¥4,727.05）；优惠券要覆盖门槛临界（≥100 可用 / <100 不可用）；提交前等待商品异步加载完成（加载期间提交被静默忽略）；金额断言含优惠展示的负号格式。",
+    "cases": [
+      {
+        "id": "TC-CHECKOUT-005",
+        "design_method": "边界值分析",
+        "module": "CHECKOUT",
+        "title": "应付金额计算正确（小计+运费−抵扣）",
+        "priority": "P0",
+        "tags": ["@smoke", "@checkout"],
+        "requirement": ["REQ-CHECKOUT-004"],
+        "preconditions": ["已登录；购物车 1 件 p1001（4727.05）"],
+        "testData": {"subtotal": 4727.05, "shipping": 0, "discount": 20, "expectedTotal": 4707.05},
+        "steps": [
+          {"action": "goto", "target": "/checkout", "data": ""},
+          {"action": "expectText", "target": "商品小计", "data": "¥4,727.05"},
+          {"action": "expectText", "target": "运费", "data": "免运费"},
+          {"action": "click", "target": "优惠券展开", "data": ""},
+          {"action": "click", "target": "优惠券", "data": ""},
+          {"action": "expectText", "target": "优惠抵扣", "data": "¥20.00"},
+          {"action": "expectText", "target": "应付总额", "data": "¥4,707.05"}
+        ],
+        "expected": ["应付 = 4727.05 + 0 − 20 = 4707.05", "金额保留 2 位小数"]
+      },
+      {
+        "id": "TC-CHECKOUT-006",
+        "design_method": "场景法",
+        "module": "CHECKOUT",
+        "title": "提交订单成功跳转订单成功页",
+        "priority": "P0",
+        "tags": ["@smoke", "@checkout"],
+        "requirement": ["REQ-CHECKOUT-005"],
+        "preconditions": ["已登录；购物车已有商品；默认地址可用"],
+        "testData": {"productId": "p1001"},
+        "steps": [
+          {"action": "goto", "target": "/checkout", "data": ""},
+          {"action": "click", "target": "提交订单", "data": ""},
+          {"action": "expectUrl", "target": "/order-success", "data": ""},
+          {"action": "expectVisible", "target": "订单成功面板", "data": ""},
+          {"action": "expectVisible", "target": "订单号", "data": ""}
+        ],
+        "expected": ["提交成功跳转订单成功页", "展示订单号与应付金额"]
+      }
+    ]
+  }
+]

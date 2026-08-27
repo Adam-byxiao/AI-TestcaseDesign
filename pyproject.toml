@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prd2tc"
+version = "0.1.0"
+description = "PRD → 测试方案 → 测试用例：独立的大模型驱动的测试用例生成 CLI（DeepSeek API，零第三方依赖）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AiWebTestCenter" }]
+keywords = ["testing", "prd", "test-case", "llm", "playwright"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.scripts]
+prd2tc = "prd2tc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+prd2tc = ["assets/prompts/*.md", "assets/templates/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
