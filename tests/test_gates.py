@@ -105,6 +105,7 @@ def test_generate_with_feedback_retries():
     )
     assert errors == []
     assert len(fake.calls) == 2
+    assert result.gate_retries == 1
     # 第二次调用的 user 消息包含门禁反馈
     assert "门禁反馈" in fake.calls[1]
     assert "缺少必备章节" in fake.calls[1]
@@ -124,3 +125,64 @@ def test_generate_with_feedback_gives_up():
     )
     assert errors  # 最终仍失败
     assert len(fake.calls) == 3  # 1 次原始 + 2 次重试
+    assert result.gate_retries == 2
+
+
+def test_analysis_gate_supports_dynamic_module_with_underscore():
+    text = GOOD_ANALYSIS + "\nREQ-CRM_CORE-001"
+    assert not any("REQ-CRM_CORE-001" in error for error in gates.check_analysis(
+        text, "REQ-CRM_CORE-001 客户管理"))
+
+
+def test_generate_with_feedback_truncation_diagnosis():
+    """输出被长度截断（finish_reason=length）时，错误清单必须带诊断提示。"""
+
+    class _TruncatedLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, cfg, user_text: str, **kwargs):
+            self.calls += 1
+            return LLMResult(content="只有需求点明细", model="fake", finish_reason="length")
+
+    fake = _TruncatedLLM()
+    cfg = Config(api_key="k", api_base="https://x", model="m", temperature=0.4, timeout=10, max_retries=1)
+    content, result, errors = stages.generate_with_feedback(
+        cfg,
+        lambda fb: stages.build_stage_2_user("分析", feedback=fb),
+        gates.check_plan,
+        llm=fake,
+        max_retries=0,
+        label="测试",
+    )
+    assert any("截断" in e for e in errors), "截断诊断必须出现在错误清单"
+    assert any("缺少必备章节" in e for e in errors), "原始门禁错误仍需保留"
+
+
+def test_generate_with_feedback_accumulates_retry_tokens():
+    """token 统计应累积所有调用（含失败重试），而不是只记最后一次。"""
+
+    class _RetryLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, cfg, user_text: str, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResult(content="只有需求点明细", model="fake",
+                                 prompt_tokens=100, completion_tokens=50)
+            return LLMResult(content=GOOD_PLAN, model="fake",
+                             prompt_tokens=80, completion_tokens=40)
+
+    fake = _RetryLLM()
+    cfg = Config(api_key="k", api_base="https://x", model="m", temperature=0.4, timeout=10, max_retries=1)
+    content, result, errors = stages.generate_with_feedback(
+        cfg,
+        lambda fb: stages.build_stage_2_user("分析", feedback=fb),
+        gates.check_plan,
+        llm=fake,
+        max_retries=1,
+        label="测试",
+    )
+    assert errors == []
+    assert result.total_tokens == 100 + 50 + 80 + 40, "应包含第一次失败调用的 token"

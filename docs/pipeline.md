@@ -69,6 +69,10 @@
 - 目录：`output/<product>/<version>/{analysis,plan,cases}/`。
 - 用例 JSON 的字段与取值枚举以 `docs/case-template.md` 为准，脚本 `validate` 强校验。
 - `orchestrate.mjs init` 生成目录与 `manifest.json` 骨架。
+- `analysis/requirements.json` 是结构化需求事实源，`cases/traceability.json` 保存 REQ↔TC 双向追踪矩阵。
+- `run-manifest.json` 是运行清单事实源；`manifest.json` 仅作为旧版本兼容副本同步维护。
+- LLM 通过统一 `LLMClient` 接口接入 `openai`、`anthropic`、`ollama`；核心使用标准库 HTTP，不强制安装第三方 SDK。
+- `run-manifest.json` 保存本次运行的输入哈希、模型参数、阶段统计和状态；JSON 文件使用原子写入。
 
 ## 4. 与 Playwright 的衔接（下一迭代）
 
@@ -80,3 +84,12 @@
 ## 5. 执行记录
 
 - 每次 pipeline 运行在 `output/<product>/<version>/run-log.md` 记录：执行时间、PRD 版本、阶段产物、评审意见。
+- 可选执行反馈使用 `schemaVersion=1.0` 的 `{runId, results[]}` 格式，结果项至少包含 `caseId`、`status` 和 `durationMs`。
+
+## 6. 长文档、恢复与增量更新
+
+- 阶段 1 对长 PRD 分段并发抽取，再执行全量合并门禁；阶段 3 按结构化需求模块并发生成。
+- `--resume` 只复用 PRD、Prompt、模型、关键参数和示例指纹完全一致的成功模块检查点。
+- `prd2tc diff` 输出需求四分类，`prd2tc merge` 将旧用例迁移为 `active/needs_review/deprecated/superseded`，历史记录不物理删除。
+- 02 子项目用 `scripts/export_results.py` 把 JUnit 转为执行契约，01 用 `prd2tc import-results` 导入到用例副本。
+- `prd2tc promote-examples --reviewed` 只导出人工确认且最近执行通过的 active/reviewed 用例，避免失败原因未分类的结果污染示例库。

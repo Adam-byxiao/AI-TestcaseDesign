@@ -30,19 +30,19 @@ def test_inputs_wrapped_in_delimiters():
     """原则 4：输入数据用 <key>…</key> 分隔符包裹，与指令隔离。"""
     user = stages.build_stage_1_user("PRD 内容")
     assert "<PRD 全文>" in user and "</PRD 全文>" in user
-    user3 = stages.build_stage_3_user("方案")
-    assert "<测试方案>" in user3 and "</测试方案>" in user3
+    user3 = stages.build_stage_3_user("方案", requirements=[{"id": "REQ-AUTH-001", "module": "AUTH", "title": "t"}])
+    assert "<结构化需求" in user3
 
 
 def test_output_requirements_at_end():
     """原则 10：输出要求置末（近因偏差）。"""
-    for fn, arg in [
-        (stages.build_stage_1_user, "PRD"),
-        (stages.build_stage_2_user, "分析"),
-        (stages.build_stage_3_user, "方案"),
-    ]:
-        user = fn(arg)
-        assert user.index("# 输出要求") > user.index("# 输入数据"), fn.__name__
+    users = [
+        ("stage1", stages.build_stage_1_user("PRD")),
+        ("stage2", stages.build_stage_2_user("分析")),
+        ("stage3", stages.build_stage_3_user("方案", requirements=[{"id": "REQ-AUTH-001", "module": "AUTH", "title": "t"}])),
+    ]
+    for name, user in users:
+        assert user.index("# 输出要求") > user.index("# 输入数据"), name
 
 
 def test_feedback_placed_last():

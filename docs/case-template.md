@@ -2,6 +2,8 @@
 
 测试用例的**机读格式**（JSON）。Markdown 评审稿由该 JSON 渲染，两者字段一致。
 
+新产物顶层格式为 `{"schemaVersion":"2.0","actionSchemaVersion":"1.0","cases":[...]}`；动作集合按 `actionSchemaVersion` 维护。校验器和 02 执行覆盖工具仍兼容旧版顶层数组及没有动作版本字段的对象，无需迁移历史文件。
+
 ## 1. 用例 JSON 字段
 
 | 字段 | 必填 | 类型 | 说明 / 枚举 |
@@ -19,7 +21,7 @@
 | `steps` | ✅ | array | 步骤数组，每步见下 |
 | `expected` | ✅ | string[] | 预期结果（可断言点，≥1） |
 | `createdBy` | - | string | `ai`/`human` |
-| `status` | - | string | `draft`/`reviewed`/`obsolete` |
+| `status` | - | string | `active`/`needs_review`/`deprecated`/`superseded`；旧值 `draft`/`reviewed`/`obsolete` 读取时兼容 |
 
 ### steps[] 每步字段
 

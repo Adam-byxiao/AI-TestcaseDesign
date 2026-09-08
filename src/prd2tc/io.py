@@ -1,51 +1,152 @@
 """产物写入：目录初始化、用例集 Markdown 渲染、统计。"""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from prd2tc import __version__
+from prd2tc.models import RunManifest
+from prd2tc.schema import envelope, normalize_cases
 
 OUT_STAGES = {"analysis": "需求分析报告.md", "plan": "测试方案.md", "cases": "用例集.md"}
+MANIFEST_NAME = "run-manifest.json"
+LEGACY_MANIFEST_NAME = "manifest.json"
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def atomic_write_text(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+    return path
+
+
 def init_output(root: Path, product: str, version: str, prd: str | None) -> Path:
-    """创建 output/<product>/<version>/ 骨架并写 manifest.json"""
+    """创建输出骨架，并同时维护权威清单与旧文件名兼容副本。"""
     for sub in ("analysis", "plan", "cases/cases"):
         (root / sub).mkdir(parents=True, exist_ok=True)
-    manifest = {"product": product, "version": version, "prd": prd, "createdAt": now_iso()}
-    manifest_path = root / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    manifest = RunManifest(toolVersion=__version__, product=product, version=version, prd=prd,
+                           runId=f"{product}-{version}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                           createdAt=now_iso(), updatedAt=now_iso()).to_dict()
+    manifest_path = root / MANIFEST_NAME
+    serialized = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(manifest_path, serialized)
+    atomic_write_text(root / LEGACY_MANIFEST_NAME, serialized)
     return manifest_path
+
+
+def update_manifest(root: Path, **updates) -> dict:
+    path = root / MANIFEST_NAME
+    legacy_path = root / LEGACY_MANIFEST_NAME
+    source = path if path.exists() else legacy_path
+    current = json.loads(source.read_text(encoding="utf-8")) if source.exists() else {}
+    current.update(updates)
+    current["updatedAt"] = now_iso()
+    serialized = json.dumps(current, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(path, serialized)
+    atomic_write_text(legacy_path, serialized)
+    return current
+
+
+def manifest_stage(root: Path, name: str, **values) -> dict:
+    """原子合并单个阶段记录，避免调用方覆盖其他阶段。"""
+    path = root / MANIFEST_NAME
+    legacy_path = root / LEGACY_MANIFEST_NAME
+    source = path if path.exists() else legacy_path
+    current = json.loads(source.read_text(encoding="utf-8")) if source.exists() else {}
+    stages = dict(current.get("stages", {}))
+    stage = dict(stages.get(name, {}))
+    stage.update(values)
+    stages[name] = stage
+    return update_manifest(root, stages=stages)
+
+
+def update_run_state(root: Path, **updates) -> dict:
+    path = root / "run-state.json"
+    current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"schemaVersion": "1.0"}
+    current.update(updates)
+    current["updatedAt"] = now_iso()
+    atomic_write_text(path, json.dumps(current, ensure_ascii=False, indent=2) + "\n")
+    return current
 
 
 def write_stage(root: Path, stage: str, content: str) -> Path:
     """写阶段产物：analysis/plan 下为 md，cases 下为用例集 md"""
     filename = OUT_STAGES[stage]
     path = root / stage / filename
-    path.write_text(content, encoding="utf-8")
+    atomic_write_text(path, content)
     return path
 
 
 def save_cases(cases_dir: Path, cases: list[dict]) -> list[Path]:
     """按模块拆分写入 <MODULE>.json"""
     by_module: dict[str, list[dict]] = defaultdict(list)
-    for c in cases:
+    for source in cases:
+        c = dict(source)
+        c.setdefault("status", "active")
         by_module[c["module"]].append(c)
     paths = []
     for mod in sorted(by_module):
         p = cases_dir / f"{mod}.json"
-        p.write_text(
-            json.dumps(by_module[mod], ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        atomic_write_text(p, json.dumps(envelope(by_module[mod]), ensure_ascii=False, indent=2) + "\n")
         paths.append(p)
     return paths
+
+
+def load_cases(cases_dir: str | Path) -> list[dict]:
+    directory = Path(cases_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"用例目录不存在: {directory}")
+    cases: list[dict] = []
+    for path in sorted(directory.glob("*.json")):
+        cases.extend(normalize_cases(json.loads(path.read_text(encoding="utf-8").lstrip("\ufeff"))))
+    return cases
+
+
+def save_requirements(path: Path, requirements: list[dict], modules: list[dict] | None = None) -> Path:
+    data = {"schemaVersion": "2.0", "modules": modules or [], "requirements": requirements}
+    return atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def load_requirements(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data.get("requirements", []) if isinstance(data, dict) else []
+
+
+def save_traceability(path: Path, matrix: dict) -> Path:
+    return atomic_write_text(path, json.dumps(matrix, ensure_ascii=False, indent=2) + "\n")
+
+
+def artifact_inventory(root: Path) -> list[dict[str, str]]:
+    artifacts = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if relative in {MANIFEST_NAME, LEGACY_MANIFEST_NAME, "run-state.json"} or "/.checkpoints/" in f"/{relative}":
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        artifacts.append({"path": relative, "sha256": digest})
+    return artifacts
 
 
 def stats(cases: list[dict]) -> dict:

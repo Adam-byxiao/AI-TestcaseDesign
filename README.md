@@ -1,5 +1,7 @@
 # 01-AI-TestCaseDesign / prd2tc
 
+> 远程协作开发者请先阅读 [当前开发交接说明](docs/developer-handoff.md)，其中包含实现状态、架构/API、运行测试方式、已知限制和下一步优先级。
+
 **PRD → 测试方案 → 测试用例** 的独立开源工具：由大模型（默认 DeepSeek API）三阶段自动化生成，
 产物为可评审的 Markdown + 结构化用例 JSON（供 Playwright 测试体系消费）。
 
@@ -18,17 +20,18 @@
 ## 安装
 
 ```bash
-cd 01-AI-TestCaseDesign
+git clone <本仓库> && cd <仓库目录>
 pip install .            # 或开发模式 pip install -e .
-export DEEPSEEK_API_KEY=sk-xxx   # 必填（--stub/--dry-run 可豁免）
+export PRD2TC_LLM_PROVIDER=openai  # openai / anthropic / ollama
+export OPENAI_API_KEY=sk-xxx      # openai 必填；ollama 不需要
 ```
 
 ## 快速开始
 
 ```bash
-cd 01-AI-TestCaseDesign   # 或 pip install . 后在任意目录使用
-pip install .             # 或开发模式 pip install -e .
-export DEEPSEEK_API_KEY=sk-xxx   # 必填（--stub/--dry-run 可豁免）
+# 在仓库目录（含 examples/）内执行；pip install . 后也可在任何目录使用
+export PRD2TC_LLM_PROVIDER=openai
+export OPENAI_API_KEY=sk-xxx
 
 # 全自动三阶段：PRD → 需求分析 → 测试方案 → 用例集（用仓库内置示例 PRD）
 prd2tc generate --prd examples/sample-prd.md \
@@ -51,12 +54,28 @@ prd2tc stats    --dir output/sample-mall/v0.1/cases/cases
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` / `PRD2TC_API_KEY` | - | API Key（必填） |
-| `PRD2TC_API_BASE` | `https://api.deepseek.com` | OpenAI 兼容端点 |
-| `PRD2TC_MODEL` | `deepseek-chat` | 模型名 |
+| `PRD2TC_LLM_PROVIDER` | `openai` | `openai` / `anthropic` / `ollama` |
+| `PRD2TC_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | - | Provider 凭证；Ollama 不需要 |
+| `PRD2TC_API_BASE` | Provider 默认地址 | 可覆盖 OpenAI、Anthropic 或 Ollama 地址 |
+| `PRD2TC_MODEL` | 随 Provider 选择 | 模型名 |
+| `PRD2TC_MAX_TOKENS` | `4096` | Anthropic 最大输出 token |
 | `PRD2TC_TEMPERATURE` | `0.4` | 采样温度 |
 | `PRD2TC_TIMEOUT` | `120` | 请求超时（秒） |
 | `PRD2TC_MAX_RETRIES` | `3` | 失败重试次数（指数退避） |
+
+Provider 示例：
+
+```bash
+# Anthropic
+export PRD2TC_LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-xxx
+export PRD2TC_MODEL=claude-sonnet-4-5
+
+# 本地 Ollama（无需 API Key）
+export PRD2TC_LLM_PROVIDER=ollama
+export PRD2TC_MODEL=qwen3:8b
+export PRD2TC_API_BASE=http://localhost:11434
+```
 
 ## 三阶段 Pipeline
 
@@ -66,7 +85,58 @@ prd2tc stats    --dir output/sample-mall/v0.1/cases/cases
 | 2 测试方案 | `prompts/02-test-plan.md` + 模板 | 分析报告 → `plan/测试方案.md` |
 | 3 用例生成 | `prompts/03-test-cases.md` + 字段约束 | 测试方案 → `cases/用例集.md` + `cases/cases/<MODULE>.json` |
 
-产物目录：`output/<product>/<version>/{analysis,plan,cases}/`（含 `manifest.json`）。
+产物目录：`output/<product>/<version>/{analysis,plan,cases}/`（含权威 `run-manifest.json` 与兼容副本 `manifest.json`）。
+
+当前版本还会额外输出 `analysis/requirements.json` 和 `cases/traceability.json`，并在 `run-manifest.json` 中记录运行 ID、PRD 哈希、模型参数、阶段用量和最终状态。为兼容旧工具会同步写出 `manifest.json`；旧版顶层数组用例 JSON 仍可读取。
+
+需求版本可通过以下命令生成确定性 Diff：
+
+```bash
+prd2tc diff --prd PRD-v0.4.md --from output/product/v0.3 --out output
+```
+
+Python 调用方可使用 `prd2tc.pipeline.PipelineRunner`，执行结果契约见 `prd2tc.execution`。
+
+长文档会按 Markdown 标题/段落切分，阶段 1 分段抽取后统一合并，阶段 3 按需求模块并发生成。可用 `--jobs 4` 控制并发；中断后用 `--resume` 复用输入、Prompt、模型和参数指纹一致的模块检查点，`--force` 明确放弃旧检查点。
+
+增量用例和执行反馈命令：
+
+```bash
+prd2tc merge --from output/product/v0.3 --new output/product/v0.4 \
+  --diff output/product/v0.4/diff/requirement-diff.json --out output/product/v0.4/merged
+prd2tc import-results --cases output/product/v0.4/cases/cases \
+  --results execution-results.json --out output/product/v0.4/cases-with-results
+prd2tc promote-examples --cases output/product/v0.4/cases-with-results \
+  --design-logic "人工评审后的设计逻辑" --reviewed --out examples/product-v0.4.json
+```
+
+可选服务模式不会增加核心 CLI 的安装依赖：
+
+```bash
+pip install '.[service]'
+uvicorn 'prd2tc.service:create_app' --factory --host 127.0.0.1 --port 8000
+```
+
+### 可交互前端工作台
+
+前端位于 `ui/`，开发时分别启动 API 和 Vite：
+
+```bash
+# 安装一次服务端可选依赖
+pip install -e ".[service]"
+# 一个命令同时启动 FastAPI + Vite
+cd ui && npm install && npm start
+```
+
+`npm start` 是 `npm run dev:all` 的别名，会同时启动前端（5173）和后端（8000）；也可以分别使用 `npm run dev` 或 `npm run dev:backend`。
+
+浏览器访问 <http://127.0.0.1:5173>。工作台支持 PRD 版本管理、Markdown 预览、需求/方案/用例阶段草稿与显式审批、实时事件、追踪矩阵和产物下载。Provider 会话在“模型配置”页面创建；API Key 只保留在服务进程内存中，Ollama 不需要 Key。
+
+工作台默认按正式流程使用真实模型：开始运行或点击“重新分析”前，必须先在“模型配置”保存当前 LLM 会话。离线 Stub 不会自动降级，只有在“新建运行”中显式打开“Stub”开关才会使用固定离线响应；运行详情会明确显示“真实模型”或“Stub 离线验收”，避免把流程验收产物误认为模型生成结果。
+
+生产部署可先执行 `cd ui && npm run build`，再将 `ui/dist` 传给 `create_app(ui_dir="ui/dist")`；服务会托管静态文件并保留 `/api/v1` 接口。
+
+服务提供 `POST /runs`、`GET /runs/{task_id}` 和 WebSocket `/runs/{task_id}/events`；任务状态持久化到本地状态目录，WebSocket 不是唯一事实源。
 阶段 3 输出的用例 JSON 经内置校验（id 唯一、字段枚举、P0 必带 `@smoke`）后落盘，非法直接报错。
 
 ## 学习能力（示例库 + 检索注入，RAG-lite）
@@ -139,6 +209,8 @@ prd2tc generate --prd <prd> --no-gate             # 退回纯 prompt 自检
 ```
 
 **三层约束体系**：① prompt 内"输出自检门"（引导模型自检）→ ② 机器门禁校验（程序强制）→ ③ 校验失败反馈重出（修正闭环）。阶段 3 的校验与 `prd2tc validate` 共用同一套规则。
+
+遇到门禁错误时，请先按错误类型判断是 PRD 事实缺失、模型输出不完整、数据契约错误还是 Provider/环境问题；不要默认修改 PRD。详细的判断标准、UI/CLI 操作和提交问题所需信息见 [门禁失败处理手册](docs/gate-troubleshooting.md)。
 
 约束模板的"学习约束"部分由 `src/prd2tc/constraints.py` 从检索到的参考示例动态生成（示例库模块/规模、优先级口径、常用标签、推断的设计方法、design_logic 要点），实现「静态原理 + 动态学习」双约束。
 

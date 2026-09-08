@@ -42,6 +42,7 @@ def test_generate_stub_end_to_end(tmp_path):
 
     out = tmp_path / "youxuan-mall" / "v0.3"
     assert (out / "manifest.json").is_file()
+    assert (out / "run-manifest.json").is_file()
     assert (out / "analysis" / "需求分析报告.md").is_file()
     assert (out / "plan" / "测试方案.md").is_file()
     assert (out / "cases" / "用例集.md").is_file()
@@ -54,7 +55,32 @@ def test_generate_stub_end_to_end(tmp_path):
 
     md = (out / "cases" / "用例集.md").read_text(encoding="utf-8")
     assert "Traceability" in md or "需求回溯表" in md
-    assert "TC-STUB-001" in md
+    assert "TC-AUTH-001" in md  # 用例 id 已被确定性重编号
+    manifest = json.loads((out / "run-manifest.json").read_text(encoding="utf-8"))
+    assert all("durationMs" in manifest["stages"][name] for name in ("analysis", "plan", "cases"))
+    assert manifest["parameters"]["provider"] == "openai"
+    assert manifest["parameters"]["apiBase"]
+    assert "test-only-secret" not in json.dumps(manifest)
+
+
+def test_generate_stub_resume_reuses_all_completed_work(tmp_path, monkeypatch):
+    calls = []
+    original = cli._stub_chat
+
+    def counting_stub(cfg, user_text, **kwargs):
+        calls.append(user_text)
+        return original(cfg, user_text, **kwargs)
+
+    monkeypatch.setattr(cli, "_stub_chat", counting_stub)
+    argv = ["generate", "--prd", str(SAMPLE_PRD), "--stub", "--out", str(tmp_path)]
+    assert cli.main(argv) == 0
+    first_count = len(calls)
+    assert first_count == 3
+    assert cli.main(argv + ["--resume"]) == 0
+    assert len(calls) == first_count
+    state = json.loads((tmp_path / "youxuan-mall" / "v0.3" / "run-state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "succeeded"
+    assert state["modules"] == {"AUTH": "skipped"}
 
 
 def test_validate_and_stats_commands(tmp_path):

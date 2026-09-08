@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "prd2tc"
-version = "0.1.0"
+version = "0.5.0"
 description = "PRD → 测试方案 → 测试用例：独立的大模型驱动的测试用例生成 CLI（DeepSeek API，零第三方依赖）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,9 @@ classifiers = [
 
 [project.scripts]
 prd2tc = "prd2tc.cli:main"
+
+[project.optional-dependencies]
+service = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

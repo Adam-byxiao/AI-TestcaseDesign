@@ -12,17 +12,18 @@ import json
 import re
 from pathlib import Path
 
+from prd2tc.schema import ACTION_SCHEMA_VERSION, ACTIONS_BY_VERSION
+
 MODULES = [
     "AUTH", "HOME", "PROD", "SEARCH", "CART", "CHECKOUT", "COUPON",
     "ORDER", "ACCOUNT", "COMMENT", "COMMON", "PERF",
+    "CHK", "GLB", "DET", "LIST", "ERR",
 ]
 PRIORITIES = ["P0", "P1", "P2", "P3"]
-ACTIONS = [
-    "goto", "fill", "click", "selectOption", "check", "hover", "press", "reload",
-    "expectVisible", "expectText", "expectUrl", "waitFor",
-]
-ID_RE = re.compile(r"^TC-[A-Z]+(-[A-Z0-9]+)?-\d{3}$")
-REQ_RE = re.compile(r"^REQ-[A-Z]+-\d{3}$")
+CASE_STATUSES = ["active", "needs_review", "deprecated", "superseded", "draft", "reviewed", "obsolete"]
+ACTIONS = sorted(ACTIONS_BY_VERSION[ACTION_SCHEMA_VERSION])
+ID_RE = re.compile(r"^TC-[A-Z][A-Z0-9_]*(-[A-Z0-9_]+)?-\d{3}$")
+REQ_RE = re.compile(r"^REQ-[A-Z][A-Z0-9_]*-\d{3}$")
 
 
 class ValidationError(Exception):
@@ -31,7 +32,7 @@ class ValidationError(Exception):
         super().__init__(f"{len(errors)} 个校验问题")
 
 
-def validate_case(case: dict, index: int, seen_ids: set[str]) -> list[str]:
+def validate_case(case: dict, index: int, seen_ids: set[str], allowed_modules: set[str] | None = None) -> list[str]:
     """校验单条用例，返回错误列表（尽可能收集全部问题）。"""
     errors: list[str] = []
     at = f"[用例#{index + 1} {case.get('id', '(无id)')}]"
@@ -46,10 +47,13 @@ def validate_case(case: dict, index: int, seen_ids: set[str]) -> list[str]:
             errors.append(f"{at} id 重复: {cid}")
         seen_ids.add(cid)
 
-    if case.get("module") not in MODULES:
+    modules = allowed_modules or set(MODULES)
+    if case.get("module") not in modules:
         errors.append(f"{at} module 非法: {case.get('module') or '(空)'}")
     if case.get("priority") not in PRIORITIES:
         errors.append(f"{at} priority 非法: {case.get('priority') or '(空)'}")
+    if case.get("status") is not None and case.get("status") not in CASE_STATUSES:
+        errors.append(f"{at} status 非法: {case.get('status')}")
     tags = case.get("tags")
     if not isinstance(tags, list) or len(tags) == 0:
         errors.append(f"{at} tags 为空")
@@ -83,7 +87,7 @@ def validate_case(case: dict, index: int, seen_ids: set[str]) -> list[str]:
     return errors
 
 
-def validate_dir(cases_dir: str | Path) -> tuple[int, list[str]]:
+def validate_dir(cases_dir: str | Path, allowed_modules: set[str] | None = None) -> tuple[int, list[str]]:
     """校验目录下所有用例 JSON（顶层为数组）。返回 (用例数, 错误列表)。"""
     d = Path(cases_dir)
     if not d.is_dir():
@@ -97,10 +101,12 @@ def validate_dir(cases_dir: str | Path) -> tuple[int, list[str]]:
         except json.JSONDecodeError as e:
             errors.append(f"[文件 {f.name}] JSON 解析失败: {e}")
             continue
+        if isinstance(cases, dict) and isinstance(cases.get("cases"), list):
+            cases = cases["cases"]
         if not isinstance(cases, list):
-            errors.append(f"[文件 {f.name}] 顶层必须是数组")
+            errors.append(f"[文件 {f.name}] 顶层必须是数组或 cases 对象")
             continue
         for i, case in enumerate(cases):
-            errors.extend(validate_case(case, total + i, seen))
+            errors.extend(validate_case(case, total + i, seen, allowed_modules))
         total += len(cases)
     return total, errors

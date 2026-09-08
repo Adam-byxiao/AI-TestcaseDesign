@@ -1,10 +1,64 @@
+# ============ Python ============
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
-dist/
-build/
+.eggs/
+.tox/
+.mypy_cache/
+.ruff_cache/
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 .venv/
 venv/
-output/
+env/
+build/
+dist/
+
+# ============ Node / UI（React 工作台） ============
+node_modules/
+ui/node_modules/
+ui/dist/
+ui/coverage/
+*.tsbuildinfo
+
+# ============ 密钥与环境 ============
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# ============ 本地运行产物（不上传） ============
+# Web 服务运行时工作区：上传的 PRD / 任务 / 草稿 / 失败留档
+.prd2tc-workspace/
+# CLI 生成产物
+output/
+# 本地调试临时目录 / 日志
+.tmp-service-check*
+tmp-ws-check/
+*.log
+
+# ============ 内部开发文档（保留本机，不上传开源仓库） ============
+# 仅 5 份“开发/成本/演进”后备文档；公开文档 docs/pipeline.md、docs/case-template.md 正常上传
+docs/developer-handoff.md
+docs/development-evolution.md
+docs/gate-troubleshooting.md
+docs/reproducibility.md
+docs/token-optimization.md
+
+# ============ Skill 元数据（DSH 专用，不作为 OSS 资产） ============
+skill/
+
+# ============ IDE / OS ============
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+.DS_Store
+Thumbs.db

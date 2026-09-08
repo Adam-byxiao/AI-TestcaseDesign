@@ -1,0 +1,6 @@
+export type Stage = 'analysis'|'plan'|'cases';
+export interface Prd { prdId:string; filename:string; path?:string; version:string; sha256:string; chars:number; content?:string; }
+export interface Run { taskId:string; runId?:string; prdId?:string; status:string; mode?:'real'|'stub'; auto?:boolean; currentStage?:string; percent?:number; output?:string; error?:string; errors?:string[]; stageStates?:Record<string,string>; modules?:Record<string,string>; review?:Record<string,any>; events?:any[]; llm?:{provider:string;model:string;apiBase:string}; qualityGate?:Record<string,any>; tokens?:{total:number; stages:Record<string,{tokens:number; moduleTokens?:Record<string,number>}>}; }
+export interface RunEvent { eventId:string; runId:string; stage?:string; module?:string|null; type:string; status?:string; percent?:number; message:string; createdAt:string; }
+export interface Requirement { id:string; module:string; title:string; description:string; acceptanceCriteria:string[]; exceptionFlows:string[]; priority:string; sourceRefs?:any[]; fingerprint?:string; idSource?:string; }
+export interface Case { id:string; module:string; title:string; priority:string; status?:string; tags:string[]; requirement:string[]; steps:any[]; expected:string[]; lastExecution?:any; }

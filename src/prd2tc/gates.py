@@ -14,10 +14,16 @@ import re
 
 from prd2tc import stages as _stages  # noqa: F401  （仅类型提示，避免循环依赖在模块级）
 from prd2tc.validator import validate_case
+from prd2tc.traceability import build_traceability, validate_traceability
 
-REQ_RE = re.compile(r"REQ-[A-Z]+-\d{3}")
+REQ_RE = re.compile(r"REQ-[A-Z][A-Z0-9_]*-\d{3}")
 
 ANALYSIS_SECTIONS = ["功能模块清单", "角色清单", "需求点明细", "业务规则", "非功能需求", "风险与疑点"]
+_SECTION_HINTS = {
+    "业务规则": "（PRD 中的校验规则/状态规则/错误与边界处理/数据联动规则均应归入此章节）",
+    "非功能需求": "（PRD 中的性能/兼容性/安全/可用性/可维护性/NFR 均应归入此章节）",
+    "风险与疑点": "（PRD 中的风险/依赖/待确认事项/Open Questions 均应归入此章节）",
+}
 PLAN_SECTIONS = [
     "测试范围",
     "测试策略",
@@ -31,7 +37,7 @@ PLAN_SECTIONS = [
 
 
 def _missing_sections(text: str, sections: list[str]) -> list[str]:
-    return [f"缺少必备章节「{s}」" for s in sections if s not in text]
+    return [f"缺少必备章节「{s}」{_SECTION_HINTS.get(s, '')}" for s in sections if s not in text]
 
 
 def check_analysis(text: str, prd_text: str | None = None) -> list[str]:
@@ -54,14 +60,25 @@ def check_plan(text: str) -> list[str]:
     return _missing_sections(text, PLAN_SECTIONS)
 
 
-def check_cases_text(text: str) -> list[str]:
+def check_four_sections(text: str) -> list[str]:
+    """阶段 1 分段合并小调用门禁：角色清单/业务规则/非功能需求/风险与疑点。"""
+    return _missing_sections(text, ["角色清单", "业务规则", "非功能需求", "风险与疑点"])
+
+
+def check_cases_text(text: str, allowed_modules: set[str] | None = None) -> list[str]:
     """阶段 3 门禁：JSON 可解析 + 用例字段强校验（id 唯一/枚举/非空）。"""
     try:
-        cases = _stages.extract_cases(text)
+        cases = _stages.extract_and_normalize(text)
     except (ValueError, json.JSONDecodeError) as e:
         return [f"用例 JSON 解析失败: {e}（请只输出一个 JSON 数组）"]
     if not cases:
         return ["未生成任何用例"]
     seen: set[str] = set()
-    errors = [e for i, c in enumerate(cases) for e in validate_case(c, i, seen)]
+    errors = [e for i, c in enumerate(cases) for e in validate_case(c, i, seen, allowed_modules)]
     return errors
+
+
+def check_traceability(requirements: list[dict], cases: list[dict], *, min_cases: int = 1) -> tuple[dict, list[str]]:
+    """校验用例引用真实性和覆盖要求，返回矩阵与错误列表。"""
+    matrix = build_traceability(requirements, cases, min_cases=min_cases)
+    return matrix, validate_traceability(matrix)

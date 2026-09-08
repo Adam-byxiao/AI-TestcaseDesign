@@ -63,13 +63,15 @@ def test_principles_enforce_constraints_language():
     assert text.count("必须") >= 10
 
 
-def test_stage3_injects_constraints_and_examples():
-    """阶段 3 的 user 消息应同时包含输出要求区、约束块与参考示例。"""
-    cfg = Config(api_key="k", api_base="https://x", model="m", temperature=0.4, timeout=10, max_retries=1)
+def test_stage3_system_and_user_split():
+    """约束/示例移入 system 前缀（可缓存）；user 仅含可变内容。"""
     exs = examples.load_examples(EXAMPLES_DIR)
-    user = stages.build_stage_3_user("…", examples=exs)
-    assert "# 输出要求" in user, "输出要求必须置末（近因偏差）"
-    assert "反模式禁止" in user
-    assert "设计逻辑（必须学习）" in user
-    # 输出要求应位于输入数据之后
-    assert user.index("# 输出要求") > user.index("# 输入数据")
+    system = stages.stage_3_system("方案", exs)
+    assert "反模式禁止" in system
+    assert "设计逻辑（必须学习）" in system
+    assert "测试方案" in system
+
+    user = stages.build_stage_3_user("方案", requirements=[{"id": "REQ-AUTH-001", "module": "AUTH", "title": "登录"}])
+    assert "# 输出要求" in user
+    assert "结构化需求" in user
+    assert "<测试方案>" not in user  # 方案已移出 user（system 前缀），避免逐模块重复发送
