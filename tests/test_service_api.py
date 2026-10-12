@@ -222,6 +222,90 @@ def test_upload_folder_depth_reaches_run_manifest(client, tmp_path):
     assert roles.get("PRD.md") == "primary", roles
 
 
+def test_upload_deduplicates_identical_content(client):
+    """**核心回归**：同样的文件集合重复上传不得生成多条 PRD 记录。
+
+    实测事故：antd 对文件夹/多文件会**逐文件**调用回调，前端把一次上传
+    发成了 N 次请求 —— 列表里堆了 8 条同名同版本记录，用户无法分辨。
+    修复分两层：前端合并为一次请求；后端按**内容**去重兜底
+    （防御用户连点、脚本重复调用、旧客户端）。
+    """
+    files = [
+        ("files", ("我的PRD/PRD.md", "# 需求\n\n## 6.1\n\n要点。\n".encode(), "text/markdown")),
+        ("files", ("我的PRD/图片和附件/x.png", PNG_BYTES, "image/png")),
+    ]
+    first = client.post("/api/v1/prds", files=files).json()
+    second = client.post("/api/v1/prds", files=files).json()
+    third = client.post("/api/v1/prds", files=files).json()
+
+    assert first["prdId"] == second["prdId"] == third["prdId"], (
+        first["prdId"], second["prdId"], third["prdId"])
+    assert second.get("deduplicated") is True
+    # 列表里只有一条，不堆积重复项
+    listed = client.get("/api/v1/prds").json()
+    assert len([p for p in listed if p["prdId"] == first["prdId"]]) == 1
+    # 重复落盘的目录已被清理
+    assert not (Path(first["dir"]).parent / "nonexistent").exists()
+
+
+def test_upload_different_content_creates_new_record(client):
+    """内容不同必须新建记录 —— 去重不能误伤正常上传。"""
+    a = client.post("/api/v1/prds", files=[
+        ("files", ("a.md", "# A\n".encode(), "text/markdown"))]).json()
+    b = client.post("/api/v1/prds", files=[
+        ("files", ("a.md", "# B\n".encode(), "text/markdown"))]).json()
+    assert a["prdId"] != b["prdId"]
+    assert not b.get("deduplicated")
+
+
+def test_update_prd_creates_version_in_own_folder(client):
+    """保存新版本：进自己的目录、版本递增、且不继承父记录的 contentDigest。
+
+    若不清理 contentDigest，新版本会带着父记录「一批上传文件」的指纹，
+    后续正常上传会被误判为重复。
+    """
+    original = client.post("/api/v1/prds", files=[
+        ("files", ("PRD.md", "# v1\n".encode(), "text/markdown"))]).json()
+    updated = client.put(f"/api/v1/prds/{original['prdId']}",
+                         json={"content": "# v2\n"}).json()
+    assert updated["version"] == "v0.2"
+    assert updated["parentPrdId"] == original["prdId"]
+    assert updated["dir"] != original["dir"]
+    assert updated.get("contentDigest") != original.get("contentDigest")
+    assert client.get(f"/api/v1/prds/{updated['prdId']}").json()["content"] == "# v2\n"
+
+
+def test_update_prd_carries_assets_to_new_version(client, tmp_path):
+    """**核心回归**：编辑正文存新版本时，图片/附件必须一并延续。
+
+    原先 `update_prd` 只把主文件写进新目录，其余资产丢失；
+    而 `files` 元数据仍从父记录继承、声称有 N 个文件 —— 两者矛盾，
+    且新版本运行时会读不到配图（实测：某 v0.2 声称 12 个文件、目录里只有 1 个）。
+    """
+    original = client.post("/api/v1/prds", files=[
+        ("files", ("我的PRD/PRD.md", "# v1\n\n![图](https://x/A)\n".encode(), "text/markdown")),
+        ("files", ("我的PRD/图片和附件/a.png", PNG_BYTES, "image/png")),
+    ]).json()
+    assert original["bundle"]["imageCount"] == 1
+
+    updated = client.put(f"/api/v1/prds/{original['prdId']}",
+                         json={"content": "# v2\n\n![图](https://x/A)\n"}).json()
+    # 资产必须被复制过来
+    names = {f["name"] for f in updated["files"]}
+    assert "a.png" in names, updated["files"]
+    assert updated["dir"] != original["dir"]
+    # files 元数据必须与磁盘实际一致（不得凭空声称文件数）
+    # `dir` 是相对工作区根的路径；工作区由 fixture 建在 tmp_path/workspace
+    folder = tmp_path / "workspace" / updated["dir"]
+    assert folder.is_dir(), folder
+    actual = sorted(p.name for p in folder.rglob("*") if p.is_file())
+    assert sorted(f["name"] for f in updated["files"]) == actual, (updated["files"], actual)
+    # 不得出现两份主文件（旧副本 + 新扁平副本）
+    assert [f["name"] for f in updated["files"]].count("PRD.md") == 1, updated["files"]
+    # 新版本仍能解析出图片
+    assert client.get(f"/api/v1/prds/{updated['prdId']}").json()["files"]
+
+
 def test_upload_rejects_unsupported_format(client):
     resp = client.post("/api/v1/prds",
                        files={"file": ("book.xlsx", b"PK\x03\x04x", "application/vnd.ms-excel")})

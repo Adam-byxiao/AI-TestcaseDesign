@@ -1,7 +1,7 @@
 """可选 FastAPI 适配层：文件工作区、阶段审阅和实时事件。"""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-import hashlib, json, mimetypes, re, secrets, threading, time, uuid
+import hashlib, json, mimetypes, re, secrets, shutil, threading, time, uuid
 from pathlib import Path
 from typing import Any
 
@@ -368,6 +368,24 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         # 后续运行就找不到显式主文件、层级信息也随之失效（实测踩到）。
         primary_stored = next((s.get("stored") or s["name"] for s in saved
                                if s["name"] == primary_name), primary_name)
+
+        # --- 内容去重（第二道防线）---
+        # 前端曾因 antd 逐文件回调而把一次文件夹上传发成 N 次请求，
+        # 列表里堆了 8 条同名同版本记录。仅修前端不足以防御
+        # 「用户连点两次」「脚本重复调用」等情况，故在此按**内容**去重：
+        # 文件集合的 sha256（排序后）完全相同即视为同一次上传，复用已有记录。
+        # 注意：`PUT /prds/{id}`（保存新版本）是用户显式行为，不经此路径。
+        content_digest = _content_hash("\n".join(sorted(s["sha256"] for s in saved)))
+        for existing_path in sorted(store.prds.glob("prd-*.json")):
+            existing = store._json(existing_path)
+            if existing.get("prdId") == prd_id:
+                continue
+            # 只按 contentDigest 匹配：旧记录没有该字段（其 sha256 语义不同），
+            # 不设兼容分支可避免把「不同内容但哈希巧合」误判为重复。
+            if existing.get("contentDigest") == content_digest:
+                shutil.rmtree(folder, ignore_errors=True)      # 丢弃本次重复落盘
+                return {**existing, "deduplicated": True}
+
         meta = {
             "prdId": prd_id,
             # filename 保持主文件名（下游按它生成产品名）；files 给出完整清单
@@ -376,6 +394,7 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
             "dir": str(folder.relative_to(root)),
             "files": saved,
             "primary": primary_name,
+            "contentDigest": content_digest,
             "bundle": summary,
             "warnings": warnings_list,
             "version": "v0.1",
@@ -401,8 +420,61 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         require_id(prd_id, "prdId")
         meta = store._json(store.prds / f"{prd_id}.json", None)
         if not meta or not isinstance(body.get("content"), str): raise HTTPException(400, "PRD 或 content 无效")
-        content = body["content"]; suffix = Path(meta["path"]).suffix; new_id = f"prd-{uuid.uuid4().hex[:12]}"; path = store.prds / f"{new_id}{suffix}"; atomic_write_text(path, content)
-        new_meta = {**meta, "prdId": new_id, "parentPrdId": prd_id, "path": str(path.relative_to(root)), "version": _next_version(meta.get("version", "v0.1")), "sha256": _content_hash(content), "chars": len(content), "createdAt": now_iso(), "updatedAt": now_iso()}; store.save_json(store.prds / f"{new_id}.json", new_meta); return new_meta
+        content = body["content"]; suffix = Path(meta["path"]).suffix
+        new_id = f"prd-{uuid.uuid4().hex[:12]}"
+        # 与上传保持一致：新版本也放进自己的目录，避免文件散落在 prds/ 根下
+        # （上传已改为 `prds/<id>/`，两处不一致会让目录结构难以理解）。
+        folder = store.prds / new_id
+        folder.mkdir(parents=True, exist_ok=True)
+        # 主文件在旧目录里的**相对位置**（如 `我的PRD/PRD.md`），
+        # 新正文必须写回同一位置 —— 否则会出现「旧副本 + 新扁平副本」两份 PRD。
+        old_folder = store._safe(store.root / meta["dir"]) if meta.get("dir") else None
+        old_main = ""
+        if meta.get("path") and meta.get("dir"):
+            try:
+                old_main = str((store.root / meta["path"]).relative_to(store.root / meta["dir"]))
+            except ValueError:
+                old_main = Path(meta["filename"]).name
+        # **把上一版的其余文件（图片/附件/子目录）复制过来**：
+        # 新版本只编辑正文文本，资产应当延续。否则新版本目录里只剩主文件，
+        # 后续运行读不到配图，而 `files` 元数据却仍声称有 N 个文件（实测踩到）。
+        # 跳过旧主文件本身 —— 它马上会被新内容替换，不跳会出现两份。
+        if old_folder and old_folder.is_dir():
+            for src in sorted(old_folder.rglob("*")):
+                if not src.is_file() or src.name.endswith(".json"):
+                    continue
+                rel = src.relative_to(old_folder)
+                if str(rel) == old_main:
+                    continue
+                dest = folder / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(src, dest)
+                except OSError:
+                    pass
+        path = folder / (old_main or Path(meta["filename"]).name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, content)
+        # 重建 files 清单：主文件用新哈希，其余沿用复制过来的实际内容
+        files: list[dict] = []
+        for item in sorted(folder.rglob("*")):
+            if not item.is_file() or item.name.endswith(".json"):
+                continue
+            blob = item.read_bytes()
+            files.append({"name": item.name, "size": len(blob),
+                          "relpath": str(item.relative_to(folder)),
+                          "stored": str(item.relative_to(folder)),
+                          "sha256": hashlib.sha256(blob).hexdigest()})
+        content_digest = _content_hash("\n".join(sorted(f["sha256"] for f in files)))
+        new_meta = {**meta, "prdId": new_id, "parentPrdId": prd_id,
+                    "path": str(path.relative_to(root)), "dir": str(folder.relative_to(root)),
+                    "files": files or meta.get("files") or [],
+                    "version": _next_version(meta.get("version", "v0.1")),
+                    "sha256": _content_hash(content), "chars": len(content),
+                    # 新版本有自己的内容指纹；不继承父记录（否则后续上传会被误判重复）
+                    "contentDigest": content_digest,
+                    "updatedAt": now_iso(), "createdAt": now_iso()}
+        store.save_json(store.prds / f"{new_id}.json", new_meta); return new_meta
 
     @app.post("/api/v1/prds/{prd_id}/reanalyze")
     def reanalyze_prd(prd_id: str, body: dict | None = None):

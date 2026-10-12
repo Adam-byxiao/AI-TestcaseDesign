@@ -1,4 +1,4 @@
-import {useEffect,useState} from 'react';
+import {useEffect,useRef,useState} from 'react';
 import {Card,Select,Upload,Button,Input,Row,Col,Typography,message,Space,Alert,Tag,Table,Tooltip} from 'antd';
 import {InboxOutlined,FolderOpenOutlined,FileTextOutlined,PictureOutlined,WarningOutlined} from '@ant-design/icons';
 import {useSearchParams,useNavigate} from 'react-router-dom';
@@ -13,6 +13,9 @@ export default function PrdPage(){
   const [text,setText]=useState('');
   const [lastRun,setLastRun]=useState<string>();
   const [uploading,setUploading]=useState(false);
+  // 同一批选择的文件收集器（见 enqueue 的说明）
+  const pendingRef=useRef<File[]>([]);
+  const flushRef=useRef<ReturnType<typeof setTimeout>|null>(null);
   const [params]=useSearchParams(); const navigate=useNavigate();
 
   const load=async()=>{try{const values=await prdApi.list();setItems(values);const requested=params.get('id');if(requested)choose(requested)}catch{message.error('无法加载 PRD 列表')}};
@@ -41,20 +44,45 @@ export default function PrdPage(){
       message.error(error?.response?.data?.detail||'上传失败');
     }finally{ setUploading(false); }
   };
-  const pickSingle=async({file}:{file:any})=>doUpload([file]);
+  /** 收集文件并在当前批次结束后**统一上传一次**。
+   *
+   *  ⚠ antd 对多文件/文件夹会**逐文件**调用 `customRequest` / `beforeUpload`：
+   *  - `customRequest({file})` 每个文件一次（每次只给 1 个）；
+   *  - `beforeUpload(file, fileList)` 同样每个文件一次（每次都给完整列表）。
+   *  若在回调里直接上传，选 12 个文件就会发 12 次请求 → **12 条重复 PRD 记录**
+   *  （实测发生：列表里堆了 8 条同名同版本记录）。
+   *
+   *  这里用一个宏任务把同一批选择合并：无论 antd 怎么分批调用，都只上传一次。
+   *  比依赖 `fileList` 顺序或 `uid` 判断更健壮。
+   */
+  const enqueue=(incoming:File[])=>{
+    pendingRef.current.push(...incoming.filter(Boolean));
+    if(flushRef.current) clearTimeout(flushRef.current);
+    flushRef.current=setTimeout(()=>{
+      const batch=pendingRef.current.slice();
+      pendingRef.current=[];
+      if(batch.length) void doUpload(batch);
+    },0);
+  };
+  /** 单个文件的选择器（folder/multiple 都由 enqueue 合并，故此处只负责入队）。 */
+  const pickSingle=({file}:{file:any})=>{ enqueue([file]); return false; };
 
   const b=current?.bundle;
   const files=current?.files||[];
   return <div className="page">
     <Card title="PRD 原文与实时预览" extra={<Space wrap>
-      <Select placeholder="选择版本" style={{width:240}} value={current?.prdId} onChange={choose}
-        options={items.map(p=>({value:p.prdId,label:`${p.filename} · ${p.version}`}))}/>
+      <Select placeholder="选择版本" style={{width:320}} value={current?.prdId} onChange={choose}
+        optionFilterProp="label" showSearch
+        options={items.map(p=>({value:p.prdId,
+          // 同名同版本可能有多条（如重复上传）：补上时间与文件数以便区分
+          label:`${p.filename} · ${p.version}${p.files?.length?` · ${p.files.length} 文件`:''}`
+                +`${p.createdAt?` · ${String(p.createdAt).slice(5,16).replace('T',' ')}`:''}`}))}/>
       <Upload accept=".md,.markdown,.mdown,.txt,.docx,.pdf,.zip,.png,.jpg,.jpeg,.gif,.webp,.bmp"
         multiple showUploadList={false} customRequest={pickSingle} disabled={uploading}>
         <Button icon={<FileTextOutlined/>} loading={uploading}>上传文件</Button>
       </Upload>
       <Upload directory showUploadList={false} disabled={uploading}
-        customRequest={pickSingle} beforeUpload={(f:any,list:any)=>{doUpload(list as File[]);return false;}}>
+        beforeUpload={(file:any)=>{ pickSingle({file}); return false; }}>
         <Tooltip title="选择整个文件夹（如 PRD + 图片和附件），服务端按相对路径还原层级并自动判定正文">
           <Button icon={<FolderOpenOutlined/>} loading={uploading}>上传文件夹</Button>
         </Tooltip>

@@ -6,7 +6,8 @@ export interface UploadBundle {
 }
 export interface PrdFile { name:string; size:number; relpath?:string; sha256:string; }
 export interface Prd { prdId:string; filename:string; path?:string; version:string; sha256:string; chars:number; content?:string;
-  files?:PrdFile[]; primary?:string; bundle?:UploadBundle; warnings?:string[]; }
+  files?:PrdFile[]; primary?:string; bundle?:UploadBundle; warnings?:string[];
+  createdAt?:string; updatedAt?:string; parentPrdId?:string; dir?:string; }
 export interface Run { taskId:string; runId?:string; prdId?:string; status:string; mode?:'real'|'stub'; auto?:boolean; currentStage?:string; percent?:number; output?:string; error?:string; errors?:string[]; stageStates?:Record<string,string>; modules?:Record<string,string>; review?:Record<string,any>; events?:any[]; llm?:{provider:string;model:string;apiBase:string}; qualityGate?:Record<string,any>; tokens?:{total:number; stages:Record<string,{tokens:number; moduleTokens?:Record<string,number>}>}; metrics?:RunMetrics; }
 export type ModuleState = 'pending'|'running'|'done'|'failed'|'skipped';
 /** `estimated:true` marks character-based token estimates; `silentMs` is ms since the last streamed delta. */
