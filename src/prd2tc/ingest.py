@@ -689,8 +689,13 @@ def ingest(inputs, *, warnings: list | None = None, preferred_primary: str = "",
         pending.append((name, data, origin, depth))
 
     if not pending:
-        # 把已收集的告警带进异常 —— 否则「为什么全都失败了」对调用方不可见
-        detail = ("；".join(warns[:5]) + ("…" if len(warns) > 5 else "")) if warns else "未提供任何输入"
+        # 把已收集的告警带进异常 —— 否则「为什么全都失败了」对调用方不可见。
+        # 同时**逐条截断**：曾把整个路径列表的 repr 塞进消息，报错长到无法阅读。
+        def _short(text: str, limit: int = 160) -> str:
+            s = str(text)
+            return s if len(s) <= limit else s[:limit] + f"…(+{len(s) - limit} 字符)"
+        detail = ("；".join(_short(w) for w in warns[:5])
+                  + (f"…共 {len(warns)} 条" if len(warns) > 5 else "")) if warns else "未提供任何输入"
         raise ValueError(f"没有可用的输入（{detail}）")
 
     # 展开压缩包（含嵌套），并对成员去重

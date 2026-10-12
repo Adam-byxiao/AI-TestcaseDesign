@@ -136,6 +136,39 @@ class PipelineRunner:
             warnings.warn(f"UI 契约留痕失败（不影响生成）: {exc}")
         return merged, metas
 
+    def _auto_prototypes(self, bundle, root: Path):
+        """从**已摄取的文件**里自动识别原型 HTML 并解析为 UI 契约。
+
+        为什么需要：`--attach` 是 CLI 入口，而 UI 上传文件夹时原型只是被当成
+        普通文本附件内联进正文 —— 它携带的真实标识符/页面/弹窗按钮**全都没被利用**，
+        模型仍会编造。实测用户上传的文件夹里就有
+        `养老Agent后台-prototype-测试内嵌版.html`（48KB），却只作为文本进了上下文
+        （既稀释了 PRD 注意力，又没换来任何结构化真值）。
+
+        仅在未显式提供 `--attach` 时启用；解析失败只告警，绝不中断。
+        """
+        if bundle is None:
+            return None, []
+        paths: list[Path] = []
+        seen: set[str] = set()
+        for src in bundle.sources:
+            if getattr(src, "kind", "") != "html" or getattr(src, "role", "") == "skipped":
+                continue
+            origin = str(getattr(src, "origin", "") or "")
+            if not origin or origin in seen:
+                continue
+            p = Path(origin)
+            if p.is_file() and p not in paths:
+                seen.add(origin)
+                paths.append(p)
+        if not paths:
+            return None, []
+        spec, metas = self._load_attachments(paths, root)
+        if spec is not None:
+            for m in metas:
+                m["autoDetected"] = True
+        return spec, metas
+
     def _load_images(self, bundle, root: Path, *, request, llm, reporter=None):
         """从摄取结果构建图片证据，落盘留痕；失败只告警不中断。
 
@@ -211,6 +244,10 @@ class PipelineRunner:
         # 原型/交互式设计产物 → UI 契约（真值）。内容纳入 configHash：
         # 改了原型就必须重新生成，不能复用按旧标识符产出的检查点。
         ui_spec, attachments_meta = self._load_attachments(request.attachments, root)
+        if ui_spec is None:
+            # 未显式 --attach 时，尝试从上传的文件里自动识别原型（UI 上传文件夹的常见形态）
+            ui_spec, auto_meta = self._auto_prototypes(bundle, root)
+            attachments_meta = list(attachments_meta) + list(auto_meta)
         # PRD 图片 → 视觉证据（来自 bundle.assets：上传/压缩包/DOCX 内嵌/目录）
         image_spec = None
         if request.analyze_images:

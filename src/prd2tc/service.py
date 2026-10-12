@@ -35,6 +35,36 @@ def _safe_filename(name: str) -> str:
     return base[:120]
 
 
+def _encode_prd(prd):
+    """序列化 `prd` 字段：单个路径 → str；多文件 → list[str]。"""
+    if prd is None:
+        return None
+    if isinstance(prd, (list, tuple)):
+        return [str(p) for p in prd]
+    return str(prd)
+
+
+# 旧的 `str(list)` 序列化残留形如：
+#   "[WindowsPath('D:/a.md'), WindowsPath('D:/b.png')]"
+# 还原它，好让**已经失败的任务仍能恢复**，不必让用户重新上传。
+_LEGACY_PRD_RE = re.compile(
+    r"(?:WindowsPath|PosixPath|PureWindowsPath|PurePosixPath)\(\s*'([^']*)'\s*\)")
+
+
+def _decode_prd(value):
+    """反序列化 `prd`：还原 Path / Path 列表，并兼容旧的字符串化列表。"""
+    if value is None or isinstance(value, (list, tuple)):
+        return [Path(p) for p in value] if isinstance(value, (list, tuple)) else value
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text.startswith("[") and ("WindowsPath(" in text or "PosixPath(" in text):
+        found = _LEGACY_PRD_RE.findall(text)
+        if found:
+            return [Path(p) for p in found]
+    return Path(text)
+
+
 def _safe_relpath_parts(relpath: str) -> list[str]:
     """把上传的相对路径拆成**安全的目录段**（用于在磁盘上还原目录结构）。
 
@@ -189,17 +219,34 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
 
     def stage_name(value: str): return {"1": "analysis", "2": "plan", "3": "cases", "all": "done"}.get(value, "unknown")
     def request_dict(req: GenerateRequest):
-        return {"prd": str(req.prd), "out": str(req.out), "product": req.product, "version": req.version,
+        """把请求序列化为可存进 task.json 的 JSON 结构。
+
+        `prd` 可能是**列表**（文件夹上传后传入多文件）。原先写成 `str(req.prd)`，
+        列表会被字符串化成 `"[WindowsPath('...'), WindowsPath('...')]"` ——
+        阶段一用内存里的原始请求故能成功，阶段二从 task.json 重建时
+        这串文本被当成路径，报「输入不存在」（实测事故）。
+        """
+        return {"prd": _encode_prd(req.prd), "out": str(req.out),
+                "product": req.product, "version": req.version,
                 "stub": req.stub, "jobs": req.jobs, "profile": req.profile,
-                "max_gate_retries": req.max_gate_retries, "allow_gate_fail": req.allow_gate_fail,
-                "no_gate": req.no_gate}
+                "max_gate_retries": req.max_gate_retries,
+                "allow_gate_fail": req.allow_gate_fail, "no_gate": req.no_gate,
+                # 原型契约与图片选项必须一并持久化：否则阶段 2/3 重建请求后
+                # 会丢失 `--attach` 的 UI 契约与图片设置。
+                "attachments": [str(p) for p in (req.attachments or [])],
+                "image_dirs": [str(p) for p in (getattr(req, "image_dirs", None) or [])],
+                "fetch_images": bool(getattr(req, "fetch_images", False)),
+                "analyze_images": bool(getattr(req, "analyze_images", True))}
     def require_stage(value: object) -> str:
         if value not in {"1", "2", "3", "all"}:
             raise HTTPException(400, f"stage 必须为 1/2/3/all，收到 {value!r}")
         return str(value)
 
     def request_from(data: dict, stage: str, resume=True):
-        return GenerateRequest(**data, stage=require_stage(stage), resume=resume)
+        payload = dict(data)
+        if "prd" in payload:
+            payload["prd"] = _decode_prd(payload["prd"])
+        return GenerateRequest(**payload, stage=require_stage(stage), resume=resume)
 
     def run_task(task_id: str, req: GenerateRequest, session_id: str | None = None, review_mode: bool = True):
         session = store.get_session(session_id) if session_id else None

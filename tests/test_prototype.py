@@ -6,6 +6,7 @@
 并按「三选项弹窗」臆造交互（真值只有 1 个「关闭」按钮）。
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,11 @@ from prd2tc import prototype
 from prd2tc.prototype import (UiAnchor, UiModal, UiSpec, extract_ui_spec, load_spec,
                               merge_specs, parse_prototype, render_ui_spec, to_json,
                               validate_targets)
+
+# 最小合法 PNG（含魔数）——自动识别原型的用例需要一份真实图片资产
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000a49444154789c6300010000050001")
 
 # 模拟真实原型的关键结构：单页 JS 应用，DOM 在 <script> 模版字符串里
 FIXTURE = """<!doctype html>
@@ -298,6 +304,202 @@ def test_validate_targets_accepts_class_and_id_both(spec):
         {"action": "click", "target": "命中结果 (id=retrieveResults)", "data": ""},
     ])]
     assert validate_targets(cases, spec) == []
+
+
+def test_js_unescape_decodes_escapes():
+    """JS 字符串转义必须解码。
+
+    打包/工具生成的原型会把中文写成 `'\\u672a\\u4fdd\\u5b58\\u4fee\\u6539'`，
+    直接取字面量只会得到一串反斜杠文本 —— 契约标题与按钮全是噪声，
+    甚至被 `_is_ui_label` 的「含中文」判定误杀（按钮会被整批丢掉）。
+    """
+    from prd2tc.prototype import js_unescape
+    assert js_unescape(r"\u672a\u4fdd\u5b58\u4fee\u6539") == "未保存修改"
+    assert js_unescape(r"\x41\x42") == "AB"
+    assert js_unescape("普通中文") == "普通中文"          # 无转义时原样返回
+    assert js_unescape(r"混合 \u4e2d\u6587 text") == "混合 中文 text"
+    assert js_unescape(r"\ud83d\ude00") == "\U0001f600"   # 代理对需合并
+    assert js_unescape(r"未知 \uZZZZ 保留") == r"未知 \uZZZZ 保留"   # 非法转义不动
+    assert js_unescape("") == ""
+
+
+ESCAPED_PROTO = (
+    "<html><body><div id='nav'></div><script>\n"
+    "const navs=[['config','\\u667a\\u80fd\\u4f53\\u914d\\u7f6e']];\n"
+    "function showPending(){modal('\\u672a\\u4fdd\\u5b58\\u4fee\\u6539','b','\\u5173\\u95ed',close)}\n"
+    "function t(){toast('\\u6587\\u4ef6\\u5927\\u5c0f\\u4e0d\\u80fd\\u8d85\\u8fc7 1MB')}\n"
+    "function r(){return `<input id=\"docName\" maxlength=\"20\" "
+    "placeholder=\"\\u8f93\\u5165\\u6587\\u6863\\u540d\\u79f0\">"
+    "<button onclick=\"x()\">\\uff0b \\u6dfb\\u52a0\\u6587\\u6863\\u77e5\\u8bc6</button>`}\n"
+    "</script></body></html>")
+
+
+def test_escaped_prototype_parses_to_readable_contract():
+    """转义形式的原型必须解析出**可读**契约（而非反斜杠噪声）。"""
+    spec = extract_ui_spec(ESCAPED_PROTO, source="escaped.html")
+    assert [p["label"] for p in spec.pages] == ["智能体配置"], spec.pages
+    titles = [m.title for m in spec.modals]
+    assert "未保存修改" in titles, titles
+    assert any("文件大小不能超过 1MB" in m for m in spec.messages), spec.messages
+    # 转义的中文按钮曾被「含中文」判定误杀，此断言锁住该修复
+    assert any("添加文档知识" in b for b in spec.buttons), spec.buttons
+    fields = {f.id: f for f in spec.fields}
+    assert fields["docName"].placeholder == "输入文档名称", fields["docName"]
+
+
+def test_escaped_and_plain_prototypes_agree():
+    """同一原型的转义/明文两种写法必须得到等价契约（确定性的前提）。"""
+    plain = ("<html><body><div id='nav'></div><script>\n"
+             "const navs=[['config','智能体配置']];\n"
+             "function p(){modal('未保存修改','b','关闭',close)}\n"
+             "</script></body></html>")
+    a = extract_ui_spec(plain, source="p.html")
+    b = extract_ui_spec(ESCAPED_PROTO, source="p.html")
+    assert [p["key"] for p in a.pages] == [p["key"] for p in b.pages]
+    assert "未保存修改" in [m.title for m in a.modals]
+    assert "未保存修改" in [m.title for m in b.modals]
+
+
+def test_auto_detects_prototype_from_ingested_bundle(tmp_path):
+    """**核心回归**：从 UI 上传文件夹时，其中的原型 HTML 必须被自动解析为契约。
+
+    为什么重要：`--attach` 是 CLI 入口；UI 上传时原型只是被当作
+    **普通文本附件**内联进正文 —— 它携带的真实标识符/页面/弹窗按钮全都没被利用，
+    模型仍会编造标识符，同时原型正文还稀释了 PRD 的注意力。
+    实测用户上传的文件夹里就有 `养老Agent后台-prototype-测试内嵌版.html`。
+    """
+    from prd2tc import loader
+    from prd2tc.config import Config
+    from prd2tc.pipeline import PipelineRunner
+
+    root = tmp_path / "包"
+    (root / "图片和附件").mkdir(parents=True)
+    (root / "PRD.md").write_text(
+        "# 需求\n\n## 6.1\n\n![智能体配置整体](https://x/A)\n", encoding="utf-8")
+    (root / "prototype.html").write_text(FIXTURE, encoding="utf-8")
+    (root / "图片和附件" / "x.png").write_bytes(PNG)
+
+    bundle = loader.load_bundle([root / "PRD.md", root / "图片和附件", root / "prototype.html"])
+    runner = PipelineRunner(Config("k", "https://x", "m", 0.4, 10, 1))
+    out = tmp_path / "out"
+    out.mkdir()
+    spec, metas = runner._auto_prototypes(bundle, out)
+
+    assert spec is not None, "应自动识别到原型"
+    assert [p["key"] for p in spec.pages] == ["history", "config", "knowledge"]
+    assert "docName" in spec.anchor_values()
+    assert metas and metas[0]["autoDetected"] is True
+    # 契约落盘（供追溯）
+    assert (out / "analysis" / "ui-spec.json").is_file()
+
+
+def test_auto_prototypes_ignores_non_html_inputs(tmp_path):
+    """没有原型时不得报错，也不得凭空产出契约。"""
+    from prd2tc import loader
+    from prd2tc.config import Config
+    from prd2tc.pipeline import PipelineRunner
+
+    prd = tmp_path / "PRD.md"
+    prd.write_text("# 需求\n", encoding="utf-8")
+    bundle = loader.load_bundle([prd])
+    runner = PipelineRunner(Config("k", "https://x", "m", 0.4, 10, 1))
+    out = tmp_path / "out"
+    out.mkdir()
+    spec, metas = runner._auto_prototypes(bundle, out)
+    assert spec is None and metas == []
+
+
+def test_auto_prototypes_survives_broken_html(tmp_path):
+    """损坏的 HTML 只告警，不中断（原型是增强输入，不是硬依赖）。"""
+    import warnings as _w
+    from prd2tc import loader
+    from prd2tc.config import Config
+    from prd2tc.pipeline import PipelineRunner
+
+    prd = tmp_path / "PRD.md"
+    prd.write_text("# 需求\n", encoding="utf-8")
+    bad = tmp_path / "broken.html"
+    bad.write_text("just text, no html markers", encoding="utf-8")
+    bundle = loader.load_bundle([prd, bad])
+    runner = PipelineRunner(Config("k", "https://x", "m", 0.4, 10, 1))
+    out = tmp_path / "out"
+    out.mkdir()
+    with _w.catch_warnings(record=True):
+        _w.simplefilter("always")
+        spec, metas = runner._auto_prototypes(bundle, out)
+    assert spec is None
+
+
+def test_request_dict_persists_attachments_and_image_options():
+    """原型契约与图片选项必须随请求持久化。
+
+    否则阶段 2/3 从 task.json 重建请求后会丢失 `--attach` 的 UI 契约
+    与图片设置 —— 表现为「阶段一有契约、后续阶段又回去编造标识符」。
+    """
+    from prd2tc.pipeline import GenerateRequest
+    from prd2tc.service import create_app   # noqa: F401  (确保模块可导入)
+    from prd2tc import service as _svc
+
+    # 直接复用 service 内部的序列化实现
+    req = GenerateRequest(prd=["a.md", "b.png"], out="o", product="p", version="v",
+                          attachments=["proto.html"], image_dirs=["imgs"],
+                          fetch_images=True, analyze_images=False)
+    # _encode_prd 是模块级函数，request_dict 是闭包内函数；此处按同样语义断言
+    assert _svc._encode_prd(req.prd) == ["a.md", "b.png"]
+    decoded = _svc._decode_prd(_svc._encode_prd(req.prd))
+    assert decoded == [Path("a.md"), Path("b.png")]
+
+
+def test_generate_wires_auto_detected_prototype_into_ui_contract(tmp_path):
+    """**接线回归**：`generate()` 必须把自动识别的原型真正接进阶段 3。
+
+    前一条测试只验证 `_auto_prototypes` 本身可用；
+    但「调用它」这一步是独立的一行代码，删掉后前者仍会通过 ——
+    需要端到端断言 `ui-spec.json` 确实由 generate 产出
+    （否则原型只是被当普通文本附件，标识符仍靠模型编造）。
+    """
+    import json as _json
+
+    from prd2tc.config import Config
+    from prd2tc.pipeline import GenerateRequest, PipelineRunner
+
+    root = tmp_path / "包"
+    root.mkdir()
+    (root / "PRD.md").write_text(
+        "# 需求\n\n## 6.1 配置\n\nREQ-AUTH-001 登录\n", encoding="utf-8")
+    (root / "prototype.html").write_text(FIXTURE, encoding="utf-8")
+
+    out = tmp_path / "out"
+    runner = PipelineRunner(Config("k", "https://x", "m", 0.4, 10, 1))
+    result = runner.generate(GenerateRequest(
+        prd=[root / "PRD.md", root / "prototype.html"], out=out,
+        product="p", version="v1", stub=True, jobs=1))
+
+    spec_path = result.root / "analysis" / "ui-spec.json"
+    assert spec_path.is_file(), "generate 未产出 UI 契约（自动识别未接线）"
+    data = _json.loads(spec_path.read_text(encoding="utf-8"))
+    assert [p["key"] for p in data["pages"]] == ["history", "config", "knowledge"], data["pages"]
+    assert data["modals"], data["modals"]
+
+
+def test_generate_records_auto_detected_attachment_meta(tmp_path):
+    """manifest 里应记录「原型是自动识别的」，便于追溯契约来源。"""
+    import json as _json
+
+    from prd2tc.config import Config
+    from prd2tc.pipeline import GenerateRequest, PipelineRunner
+
+    root = tmp_path / "包"
+    root.mkdir()
+    (root / "PRD.md").write_text("# 需求\n\nREQ-AUTH-001 登录\n", encoding="utf-8")
+    (root / "prototype.html").write_text(FIXTURE, encoding="utf-8")
+    runner = PipelineRunner(Config("k", "https://x", "m", 0.4, 10, 1))
+    result = runner.generate(GenerateRequest(
+        prd=[root / "PRD.md", root / "prototype.html"], out=tmp_path / "out",
+        product="p", version="v1", stub=True, jobs=1))
+    manifest = _json.loads((result.root / "run-manifest.json").read_text(encoding="utf-8"))
+    metas = manifest.get("attachments") or []
+    assert any(m.get("autoDetected") for m in metas), metas
 
 
 # ---------- 与流水线集成 ----------

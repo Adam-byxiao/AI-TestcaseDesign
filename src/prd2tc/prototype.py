@@ -123,6 +123,28 @@ _ONCLICK_FN_RE = re.compile(
 # 模版/字符串拼接残留：`'+(cond?'a':'b')+'`、`${...}`、孤立引号
 _TERNARY_RE = re.compile(r"\?\s*'([^']*)'\s*:\s*'([^']*)'")
 _TEMPLATE_EXPR_RE = re.compile(r"\$\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}")
+# JS 字符串转义：\uXXXX 与 \xXX。压缩/构建产物常把中文写成转义序列。
+_JS_ESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})")
+
+
+def js_unescape(text: str) -> str:
+    r"""解码 JS 字符串转义（`\uXXXX` / `\xXX`）。
+
+    为什么需要：打包或工具生成的原型会把中文写成
+    `'\u672a\u4fdd\u5b58\u4fee\u6539'`，直接取字面量只会得到一串反斜杠文本 ——
+    契约里的标题与按钮全是噪声，甚至被 `_is_ui_label` 的「含中文」判定误杀。
+
+    只对**已提取的字符串值**解码，不对整段 JS 解码：
+    后者会把 `\u0027`（单引号）变成 `'`，破坏引号配对，导致后续正则整体错位。
+    """
+    if not text or "\\" not in text:
+        return text
+    out = _JS_ESC_RE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+    # 合并代理对（如 \ud83d\ude00），避免留下孤立代理导致后续编码失败
+    try:
+        return out.encode("utf-16", "surrogatepass").decode("utf-16")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return out
 # 明显不是 UI 文案的标记（属性值/状态名/变量名）
 _NON_LABEL = {
     "active", "wide", "primary", "link", "danger", "on", "off", "empty",
@@ -200,15 +222,15 @@ def _split_top_args(call_args: str) -> list[str]:
 
 
 def _literal(value: str) -> str:
-    """从 JS 表达式取字样面量；三元表达式取全部候选。"""
+    """从 JS 表达式取字样面量；三元表达式取全部候选（并解码 JS 转义）。"""
     v = value.strip()
     if re.fullmatch(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", v):
-        return v[1:-1]
+        return js_unescape(v[1:-1])
     cands = [a for a, _ in _TERNARY_RE.findall(v)] + [b for _, b in _TERNARY_RE.findall(v)]
     if cands:
-        return " / ".join(dict.fromkeys(c for c in cands if c))
+        return js_unescape(" / ".join(dict.fromkeys(c for c in cands if c)))
     found = re.findall(r"'([^']{1,40})'", v)
-    return " / ".join(dict.fromkeys(found)) if found else ""
+    return js_unescape(" / ".join(dict.fromkeys(found))) if found else ""
 
 
 def _strip_tags(text: str) -> str:
@@ -242,7 +264,7 @@ def _clean_label(text: str) -> str:
     # 仅当因去掉前导 `(` 才配对去掉尾部 `)`；否则会误伤 `通话时长(s)` 这类真实列名
     if had_paren and t.endswith(")"):
         t = t[:-1]
-    return t.strip()
+    return js_unescape(t.strip())
 
 
 def _is_ui_label(text: str) -> bool:
@@ -274,7 +296,7 @@ def _parse_pairs(array_literal: str) -> list[dict]:
             continue
         if not label:
             continue
-        out.append({"key": key, "label": label})
+        out.append({"key": key, "label": js_unescape(label)})
     return out
 
 
@@ -336,7 +358,7 @@ def _extract_fields(html: str, js: str) -> list[UiField]:
             id=fid.group(1),
             label=_clean_label(labels[-1]) if labels else "",
             tag=tag,
-            placeholder=ph.group(1) if ph else "",
+            placeholder=js_unescape(ph.group(1)) if ph else "",
             maxlength=ml.group(1) if ml else "",
         )
     return [fields[k] for k in sorted(fields)]
@@ -439,7 +461,7 @@ def extract_ui_spec(html: str, *, source: str = "") -> UiSpec:
     messages: list[str] = []
     for m in _TOAST_RE.finditer(js):
         val = next((g for g in m.groups() if g), "")
-        val = _TEMPLATE_EXPR_RE.sub("…", val)
+        val = js_unescape(_TEMPLATE_EXPR_RE.sub("…", val))
         if val:
             messages.append(val)
 

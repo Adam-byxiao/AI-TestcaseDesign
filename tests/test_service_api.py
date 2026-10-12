@@ -306,6 +306,57 @@ def test_update_prd_carries_assets_to_new_version(client, tmp_path):
     assert client.get(f"/api/v1/prds/{updated['prdId']}").json()["files"]
 
 
+def test_request_roundtrip_preserves_path_list(client):
+    """**核心回归**：多文件请求经 task.json 往返后，`prd` 必须仍是路径列表。
+
+    实测事故：`request_dict` 写成 `str(req.prd)`，多文件时存成
+    `"[WindowsPath('D:/a.md'), WindowsPath('D:/b.png')]"`。
+    阶段一用内存里的原始请求故能成功；阶段二从 task.json 重建时
+    这串文本被当作单个路径 → `ValueError: 没有可用的输入（输入不存在: [...]）`。
+    """
+    from prd2tc.service import _decode_prd, _encode_prd
+    paths = [Path("D:/w/prd.md"), Path("D:/w/图/x.png")]
+    encoded = _encode_prd(paths)
+    assert isinstance(encoded, list) and all(isinstance(x, str) for x in encoded), encoded
+    # JSON 往返（task.json 的真实存储方式）
+    decoded = _decode_prd(json.loads(json.dumps(encoded)))
+    assert decoded == paths, decoded
+    # 单文件仍为标量
+    assert _encode_prd(Path("D:/w/a.md")) == str(Path("D:/w/a.md"))
+    assert _decode_prd(_encode_prd(Path("D:/w/a.md"))) == Path("D:/w/a.md")
+
+
+def test_legacy_stringified_prd_list_is_recovered():
+    """旧的字符串化列表必须能还原 —— 否则已失败的任务无法恢复、用户要重传。"""
+    from prd2tc.service import _decode_prd
+    legacy = "[WindowsPath('D:/a/b.md'), WindowsPath('D:/a/c.png')]"
+    assert _decode_prd(legacy) == [Path("D:/a/b.md"), Path("D:/a/c.png")]
+    # 普通字符串（正常单文件）不得被误判为列表
+    assert _decode_prd("D:/a/b.md") == Path("D:/a/b.md")
+
+
+def test_build_request_passes_all_files_and_survives_stage_handoff(client, tmp_path):
+    """上传多文件后：请求携带全部文件，且经 request_dict/request_from 往返不丢信息。"""
+    from prd2tc.service import _decode_prd
+    meta = client.post("/api/v1/prds", files=[
+        ("files", ("我的PRD/PRD.md", "# 需求\n".encode(), "text/markdown")),
+        ("files", ("我的PRD/图片和附件/x.png", PNG_BYTES, "image/png")),
+    ]).json()
+    body = {"product": "p", "version": "v1"}
+    task = client.post("/api/v1/runs", json={**body, "prdId": meta["prdId"],
+                                             "stub": True, "auto": True}).json()
+    # 该运行能跑到成功（阶段一与后续阶段共用同一序列化路径）
+    run = wait_for(client, task["taskId"], {"succeeded", "failed"})
+    assert run["status"] == "succeeded", run.get("errors")
+    # 请求里的 prd 落盘后必须是列表（不是字符串化文本）
+    workspace = tmp_path / "workspace" / "tasks" / f"{task['taskId']}.json"
+    payload = json.loads(workspace.read_text(encoding="utf-8"))
+    stored = payload["request"]["prd"]
+    assert isinstance(stored, list), stored
+    assert len(stored) >= 2, stored
+    assert all("WindowsPath(" not in str(x) for x in stored), stored
+
+
 def test_upload_rejects_unsupported_format(client):
     resp = client.post("/api/v1/prds",
                        files={"file": ("book.xlsx", b"PK\x03\x04x", "application/vnd.ms-excel")})
