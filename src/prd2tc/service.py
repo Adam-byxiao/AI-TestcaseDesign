@@ -65,6 +65,28 @@ def _decode_prd(value):
     return Path(text)
 
 
+def _credential_error(*, stub: bool, dry_run: bool, requires_key: bool, has_key: bool,
+                      session_id: str | None, session_alive: bool) -> str | None:
+    """凭证问题的**可操作**提示；无问题返回 None。
+
+    必须区分「会话已过期」与「从未配置」：
+    前者的提示若写成「未配置 LLM 凭证」，用户会反复去「模型配置」重新保存，
+    却始终失败 —— 因为真因是旧会话失效、而新会话没被用上（实测最困惑之处）。
+
+    抽成纯函数是为了**可单测**：stub 模式下不会走到这段逻辑，
+    若内联在 `run_task` 里，这两条消息实际无法被任何测试触达
+    （变异测试因此漏报过一次）。
+    """
+    if stub or dry_run or not requires_key or has_key:
+        return None
+    if session_id and not session_alive:
+        return ("LLM 会话已过期（服务重启，或保存后超过 1 小时未操作）。"
+                "请在「模型配置」重新保存会话，然后回到本页点「恢复」重试；"
+                "已完成阶段的产物不会丢失。")
+    return ("未配置 LLM 凭证：请先在「模型配置」保存会话，"
+            "或在环境中设置对应 Provider 的 API Key。")
+
+
 def _safe_relpath_parts(relpath: str) -> list[str]:
     """把上传的相对路径拆成**安全的目录段**（用于在磁盘上还原目录结构）。
 
@@ -187,6 +209,8 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
     except ImportError as exc: raise RuntimeError("服务模式需要安装: pip install 'prd2tc[service]'") from exc
     app = FastAPI(title="prd2tc service", version=__version__); store = WorkspaceStore(state_dir)
+    # 暴露工作区存储：便于测试与排障（如检查 LLM 会话是否仍存活）。
+    app.state.store = store
     executor = ThreadPoolExecutor(max_workers=max(1, max_workers)); base_config = config or Config.from_env()
     root = store.root
 
@@ -248,13 +272,49 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
             payload["prd"] = _decode_prd(payload["prd"])
         return GenerateRequest(**payload, stage=require_stage(stage), resume=resume)
 
+    def _resolve_session(task: dict, provided: str | None = None):
+        """决定本次运行使用哪个 LLM 会话，返回 (session, session_id)。
+
+        优先用**本次请求带来的**会话（用户刚在「模型配置」保存的那个），
+        其次才是任务创建时记录的。为什么必须这样：
+
+        `store.sessions` 是**内存态**、TTL 1 小时且随服务重启失效；而 task.json 里
+        存的是旧的 sessionId。用户重新配置后旧 ID 已死，端点却仍拿旧 ID 去取会话 →
+        取不到 → 静默退化成空凭证 → 报「未配置 LLM 凭证」。
+        用户照提示重新配置，仍然失败（因为根本没用到新会话）。
+
+        `provided` 无效时直接 401 明确报错，不静默降级。
+        """
+        if provided:
+            sid = str(provided)
+            session = store.get_session(sid)
+            if not session:
+                raise HTTPException(401, "LLM 会话已过期，请在「模型配置」重新保存后再重试")
+            return session, sid
+        stored = task.get("sessionId")
+        if stored:
+            return store.get_session(str(stored)), str(stored)
+        return None, None
+
     def run_task(task_id: str, req: GenerateRequest, session_id: str | None = None, review_mode: bool = True):
         session = store.get_session(session_id) if session_id else None
         runner_config = base_config
         if session:
             runner_config = replace(base_config, provider=session["provider"], model=session["model"], api_base=session["apiBase"], api_key=session.get("apiKey", ""), temperature=float(session.get("temperature", base_config.temperature)), timeout=int(session.get("timeout", base_config.timeout)))
         try:
-            current = stage_name(req.stage); task = store.task(task_id) or {}; stage_states = dict(task.get("stageStates", {})); stage_states[current] = "running"
+            current = stage_name(req.stage); task = store.task(task_id) or {}
+            # 凭证前置校验：把「会话已过期」与「从未配置」区分开，并给出可操作提示。
+            # 否则会一路走到 pipeline 抛「未配置 LLM 凭证」——
+            # 用户照提示重新配置后**仍然失败**（真因是旧会话失效，新会话没被用上），
+            # 这是实测中最令人困惑的一点。
+            problem = _credential_error(
+                stub=bool(req.stub), dry_run=bool(req.dry_run),
+                requires_key=runner_config.requires_api_key(),
+                has_key=bool(runner_config.api_key),
+                session_id=session_id, session_alive=session is not None)
+            if problem:
+                raise ValueError(problem)
+            stage_states = dict(task.get("stageStates", {})); stage_states[current] = "running"
             store.save_task(task_id, status="running", currentStage=current, failedStage=None, stageStates=stage_states)
             store.event(task_id, stage=current, type="run_started", status="running", percent=task.get("percent", 0), message=f"开始 {current}")
             runner = PipelineRunner(runner_config)
@@ -641,14 +701,18 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         task = store.task(run_id)
         if not task: raise HTTPException(404, "运行不存在")
         if task.get("status") != "awaiting_review" or task.get("currentStage") != stage: raise HTTPException(409, "当前阶段不可批准")
-        if body: save_draft(run_id, stage, body)
+        # sessionId 是控制参数，必须先从草稿体里摘掉：
+        # save_draft 会对 body 整体做哈希并原样存为草稿内容，混进去会污染草稿与 contentHash。
+        payload = dict(body or {})
+        _session, sid = _resolve_session(task, payload.pop("sessionId", None))
+        if payload: save_draft(run_id, stage, payload)
         apply_draft(task, stage)
         latest = store._json(draft_path(run_id, stage), {})
         review=dict(task.get("review",{})); review[stage]={"status":"approved","approvedBy":"local-user","approvedAt":now_iso(),"contentHash":latest.get("contentHash")}; states=dict(task.get("stageStates",{})); states[stage]="approved"
         if stage == "cases":
             store.save_task(run_id,status="succeeded",currentStage="done",stageStates=states,review=review); store.event(run_id,stage=stage,type="stage_approved",status="succeeded",percent=100,message="用例已批准"); return store.task(run_id)
         next_stage = "2" if stage == "analysis" else "3"; next_name=stage_name(next_stage); states[next_name]="pending"
-        store.save_task(run_id,status="pending",currentStage=next_name,stageStates=states,review=review); req=request_from(task["request"],next_stage,True); executor.submit(run_task,run_id,req,task.get("sessionId"),True); return store.task(run_id)
+        store.save_task(run_id,status="pending",currentStage=next_name,stageStates=states,review=review,sessionId=sid); req=request_from(task["request"],next_stage,True); executor.submit(run_task,run_id,req,sid,True); return store.task(run_id)
 
     @app.post("/api/v1/runs/{run_id}/stages/{stage}/reject")
     def reject_stage(run_id: str, stage: str, body: dict):
@@ -660,14 +724,15 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         data=store.save_task(run_id,status="rejected",stageStates=states,review=review); store.event(run_id,stage=stage,type="stage_rejected",status="rejected",percent=task.get("percent",0),message=reason); return data
 
     @app.post("/api/v1/runs/{run_id}/modules/{module}/retry")
-    def retry_module(run_id: str, module: str):
+    def retry_module(run_id: str, module: str, body: dict | None = None):
         task=store.task(run_id)
         if not task or not task.get("request"): raise HTTPException(404,"运行不存在")
         output_state = store._json(Path(task.get("output", "")) / "run-state.json", {}) if task.get("output") else {}
         modules = output_state.get("modules", {})
         if module not in modules: raise HTTPException(404, "模块不存在")
         if modules.get(module) != "failed": raise HTTPException(409, "仅失败模块可重试")
-        req=request_from(task["request"],"3",True); store.save_task(run_id,status="pending",currentStage="cases",retryModule=module); executor.submit(run_task,run_id,req,task.get("sessionId"),True); return store.task(run_id)
+        _session, sid = _resolve_session(task, (body or {}).get("sessionId"))
+        req=request_from(task["request"],"3",True); store.save_task(run_id,status="pending",currentStage="cases",retryModule=module,sessionId=sid); executor.submit(run_task,run_id,req,sid,True); return store.task(run_id)
     @app.post("/api/v1/runs/{run_id}/cancel")
     def cancel_run(run_id: str):
         # 真正止损：置取消标志，流式回调命中后立即停止接收响应
@@ -676,13 +741,16 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         store.event(run_id, type="run_cancelled", status="cancelled", percent=0, message="已请求取消")
         return store.save_task(run_id, status="cancelled", currentStage="cancelled")
     @app.post("/api/v1/runs/{run_id}/resume")
-    def resume_run(run_id: str):
+    def resume_run(run_id: str, body: dict | None = None):
         task = store.task(run_id)
         if not task: raise HTTPException(404, "运行不存在")
         failed=task.get("failedStage") or task.get("currentStage")
         stage={"analysis":"1","plan":"2","cases":"3"}.get(failed)
         if not stage: raise HTTPException(409,"当前状态不可恢复")
-        req=request_from(task["request"],stage,True); store.save_task(run_id,status="pending",currentStage=failed); executor.submit(run_task,run_id,req,task.get("sessionId"),True); return store.task(run_id)
+        # 恢复时常已隔了一段时间（甚至服务重启过），旧会话多半失效 ——
+        # 因此优先采用前端带来的新会话，并写回任务，供后续阶段继续使用。
+        _session, sid = _resolve_session(task, (body or {}).get("sessionId"))
+        req=request_from(task["request"],stage,True); store.save_task(run_id,status="pending",currentStage=failed,sessionId=sid); executor.submit(run_task,run_id,req,sid,True); return store.task(run_id)
     @app.get("/api/v1/runs/{run_id}/artifacts")
     def artifacts(run_id: str):
         task = store.task(run_id)

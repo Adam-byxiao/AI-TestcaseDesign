@@ -357,6 +357,264 @@ def test_build_request_passes_all_files_and_survives_stage_handoff(client, tmp_p
     assert all("WindowsPath(" not in str(x) for x in stored), stored
 
 
+def _make_session(client, monkeypatch, *, api_key="sk-test", provider="openai"):
+    """写入一个 LLM 会话并返回 sessionId。
+
+    走真实端点（验证其行为），但**打桩探测** —— 该端点会真实探测网络并拒绝保存，
+    单元测试不得访问网络。
+    """
+    _stub_probe(monkeypatch)
+    resp = client.post("/api/v1/sessions/llm-config", json={
+        "provider": provider, "apiBase": "https://api.example.com/v1",
+        "model": "m", "apiKey": api_key})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["sessionId"]
+
+
+def test_approved_stage_uses_freshly_provided_session(client, monkeypatch):
+    """**核心回归**：阶段推进必须采用**本次请求带来的**新会话。
+
+    实测事故：用户重新在「模型配置」保存后，点「批准」仍报「未配置 LLM 凭证」。
+    根因是端点用 task.json 里记录的**旧** sessionId —— 服务端会话是内存态、
+    TTL 1 小时且随重启失效；用户新配的会话压根没被用上。
+    """
+    # 旧会话写入任务后失效（模拟服务重启/TTL 过期）
+    stale = _make_session(client, monkeypatch, api_key="sk-stale")
+    fresh = _make_session(client, monkeypatch, api_key="sk-fresh")
+    assert stale != fresh
+
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True,
+                                            "jobs": 1, "sessionId": stale}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    assert run["currentStage"] == "analysis", run
+
+    # 让旧会话失效：直接清掉（等价于服务重启 / TTL 过期）
+    store = _store_of(client)
+    store.sessions.pop(stale, None)
+
+    # 用**新会话**批准：必须成功，且新会话被写回任务
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve",
+                       json={"sessionId": fresh})
+    assert resp.status_code == 200, resp.text
+    after = client.get(f"/api/v1/runs/{run['taskId']}").json()
+    assert after.get("sessionId") == fresh, after.get("sessionId")
+
+
+def test_approve_with_expired_session_reports_expiry_not_missing_credentials(client, monkeypatch):
+    """会话失效时必须报「会话已过期」，而不是误导性的「未配置 LLM 凭证」。
+
+    用户按「未配置」的提示反复重新配置，却始终失败 —— 实测最令人困惑之处。
+    """
+    stale = _make_session(client, monkeypatch)
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True,
+                                            "sessionId": stale}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    _store_of(client).sessions.pop(stale, None)
+
+    # 明确带来一个失效的 sessionId → 立刻 401 且说明是过期
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve",
+                       json={"sessionId": stale})
+    assert resp.status_code == 401, resp.text
+    assert "过期" in resp.json()["detail"], resp.json()
+
+
+def test_approve_does_not_pollute_draft_with_session_id(client, monkeypatch):
+    """`sessionId` 是控制参数，绝不能混进草稿体。
+
+    `save_draft` 会对 body 整体做哈希并原样存为草稿内容 —— 混进去会污染草稿
+    与 contentHash（进而影响「已审阅内容」的指纹比对）。
+    """
+    session = _make_session(client, monkeypatch)
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True,
+                                            "sessionId": session}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve",
+                       json={"sessionId": session, "markdown": "# 我改过的分析"})
+    assert resp.status_code == 200, resp.text
+    drafts = list((_workspace_of(client) / "drafts" / run["taskId"]).glob("analysis.json"))
+    assert drafts, "草稿未落盘"
+    saved = json.loads(drafts[0].read_text(encoding="utf-8"))
+    assert "sessionId" not in json.dumps(saved.get("content") or {}, ensure_ascii=False)
+    assert saved["content"].get("markdown") == "# 我改过的分析"
+
+
+def test_resume_and_retry_accept_fresh_session(client, monkeypatch):
+    """恢复与模块重试同样必须支持传入新会话（否则同一类困惑会复现）。"""
+    stale = _make_session(client, monkeypatch)
+    fresh = _make_session(client, monkeypatch)
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True,
+                                            "sessionId": stale}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    _store_of(client).sessions.pop(stale, None)
+
+    # 恢复：带新会话应被接受并写回
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/resume", json={"sessionId": fresh})
+    assert resp.status_code in {200, 409}, resp.text        # 409 = 当前状态不可恢复，非本测试关注点
+    if resp.status_code == 200:
+        assert client.get(f"/api/v1/runs/{run['taskId']}").json().get("sessionId") == fresh
+
+    # 过期会话：明确 401，而不是静默降级
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/resume", json={"sessionId": stale})
+    assert resp.status_code == 401, resp.text
+    assert "过期" in resp.json()["detail"], resp.json()
+
+
+def _workspace_of(client) -> Path:
+    return _store_of(client).root
+
+
+def _store_of(client):
+    """取出 service 的 WorkspaceStore（create_app 挂在 app.state.store 上）。"""
+    store = getattr(client.app.state, "store", None)
+    assert store is not None and hasattr(store, "sessions"), "未找到 WorkspaceStore"
+    return store
+
+
+def test_credential_error_distinguishes_expiry_from_missing_config():
+    """凭证提示策略必须区分「会话过期」与「从未配置」。
+
+    为什么单独测这个纯函数：stub 模式下 `run_task` 不会走到该分支，
+    这两条消息**无法**通过端点测试触达 —— 变异测试曾因此漏报
+    （把「会话过期」的提示删掉，所有测试仍然全绿）。
+    """
+    from prd2tc.service import _credential_error
+
+    base = dict(stub=False, dry_run=False, requires_key=True)
+
+    # 有可用 key：无问题
+    assert _credential_error(**base, has_key=True, session_id="s", session_alive=True) is None
+    # stub / dry-run 不校验凭证
+    assert _credential_error(stub=True, dry_run=False, requires_key=True, has_key=False,
+                             session_id="s", session_alive=False) is None
+    assert _credential_error(stub=False, dry_run=True, requires_key=True, has_key=False,
+                             session_id="s", session_alive=False) is None
+    # ollama 之类不需要 key
+    assert _credential_error(stub=False, dry_run=False, requires_key=False, has_key=False,
+                             session_id=None, session_alive=False) is None
+
+    # 带了会话但已失效 → 必须说「过期」（可操作指引）
+    expired = _credential_error(**base, has_key=False, session_id="s", session_alive=False)
+    assert expired and "过期" in expired, expired
+    assert "恢复" in expired, expired           # 要给出下一步动作
+
+    # 压根没会话也没 key → 说「未配置」
+    missing = _credential_error(**base, has_key=False, session_id=None, session_alive=False)
+    assert missing and "未配置" in missing, missing
+    assert "过期" not in missing, missing       # 不得混用两种原因
+
+
+def test_run_creation_rejects_expired_session_before_queueing(client, monkeypatch):
+    """创建运行时若带来已失效的 sessionId，必须**立刻 401**、不入队、不产生任务。
+
+    比「入队后失败」更好：用户立即得到明确原因，也不会留下一条失败记录。
+    """
+    stale = _make_session(client, monkeypatch)
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    _store_of(client).sessions.pop(stale, None)
+
+    # 非 stub：会真正校验凭证（stub 会跳过整段检查）
+    resp = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": False,
+                                             "sessionId": stale, "auto": True})
+    assert resp.status_code == 401, resp.text
+    assert "过期" in resp.json()["detail"], resp.json()
+    # 没有产生失败任务
+    tasks = [t for t in client.get("/api/v1/runs").json() if t.get("prdId") == prd["prdId"]]
+    assert tasks == [], tasks
+
+
+def test_legacy_run_endpoint_reports_credential_problem(client, monkeypatch):
+    """**接线回归**：旧版 `POST /runs` 走 `run_task` 且不传 sessionId —— 它正是
+    能到达 `run_task` 凭证检查的路径（新版端点会在创建时就拦截）。
+
+    该端点原先**完全没有凭证校验**，会一路走到 pipeline 才报错，
+    错误信息也含糊（用户看不出该去配模型还是该恢复运行）。
+    这里断言：任务失败且原因明确指向「未配置凭证 / 会话过期」其中之一。
+    """
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    # 非 stub 且不提供会话 → 必然缺少凭证
+    resp = client.post("/runs", json={"prd": str(sample), "stub": False})
+    assert resp.status_code == 202, resp.text
+    run = wait_for(client, resp.json()["taskId"], {"failed", "succeeded"})
+    assert run["status"] == "failed", run
+    blob = json.dumps(run.get("errors") or [], ensure_ascii=False)
+    assert ("未配置 LLM 凭证" in blob) or ("过期" in blob), blob
+
+
+def test_approve_without_session_after_expiry_reports_expiry(client, monkeypatch):
+    """**可观测路径**：任务里存有会话、会话随后失效、用户**不带** sessionId 直接批准。
+
+    这是真实场景（服务重启后用户直接点「批准」，没意识到需要重配）。
+    此时 `_resolve_session` 回退到任务里的旧 ID（取不到会话但不报错），
+    必须由 `run_task` 的凭证前置校验报出「过期」。
+
+    观测方式：凭证检查发生在**构造 PipelineRunner 之前**，
+    因此打桩 Runner 并断言它**从未被构造** —— 这是与「删掉前置校验」的
+    确定性区别（后者会一路走到 Runner 才失败，且消息含糊）。
+    """
+    import prd2tc.service as _svc
+
+    session = _make_session(client, monkeypatch)
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True,
+                                            "sessionId": session}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    assert run["currentStage"] == "analysis", run
+    _store_of(client).sessions.pop(session, None)     # 模拟重启/超时
+
+    # 把**存下来的请求**改成非 stub（模拟真实模型运行）：
+    # 用 stub 跑到待审阅可避免联网，但 stub 会正确地跳过凭证校验，
+    # 因此必须翻转该标记才能真正观测到前置校验。
+    stored = client.get(f"/api/v1/runs/{run['taskId']}").json()
+    _store_of(client).save_task(run["taskId"],
+                                request={**(stored.get("request") or {}), "stub": False})
+
+    constructed: list = []
+
+    class _FakeRunner:
+        def __init__(self, *_a, **_k):
+            constructed.append(True)
+            self.live = type("L", (), {"snapshot": lambda self, force=False: {},
+                                       "final_snapshot": lambda self: None,
+                                       "set_stage": lambda self, s: None,
+                                       "begin_module": lambda self, *a, **k: None,
+                                       "finish_module": lambda self, *a, **k: None,
+                                       "mark_cancelled": lambda self: None})()
+            self.cancel_flag = type("C", (), {"is_set": lambda self: False})()
+
+        def generate(self, *_a, **_k):
+            raise AssertionError("前置凭证校验未生效：Runner 不该被构造")
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(_svc, "PipelineRunner", _FakeRunner)
+
+    # 不带 sessionId 批准 → 必须在前置校验处失败，Runner 不构造
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve", json={})
+    assert resp.status_code == 200, resp.text
+    after = wait_for(client, run["taskId"], {"failed", "awaiting_review", "succeeded"})
+    blob = json.dumps(after.get("errors") or [], ensure_ascii=False)
+    assert "过期" in blob, blob
+    assert "未配置 LLM 凭证" not in blob, blob
+    assert constructed == [], "凭证校验应先于 Runner 构造"
+
+
 def test_upload_rejects_unsupported_format(client):
     resp = client.post("/api/v1/prds",
                        files={"file": ("book.xlsx", b"PK\x03\x04x", "application/vnd.ms-excel")})
