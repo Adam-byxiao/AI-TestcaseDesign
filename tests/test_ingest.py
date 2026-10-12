@@ -309,6 +309,81 @@ def test_loader_marks_first_explicit_file_as_primary(tmp_path):
     assert len(b.images()) == 1
 
 
+def test_depth_outranks_name_hint():
+    """**隔离 depth 的用例**：浅层文件无名称线索，深层文件有名称线索，浅层必须胜出。
+
+    为什么需要这条：其他 depth 用例里浅层文件恰好叫 `PRD.md`，
+    「名称线索」会先命中，于是即使把 depth 从评分里删掉测试也照样通过
+    （变异测试因此漏报）。本用例让深层文件独占名称线索，从而真正锁住 depth 优先级。
+
+    设计理由：**目录结构是用户意图的直接表达且与语言无关** ——
+    把主文档放根目录、把资料放进子目录是通用约定；而名称线索依赖语言
+    （需同时覆盖 `prd`/`需求`/`spec`/`requirement`）。故 depth 先于名称线索。
+    """
+    deep_named = "# 详细需求说明\n\n" + "细节。" * 3000        # 更深、且名字含「需求」
+    b = ingest.ingest([
+        ("主文档.md", "# 主文档正文\n".encode(), "u", "包/主文档.md"),          # depth 1，无线索
+        ("需求详情.md", deep_named.encode(), "u", "包/资料/需求详情.md"),        # depth 2，有线索
+    ])
+    assert b.primary == "主文档.md", b.primary
+
+
+def test_depth_from_relpath_prefers_shallower():
+    """文件夹上传：`(name, bytes, origin, relpath)` 的层级必须参与主文件判定。
+
+    真实形态：`我的PRD/PRD.md`（depth 0）vs
+    `我的PRD/图片和附件/rag-service.md`（depth 1，且内容更长）。
+    只看长度会让附件抢占正文。
+    """
+    long_attach = "# RAG 接口说明\n\n" + "接口细节。" * 3000
+    b = ingest.ingest([
+        ("PRD.md", b"# \xe4\xb8\xbb\xe9\x9c\x80\xe6\xb1\x82\n", "u", "我的PRD/PRD.md"),
+        ("rag-service.md", long_attach.encode(), "u", "我的PRD/图片和附件/rag-service.md"),
+    ])
+    assert b.primary == "PRD.md", b.primary
+    depths = {s.name: s.depth for s in b.sources}
+    assert depths == {"PRD.md": 1, "rag-service.md": 2}, depths
+
+
+def test_depth_from_base_dir_for_disk_paths(tmp_path):
+    """磁盘路径：传入 base_dir 后 depth 必须反映真实层级。
+
+    真实回归：运行产物里 `prds/<id>/我的PRD/PRD.md` 与
+    `prds/<id>/我的PRD/图片和附件/rag-service.md` 必须被判为 0 与 1；
+    否则子目录里的长附件会与 PRD 同级并抢占正文。
+    """
+    root = tmp_path / "我的PRD"
+    (root / "图片和附件").mkdir(parents=True)
+    prd = root / "PRD.md"
+    prd.write_text("# 主需求\n", encoding="utf-8")
+    attach = root / "图片和附件" / "rag-service.md"
+    attach.write_text("# RAG\n\n" + "细节。" * 3000, encoding="utf-8")
+
+    b = ingest.ingest([prd, root / "图片和附件"], base_dir=root)
+    names = {s.name: s.depth for s in b.sources}
+    assert names.get("PRD.md") == 0, names
+    assert names.get("rag-service.md") == 1, names
+    assert b.primary == "PRD.md", b.primary
+
+
+def test_loader_common_base_computes_depth(tmp_path):
+    """`loader.load_bundle` 自动求共同父目录，使磁盘路径也有层级。"""
+    from prd2tc import loader
+    root = tmp_path / "我的PRD"
+    (root / "图片和附件").mkdir(parents=True)
+    (root / "PRD.md").write_text("# 主需求\n", encoding="utf-8")
+    (root / "图片和附件" / "rag-service.md").write_text(
+        "# RAG\n\n" + "细节。" * 3000, encoding="utf-8")
+    (root / "图片和附件" / "a.png").write_bytes(PNG)
+
+    b = loader.load_bundle([root / "PRD.md", root / "图片和附件"])
+    assert b.primary == "PRD.md", b.primary
+    depths = {s.name: s.depth for s in b.sources}
+    assert depths.get("PRD.md") == 0, depths
+    assert depths.get("rag-service.md") == 1, depths
+    assert len(b.images()) == 1
+
+
 def test_ingest_prefers_markdown_then_docx_then_pdf():
     """无 prd 名线索时按格式优先级：md → docx → pdf。"""
     md, docx, pdf = ("a.md", b"# m\n", "u"), ("b.docx", make_docx(), "u"), ("c.pdf", make_pdf(), "u")

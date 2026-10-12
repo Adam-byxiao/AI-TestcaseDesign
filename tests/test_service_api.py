@@ -10,6 +10,11 @@ from fastapi.testclient import TestClient
 from prd2tc.llm import ProbeResult
 from prd2tc.service import create_app
 
+# 最小合法 PNG（仅含魔数，足以通过嗅探）
+PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000a49444154789c6300010000050001")
+
 
 def _stub_probe(monkeypatch, *, ok=True, kind="ok", message="连接成功，端点可用", hint="",
                 http_status=None, suggested_base="", model="m"):
@@ -172,6 +177,49 @@ def test_upload_accepts_multiple_files_and_formats(client):
     assert meta["bundle"]["imageCount"] == 1
     assert set(meta["bundle"]["kinds"]) == {"markdown", "image", "docx"}
     assert meta["chars"] > 0
+
+
+def test_upload_preserves_folder_structure(client):
+    """文件夹上传必须**还原目录结构**，而不是把文件拍平。
+
+    拍平的后果：`prds/<id>/` 下所有文件同级，磁盘读取时 `depth` 全部退化为 0，
+    「根目录的 PRD」与「子目录里的长附件」不再可区分（实测附件抢占了正文）。
+    同时 `path` 必须指向**实际落盘位置**（含子目录），否则显式主文件会失效。
+    """
+    long_attach = "# RAG 接口说明\n\n" + "接口细节。" * 3000
+    resp = client.post("/api/v1/prds", files=[
+        ("files", ("我的PRD/PRD.md", b"# \xe4\xb8\xbb\xe9\x9c\x80\xe6\xb1\x82\n", "text/markdown")),
+        ("files", ("我的PRD/图片和附件/rag-service.md", long_attach.encode(), "text/markdown")),
+        ("files", ("我的PRD/图片和附件/x.png", PNG_BYTES, "image/png")),
+    ])
+    assert resp.status_code == 200, resp.text
+    meta = resp.json()
+    assert meta["primary"] == "PRD.md", meta["primary"]
+    stored = {f["name"]: (f.get("stored") or "").replace("\\", "/") for f in meta["files"]}
+    assert stored["PRD.md"] == "我的PRD/PRD.md", stored
+    assert stored["rag-service.md"] == "我的PRD/图片和附件/rag-service.md", stored
+    # path 必须落在含子目录的真实位置
+    assert meta["path"].replace("\\", "/").endswith("我的PRD/PRD.md"), meta["path"]
+
+
+def test_upload_folder_depth_reaches_run_manifest(client, tmp_path):
+    """端到端：文件夹上传后运行，产物里的 depth 必须保留层级。"""
+    long_attach = "# RAG\n\n" + "细节。" * 3000
+    meta = client.post("/api/v1/prds", files=[
+        ("files", ("我的PRD/PRD.md", "# 主需求\n\n## 6.1\n\n需求点。\n".encode(), "text/markdown")),
+        ("files", ("我的PRD/图片和附件/rag-service.md", long_attach.encode(), "text/markdown")),
+    ]).json()
+    run = client.post("/api/v1/runs", json={"prdId": meta["prdId"], "stub": True, "auto": True}).json()
+    run = wait_for(client, run["taskId"], {"succeeded", "failed"})
+    assert run["status"] == "succeeded", run.get("errors")
+    bundle_path = Path(run["output"]) / "analysis" / "prd-bundle.json"
+    assert bundle_path.is_file()
+    data = json.loads(bundle_path.read_text(encoding="utf-8"))
+    depths = {s["name"]: s["depth"] for s in data["sources"]}
+    assert depths.get("PRD.md") == 0, depths
+    assert depths.get("rag-service.md") == 1, depths
+    roles = {s["name"]: s["role"] for s in data["sources"]}
+    assert roles.get("PRD.md") == "primary", roles
 
 
 def test_upload_rejects_unsupported_format(client):

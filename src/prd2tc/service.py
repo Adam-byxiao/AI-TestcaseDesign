@@ -19,8 +19,9 @@ from prd2tc.validator import format_exception, validate_case
 ALLOWED_PRD = {".md", ".markdown", ".mdown", ".txt", ".text",
                ".docx", ".docm", ".pdf", ".zip",
                ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-MAX_UPLOAD_FILES = 50
+MAX_UPLOAD_FILES = 400
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+MAX_UPLOAD_TOTAL_BYTES = 256 * 1024 * 1024
 
 
 def _safe_filename(name: str) -> str:
@@ -32,6 +33,26 @@ def _safe_filename(name: str) -> str:
     base = re.sub(r'[<>:"|?*\x00-\x1f]', "_", base)
     base = base.lstrip(".") or "upload.bin"
     return base[:120]
+
+
+def _safe_relpath_parts(relpath: str) -> list[str]:
+    """把上传的相对路径拆成**安全的目录段**（用于在磁盘上还原目录结构）。
+
+    为什么要还原结构：若把上传的文件全部拍平到同一层，那么
+    「根目录的 PRD」与「子目录里的附件」在磁盘上就不再可区分，
+    摄取层赖以判定主文件的 `depth` 会全部退化为 0
+    （实测：`图片和附件/rag-service.md` 因此与 PRD 同级，层级线索失效）。
+
+    安全：逐段清洗，丢弃 `.`/`..`/盘符/空段，杜绝目录穿越。
+    """
+    parts = []
+    for raw in Path(str(relpath or "")).parts:
+        if raw in (".", "..", "", "/", "\\") or raw.endswith(":") or ":" in raw:
+            continue
+        cleaned = _safe_filename(raw)
+        if cleaned and cleaned not in (".", ".."):
+            parts.append(cleaned)
+    return parts[:-1]      # 最后一段是文件名本身
 STAGES = ("analysis", "plan", "cases")
 # 这些产物是二进制，不能用 read_text 读取
 BINARY_ARTIFACT_SUFFIXES = {".xlsx", ".xmind", ".zip", ".png", ".pdf"}
@@ -147,14 +168,15 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         product = _safe_component(body.get("product") or Path(meta["filename"]).stem, "product")
         version = _safe_component(body.get("version") or meta.get("version"), "v0.1")
         prd_path = root / meta["path"]
-        # 上传目录里的其它文件（图片/附件）一并作为输入：
-        # 这样「PRD + 图片」从 UI 上传即可直接生成，无需 --images-dir 绕道。
+        # 上传目录里的其它文件（图片/附件/子目录）一并作为输入：
+        # 这样「PRD + 图片和附件/」从 UI 上传即可直接生成，无需 --images-dir 绕道。
+        # 必须用 rglob 递归：目录结构已按相对路径还原，附件常在子目录里。
         extra: list = []
         prd_dir = meta.get("dir")
         if prd_dir:
             folder = root / prd_dir
             if folder.is_dir():
-                extra = [p for p in sorted(folder.iterdir())
+                extra = [p for p in sorted(folder.rglob("*"))
                          if p.is_file() and p != prd_path and p.suffix.lower() != ".json"]
         return GenerateRequest(
             prd=([prd_path] + extra) if extra else prd_path,
@@ -293,24 +315,38 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         folder = store.prds / prd_id
         folder.mkdir(parents=True, exist_ok=True)
         saved: list[dict] = []
-        payloads: list[tuple[str, bytes, str]] = []
+        payloads: list[tuple] = []
+        total = 0
         for item in items:
-            name = _safe_filename(getattr(item, "filename", "") or "upload.bin")
+            # 文件夹上传时浏览器会带上相对路径；保留它才能还原层级，
+            # 进而正确判定「哪个才是 PRD 正文」（根目录的 PRD 胜过子目录的附件）。
+            relpath = str(getattr(item, "filename", "") or "upload.bin")
+            name = _safe_filename(Path(relpath).name or relpath)
             data = await item.read()
             if not data:
                 continue
             if len(data) > MAX_UPLOAD_BYTES:
                 raise HTTPException(400, f"{name} 超过单文件上限 "
                                          f"{MAX_UPLOAD_BYTES // 1024 // 1024}MB")
-            target = folder / name
-            # 同名文件去重（多选时可能撞名），保证不互相覆盖
+            total += len(data)
+            if total > MAX_UPLOAD_TOTAL_BYTES:
+                raise HTTPException(400, f"上传总量超过 "
+                                         f"{MAX_UPLOAD_TOTAL_BYTES // 1024 // 1024}MB，请分批")
+            # **按相对路径还原目录结构**（而非拍平）：保留层级，
+            # 摄取层才能区分「根目录的 PRD」与「子目录里的附件」。
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder.joinpath(*_safe_relpath_parts(relpath), name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # 同名文件去重（多选/深层目录可能撞名），保证不互相覆盖
             seq = 1
             while target.exists():
-                target = folder / f"{Path(name).stem}-{seq}{Path(name).suffix}"
+                target = target.with_name(f"{Path(name).stem}-{seq}{Path(name).suffix}")
                 seq += 1
             atomic_write_bytes(target, data)
-            payloads.append((target.name, data, "upload"))
-            saved.append({"name": target.name, "size": len(data),
+            # 传 relpath 给摄取层：depth 由它推导，用于主文件判定
+            payloads.append((target.name, data, "upload", str(target.relative_to(folder))))
+            saved.append({"name": target.name, "size": len(data), "relpath": relpath,
+                          "stored": str(target.relative_to(folder)),
                           "sha256": hashlib.sha256(data).hexdigest()})
 
         if not saved:
@@ -327,11 +363,16 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
             raise HTTPException(400, f"无法解析上传内容：{exc}") from exc
 
         primary_name = next((s["name"] for s in saved if s["name"] == primary), saved[0]["name"])
+        # 主文件在磁盘上的**实际相对路径**（可能位于还原出的子目录里，
+        # 如 `我的PRD/PRD.md`）。若这里只用 basename，`path` 会指向不存在的文件，
+        # 后续运行就找不到显式主文件、层级信息也随之失效（实测踩到）。
+        primary_stored = next((s.get("stored") or s["name"] for s in saved
+                               if s["name"] == primary_name), primary_name)
         meta = {
             "prdId": prd_id,
             # filename 保持主文件名（下游按它生成产品名）；files 给出完整清单
             "filename": primary_name,
-            "path": str((folder / primary_name).relative_to(root)),
+            "path": str((folder / primary_stored).relative_to(root)),
             "dir": str(folder.relative_to(root)),
             "files": saved,
             "primary": primary_name,

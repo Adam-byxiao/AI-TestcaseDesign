@@ -98,6 +98,7 @@ class Source:
     role: str = "primary"     # primary | attachment | asset | skipped
     textChars: int = 0
     note: str = ""
+    depth: int = 0            # 相对根的层级（0 = 根目录）。用于「浅者更可能是主文档」
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -592,67 +593,100 @@ def _image_mime(data: bytes) -> str:
 # 摄取
 # ---------------------------------------------------------------------------
 
-def _norm_input(item) -> tuple[str, bytes, str]:
-    """把输入项归一化为 (name, data, origin)。
+def _norm_input(item, base: Path | None = None) -> tuple[str, bytes, str, int]:
+    """把输入项归一化为 (name, data, origin, depth)。
 
     支持：
-      - `(name, bytes)` 二元组 —— 最简上传形态；
-      - `(name, bytes, origin)` 三元组 —— 需要保留来源标记时（如 "upload:field"）；
-      - 文件/目录路径。
+      - `(name, bytes)` —— 最简上传形态；
+      - `(name, bytes, origin)` —— 需要保留来源标记时；
+      - `(name, bytes, origin, relpath)` —— **文件夹上传**：
+        `relpath` 形如 `我的PRD/图片和附件/a.png`，用于还原层级以正确选主文件；
+      - 文件路径（`base` 给定时按它计算相对层级）。
+
+    `base` 的作用：从**磁盘**读取多个文件时，仅凭绝对路径无法判断谁更「浅」。
+    传入共同父目录后，`depth` 才能反映真实层级 ——
+    否则「根目录的 PRD」与「子目录里的长附件」会被视为同级（实测踩到）。
     """
     if isinstance(item, tuple):
-        if len(item) == 2 and isinstance(item[1], (bytes, bytearray)):
-            return str(item[0]), bytes(item[1]), "upload"
-        if len(item) == 3 and isinstance(item[1], (bytes, bytearray)):
-            return str(item[0]), bytes(item[1]), str(item[2])
-        raise TypeError("元组输入应为 (name, bytes) 或 (name, bytes, origin)")
+        if len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
+            name = str(item[0])
+            origin = str(item[2]) if len(item) > 2 else "upload"
+            relpath = str(item[3]) if len(item) > 3 else name
+            depth = max(0, len(Path(relpath).parts) - 1)
+            # 目录上传时 name 可能带相对路径，取基名以保持资产/来源命名简洁
+            return Path(name).name or name, bytes(item[1]), origin, depth
+        raise TypeError("元组输入应为 (name, bytes[, origin[, relpath]])")
     p = Path(item)
     if p.is_dir():
-        raise IsADirectoryError(f"目录请通过 ingest_directory 处理: {p}")
+        raise IsADirectoryError(f"目录请通过 ingest 的目录分支处理: {p}")
     if not p.is_file():
         raise FileNotFoundError(f"输入不存在: {p}")
     size = p.stat().st_size
     if size > MAX_SOURCE_BYTES:
         raise ValueError(f"文件超过上限 {MAX_SOURCE_BYTES // 1024 // 1024}MB: {p.name}")
-    return p.name, p.read_bytes(), str(p)
+    depth = 0
+    if base is not None:
+        try:
+            depth = max(0, len(p.resolve().relative_to(base.resolve()).parts) - 1)
+        except ValueError:
+            depth = 0          # 不在 base 之下（如显式单文件）→ 视为根
+    return p.name, p.read_bytes(), str(p), depth
 
 
-def _iter_dir(path: Path):
-    """递归遍历目录，忽略隐藏文件与 macOS 元数据（确定性排序）。"""
+def _iter_dir(path: Path, base: Path | None = None):
+    """递归遍历目录，忽略隐藏文件与 macOS 元数据（确定性排序）。
+
+    给出**相对层级** `depth` 用于主文件判定 ——
+    根目录的 `PRD.md` 应胜过子目录里的 `图片和附件/rag-service.md`。
+
+    `base` 给定时按它计算层级：**必须如此**，因为同一批输入常由多个目录组成
+    （如 `PRD.md` 与 `图片和附件/` 分开传入）。若一律按各自目录算，
+    子目录里的文件会得到 depth 0，与根目录的 PRD 同级，层级线索失效（实测踩到）。
+    """
     for p in sorted(path.rglob("*")):
         if not p.is_file():
             continue
-        if any(part.startswith(".") for part in p.relative_to(path).parts):
+        rel = p.relative_to(path)
+        if any(part.startswith(".") for part in rel.parts):
             continue
         if "__MACOSX" in p.parts or p.name.startswith("._"):
             continue
-        yield p.name, p.read_bytes(), str(p)
+        anchor = base if base is not None else path
+        try:
+            depth = max(0, len(p.resolve().relative_to(anchor.resolve()).parts) - 1)
+        except ValueError:
+            depth = max(0, len(rel.parts) - 1)
+        yield p.name, p.read_bytes(), str(p), depth
 
 
-def ingest(inputs, *, warnings: list | None = None, preferred_primary: str = "") -> Bundle:
+def ingest(inputs, *, warnings: list | None = None, preferred_primary: str = "",
+           base_dir=None) -> Bundle:
     """摄取多个输入（文件路径 / 目录 / (name, bytes)），返回归一化 Bundle。
 
     主文件判定见 `_pick_primary`；`preferred_primary` 由调用方传入
     （如用户显式给出的第一个 `--prd`），优先级最高。
+    `base_dir` 用于计算**磁盘文件**的相对层级（depth），
+    这样「根目录的 PRD」才能胜过「子目录里的长附件」。
     其余文本类来源作为**附件**按节内联，图片全部作为资产交视觉识别。
     """
     bundle = Bundle()
     warns = warnings if warnings is not None else bundle.warnings
     pending: list[tuple[str, bytes, str, int]] = []      # name, data, origin, depth
     seen_hash: set[str] = set()
+    base = Path(base_dir) if base_dir is not None else None
 
     raw_items = list(inputs)
     for item in raw_items:
         try:
             if isinstance(item, (str, Path)) and Path(item).is_dir():
-                for name, data, origin in _iter_dir(Path(item)):
-                    pending.append((name, data, origin, 0))
+                for name, data, origin, depth in _iter_dir(Path(item), base):
+                    pending.append((name, data, origin, depth))
                 continue
-            name, data, origin = _norm_input(item)
+            name, data, origin, depth = _norm_input(item, base)
         except (FileNotFoundError, IsADirectoryError, OSError, ValueError, TypeError) as exc:
             warns.append(f"输入跳过：{exc}")
             continue
-        pending.append((name, data, origin, 0))
+        pending.append((name, data, origin, depth))
 
     if not pending:
         # 把已收集的告警带进异常 —— 否则「为什么全都失败了」对调用方不可见
@@ -711,18 +745,19 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
     """
     bundle = bundle if bundle is not None else Bundle()
     bundle.warnings = warns
-    texts: list[tuple[str, str, str, int]] = []          # name, text, origin, order
+    texts: list[tuple[str, str, str, int, int]] = []     # name, text, origin, order, depth
     assets: list[Asset] = []
 
-    for idx, (name, data, origin, _depth) in enumerate(items):
+    for idx, (name, data, origin, depth) in enumerate(items):
         kind = sniff_kind(name, data)
         digest = hashlib.sha256(data).hexdigest()
-        src = Source(name=name, kind=kind, size=len(data), sha256=digest, origin=origin)
+        src = Source(name=name, kind=kind, size=len(data), sha256=digest,
+                     origin=origin, depth=depth)
         try:
             if kind in (KIND_MARKDOWN, KIND_TEXT, KIND_HTML):
                 text = decode_text(data)
                 src.textChars = len(text)
-                texts.append((name, text, origin, idx))
+                texts.append((name, text, origin, idx, depth))
             elif kind == KIND_DOCX:
                 text, embedded, w = extract_docx(data, name=name)
                 src.textChars = len(text)
@@ -732,7 +767,7 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
                     src.note = "DOCX 正文为空"
                     warns.append(f"{name} 正文为空，已跳过")
                 else:
-                    texts.append((name, text, origin, idx))
+                    texts.append((name, text, origin, idx, depth))
                     assets.extend(embedded)
                     if embedded:
                         src.note = f"含 {len(embedded)} 张内嵌图片"
@@ -741,7 +776,7 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
                 src.textChars = len(text)
                 warns.extend(f"{name}: {x}" for x in w)
                 if text.strip():
-                    texts.append((name, text, origin, idx))
+                    texts.append((name, text, origin, idx, depth))
                 else:
                     src.role = "skipped"
                     src.note = "未能抽取文本"
@@ -784,7 +819,7 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
     bundle.primary = primary[0]
 
     parts: list[str] = [primary[1]]
-    for i, (name, text, origin, _order) in enumerate(texts):
+    for i, (name, text, origin, _order, _depth) in enumerate(texts):
         if i == primary_idx:
             continue
         parts.append(f"\n\n---\n\n## 附件：{name}\n\n{text}")
@@ -806,34 +841,40 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
     return bundle
 
 
-def _pick_primary(texts: list[tuple[str, str, str, int]], preferred: str = "") -> int:
+def _pick_primary(texts: list[tuple], preferred: str = "") -> int:
     """选主文件（决定哪份是 PRD 正文）。
 
-    优先级（**不可只看长度**）：
+    评分顺序（逐级比较，**不可只看长度**）：
       0. `preferred`：调用方显式指定的文件（如用户给的第一个 `--prd`）—— 最强信号；
-      1. 文件名线索：含 `prd`/`需求`/`requirement` 的 Markdown；
-      2. 格式优先级：`.md` → `.docx` → `.pdf` → 其它文本；
-      3. 正文长度（最长者）。
+      1. **相对层级**：越浅越优先。根目录的 `PRD.md` 应胜过
+         `图片和附件/rag-service.md`；
+      2. 文件名线索：含 `prd`/`需求`/`requirement`/`spec`；
+      3. 格式优先级：`.md` → `.docx` → `.pdf` → 其它文本；
+      4. 正文长度（最长者）。
 
     为什么不能只看长度：实测把「PRD + 图片和附件」一起摄入时，
     附件 `rag-service.md`（43KB 接口文档）比真正的 PRD（17KB）**长得多**，
-    按长度会把附件当成正文，PRD 反被降级为附件。
+    按长度会把附件当成正文、PRD 反被降级为附件。
+
+    为什么层级要排在名称线索**之前**：用户目录结构本身就是意图表达 ——
+    把 PRD 放在根、把资料放进子目录是常见约定；而名称线索依赖语言
+    （英文 `spec` 与中文 `需求` 都要覆盖），层级则与语言无关。
     """
     if preferred:
         target = Path(preferred).name
-        for i, (name, _text, _origin, _order) in enumerate(texts):
-            if name == target:
+        for i, item in enumerate(texts):
+            if item[0] == target:
                 return i
     hint = re.compile(r"(prd|需求|requirement|spec)", re.I)
 
     def score(item):
-        name, text, _origin, order = item
+        name, text, _origin, order = item[:4]
+        depth = item[4] if len(item) > 4 else 0
         suffix = Path(name).suffix.lower()
         rank = 0 if suffix in (".md", ".markdown", ".mdown") else \
                1 if suffix in (".docx", ".docm") else 2 if suffix == ".pdf" else 3
-        # 名字里带 prd/需求 的优先于一切都只是「格式更好」的
         named = 0 if hint.search(Path(name).stem) else 1
-        return (named, rank, -len(text), order)
+        return (depth, named, rank, -len(text), order)
     return min(range(len(texts)), key=lambda i: score(texts[i]))
 
 

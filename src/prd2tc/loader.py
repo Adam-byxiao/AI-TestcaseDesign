@@ -52,8 +52,9 @@ def load_bundle(prd, *, extra_dirs: list | None = None, warnings: list | None = 
 
     接受：
       - 单个文件路径（`.md/.txt/.docx/.pdf/图片` 均可）；
-      - 目录（递归，忽略隐藏文件）；
-      - 路径/`(name, bytes)` 的列表（多文件、混合格式）；
+      - 目录（递归，保留相对层级用于主文件判定）；
+      - 路径 / `(name, bytes)` / `(name, bytes, origin, relpath)` 的列表
+        （多文件、混合格式；末者可还原**文件夹上传**的层级）；
       - `extra_dirs`：额外资源目录（`--images-dir` 的兼容入口）。
 
     单文件时**自动带上同级约定资源目录**（如 `prd.assets/`），
@@ -80,4 +81,32 @@ def load_bundle(prd, *, extra_dirs: list | None = None, warnings: list | None = 
             # candidate_dirs 首项是文件所在目录本身，需排除，否则会把整目录吞进来
             inputs = inputs + [d for d in _images.candidate_dirs(p) if d != p.parent]
     inputs = inputs + [d for d in (extra_dirs or []) if d is not None]
-    return ingest.ingest(inputs, warnings=warnings, preferred_primary=preferred)
+    return ingest.ingest(inputs, warnings=warnings, preferred_primary=preferred,
+                         base_dir=_common_base(inputs))
+
+
+def _common_base(inputs) -> Path | None:
+    """求多个**磁盘路径**的共同父目录，用于计算相对层级（depth）。
+
+    为什么需要：从磁盘读取时，仅凭绝对路径无法判断谁更「浅」——
+    运行产物里 `prds/<id>/我的PRD/PRD.md` 与
+    `prds/<id>/我的PRD/图片和附件/rag-service.md` 必须被识别为深度 0 与 1，
+    否则「子目录里的长附件」会与 PRD 同级并可能抢占正文。
+
+    只对路径输入计算；纯内存上传（`(name, bytes, ...)`）自带 relpath，不依赖此值。
+    """
+    paths = []
+    for x in inputs:
+        if isinstance(x, (str, Path)):
+            p = Path(x)
+            try:
+                paths.append(p.resolve() if p.is_dir() else p.resolve().parent)
+            except OSError:
+                continue
+    if len(paths) < 2:
+        return None
+    try:
+        import os
+        return Path(os.path.commonpath([str(p) for p in paths]))
+    except (ValueError, OSError):
+        return None
