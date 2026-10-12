@@ -10,14 +10,14 @@ VALID_CASE = {
     "module": "AUTH",
     "subModule": "LOGIN",
     "title": "正确凭据登录成功",
-    "priority": "P0",
+    "design_method": "场景法", "priority": "P0",
     "tags": ["@smoke", "@auth"],
     "requirement": ["REQ-AUTH-002"],
     "steps": [
         {"action": "goto", "target": "/login", "data": ""},
         {"action": "click", "target": "登录按钮", "data": ""},
     ],
-    "expected": ["跳转首页"],
+    "expected": ["登录成功后跳转至首页"],
 }
 
 

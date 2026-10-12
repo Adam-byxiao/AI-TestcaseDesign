@@ -42,6 +42,8 @@ output/
 .tmp-service-check*
 tmp-ws-check/
 *.log
+# 导出格式可行性验证的探针产物（临时样例文件，勿提交）
+_probe_out/
 
 # ============ 内部开发文档（保留本机，不上传开源仓库） ============
 # 仅 5 份“开发/成本/演进”后备文档；公开文档 docs/pipeline.md、docs/case-template.md 正常上传

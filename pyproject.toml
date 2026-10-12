@@ -21,7 +21,8 @@ classifiers = [
 prd2tc = "prd2tc.cli:main"
 
 [project.optional-dependencies]
-service = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
+# websockets 必需：否则 uvicorn 无法升级 WebSocket，UI 实时进度会静默退化成 10s 轮询
+service = ["fastapi>=0.110", "uvicorn>=0.29", "websockets>=12", "python-multipart>=0.0.9"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -40,9 +40,9 @@ BASE_URL、账号
 
 VALID_CASES = (
     "```json\n"
-    '[{"id":"TC-A-001","module":"AUTH","title":"t","priority":"P1",'
+    '[{"id":"TC-A-001","module":"AUTH","title":"t","design_method": "场景法", "priority":"P1",'
     '"tags":["@regression"],"requirement":["REQ-AUTH-001"],'
-    '"steps":[{"action":"goto","target":"/","data":""}],"expected":["渲染"]}]\n'
+    '"steps":[{"action":"goto","target":"/","data":""}],"expected":["页面成功渲染并显示预期内容"]}]\n'
     "```"
 )
 

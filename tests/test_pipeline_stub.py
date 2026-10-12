@@ -10,7 +10,11 @@ from prd2tc.config import Config
 from prd2tc.validator import validate_dir
 
 REPO_ROOT = Path(__file__).resolve().parents[1]  # 01-AI-TestCaseDesign/
-SAMPLE_PRD = REPO_ROOT.parent / "PRD_File" / "youxuan-mall" / "PRD-优选商城-v0.3.md"
+# 端到端 fixture 用仓库内自带的 PRD，避免依赖仓库外的兄弟目录（旧版指向 PRD_File/）。
+SAMPLE_PRD = REPO_ROOT / "examples" / "sample-prd.md"
+# 产物目录由 PRD 推导：product = PRD 所在目录名，version 从 PRD 内容/文件名提取。
+PRODUCT = "examples"
+VERSION = "v0.1"
 
 
 def test_extract_cases_fenced_and_plain():
@@ -40,7 +44,7 @@ def test_generate_stub_end_to_end(tmp_path):
     code = cli.main(["generate", "--prd", str(SAMPLE_PRD), "--stub", "--out", str(tmp_path)])
     assert code == 0
 
-    out = tmp_path / "youxuan-mall" / "v0.3"
+    out = tmp_path / PRODUCT / VERSION
     assert (out / "manifest.json").is_file()
     assert (out / "run-manifest.json").is_file()
     assert (out / "analysis" / "需求分析报告.md").is_file()
@@ -78,7 +82,7 @@ def test_generate_stub_resume_reuses_all_completed_work(tmp_path, monkeypatch):
     assert first_count == 3
     assert cli.main(argv + ["--resume"]) == 0
     assert len(calls) == first_count
-    state = json.loads((tmp_path / "youxuan-mall" / "v0.3" / "run-state.json").read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / PRODUCT / VERSION / "run-state.json").read_text(encoding="utf-8"))
     assert state["status"] == "succeeded"
     assert state["modules"] == {"AUTH": "skipped"}
 
@@ -86,7 +90,7 @@ def test_generate_stub_resume_reuses_all_completed_work(tmp_path, monkeypatch):
 def test_validate_and_stats_commands(tmp_path):
     """validate/stats 命令对 stub 产物工作正常"""
     cli.main(["generate", "--prd", str(SAMPLE_PRD), "--stub", "--out", str(tmp_path)])
-    cases_dir = tmp_path / "youxuan-mall" / "v0.3" / "cases" / "cases"
+    cases_dir = tmp_path / PRODUCT / VERSION / "cases" / "cases"
     assert cli.main(["validate", "--dir", str(cases_dir)]) == 0
     assert cli.main(["stats", "--dir", str(cases_dir)]) == 0
 
@@ -102,5 +106,5 @@ def test_dry_run_no_call(tmp_path):
     """dry-run 应打印 prompt 且不产出阶段文件"""
     code = cli.main(["generate", "--prd", str(SAMPLE_PRD), "--dry-run", "--out", str(tmp_path)])
     assert code == 0
-    out = tmp_path / "youxuan-mall" / "v0.3"
+    out = tmp_path / PRODUCT / VERSION
     assert not (out / "analysis" / "需求分析报告.md").exists()

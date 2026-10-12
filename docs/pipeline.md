@@ -55,7 +55,12 @@
 **输出**：
 - `output/<product>/<version>/cases/用例集.md`（评审稿，按模块分节）；
 - `output/<product>/<version>/cases/cases/*.json`（每模块一个 JSON，字段见 case-template.md）；
+- `output/<product>/<version>/cases/<product>-<version>-用例集.xlsx`（Excel：用例明细 / 需求覆盖 / 统计概览 三个 sheet）；
+- `output/<product>/<version>/cases/<product>-<version>-用例集.xmind`（思维导图：模块 → 子模块 → 用例）；
 - 可选：`output/<product>/<version>/cases/manifest.json`（汇总统计）。
+
+> 后两种格式由阶段 3 成功后**自动导出**（也可用 `prd2tc export` 单独重跑）。
+> 导出失败只降级为告警，不影响生成结果；实现细节见 `docs/export-excel-xmind.md`。
 
 **质量自检（强制）**：
 - [ ] 覆盖全部 REQ-*（生成 traceability 映射表，标注未覆盖项）；
@@ -93,3 +98,62 @@
 - `prd2tc diff` 输出需求四分类，`prd2tc merge` 将旧用例迁移为 `active/needs_review/deprecated/superseded`，历史记录不物理删除。
 - 02 子项目用 `scripts/export_results.py` 把 JUnit 转为执行契约，01 用 `prd2tc import-results` 导入到用例副本。
 - `prd2tc promote-examples --reviewed` 只导出人工确认且最近执行通过的 active/reviewed 用例，避免失败原因未分类的结果污染示例库。
+
+## 7. 输出截断与失败产物的处置
+
+### 7.1 截断必须视为失败（不是「部分成功」）
+
+`max_tokens` 用尽时 Provider 返回 `finish_reason=length`，此时输出**不完整**。必须注意一个陷阱：
+
+> `extract_cases` 的「修补截断 JSON」回退会 `rfind("]")` 定位数组结尾。由于用例内部必然含
+> `]`（如 `"tags":["@smoke"]`），当截断点落在「某个完整用例之后、某个内层数组闭合之后」时，
+> 修补会产出一个**语法合法但内容残缺**的数组 → 字段级门禁全部通过 → 模块被误判为成功。
+
+实测后果（运行 9d97060e，MiniMax-M3）：AGENT 6 条需求只留 1 条用例、SCENE 7 条需求只留 2 条，
+5 个模块全被标记 `succeeded`，直到最后 traceability 才发现 3 条 P0 未覆盖而整条运行失败。
+
+因此门禁的处置是：
+
+1. **`finish_reason=length` 一律报错**，无论修补后的内容是否合法；
+2. 出错时**自动把该批对半拆分重试**（`MAX_BATCH_SPLIT_DEPTH=2`）——降低单次输出量是唯一有效杠杆；
+3. 若拆到单条需求仍截断，则模块标记 `failed`，可用「仅重试失败模块」局部恢复。
+
+### 7.2 批次容量与输出预算（三者必须同时调）
+
+`max_tokens`（默认 **16384**）、`TOKENS_PER_REQ_EST`（默认 **1800**）、`OUTPUT_BUDGET_RATIO`
+（默认 **0.60**）、`CASE_BATCH_CAP`（默认 **8**）共同决定「单次请求的输出是否有余量」：
+
+```
+每批需求数 = min( max_tokens × OUTPUT_BUDGET_RATIO ÷ TOKENS_PER_REQ_EST , CASE_BATCH_CAP , 模块需求数 )
+```
+
+> ⚠️ **关键陷阱：只调高 `max_tokens` 不会降低截断率。**
+> 批次容量与 `max_tokens` 成正比，若 `OUTPUT_BUDGET_RATIO` 沿用 0.85，
+> 调高上限只会让每批容纳更多需求，安全余量恒为 `1/0.85 ≈ 1.18x`。
+> 必须同时下调预算占用比，才能把上限换成真实余量。`tests/test_long_doc.py`
+> 的 `test_raising_max_tokens_actually_buys_headroom` 会强制守住这一点。
+
+实测校准（运行 9d97060e，MiniMax-M3）：
+
+| 模块 | 需求数 | 输出 token | tok/需求 | 状态 |
+|---|---|---|---|---|
+| KB | 20 | 34005 | 1700 | 完整 |
+| AGENT | 6 | 16384 | ≥2731 | 截断 |
+| SCENE | 7 | 8192 | ≥1170 | 截断 |
+| TEST | 8 | 8192 | ≥1024 | 截断 |
+| TOOL | 3 | 8192 | ≥2731 | 截断 |
+
+现配置下每批 5 条需求，预期输出 9000，余量 **1.82x**；即使按最坏值 2731 tok/需求
+估算（13655）也仍在 16384 之内。叠加「截断即拆批」自愈，残差风险由重试兜底。
+
+调参入口：`PRD2TC_MAX_TOKENS`、`PRD2TC_TOKENS_PER_REQ`、`PRD2TC_CASE_BATCH_CAP`、
+`PRD2TC_CASE_OUTPUT_BUDGET`、`PRD2TC_CASE_BATCH_SIZE`（硬覆盖每批条数）。
+
+### 7.3 失败时的产物保全
+
+覆盖率门禁失败时，已生成的用例**不再被丢弃**，而是写入 `cases/partial/` 并附
+`READ-ME-部分用例未通过门禁.md`（含门禁错误清单与处置建议）；`run-manifest.json` 的
+`stages.cases.partialCaseCount` 记录数量。
+
+正式产物 `cases/cases/` 在门禁未通过时保持为空，**避免失败产物被误当作交付结果**。
+`cases/partial/` 会出现在产物清单里，便于下载后人工修复。

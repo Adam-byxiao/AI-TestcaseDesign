@@ -12,7 +12,7 @@ from prd2tc.io import (MANIFEST_NAME, LEGACY_MANIFEST_NAME, atomic_write_text,
                        update_manifest)
 from prd2tc.pipeline import GenerateRequest, PipelineRunner, extract_version
 from prd2tc.profiles import get_profile
-from prd2tc.validator import ValidationError, validate_dir
+from prd2tc.validator import ValidationError, format_exception, validate_dir
 S = stages  # 兼容既有调用方；生成编排已迁移至 PipelineRunner。
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -38,23 +38,45 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if args.model: cfg = replace(cfg, model=args.model)
     if args.repro: cfg = replace(cfg, repro=True)
     if args.seed is not None: cfg = replace(cfg, seed=args.seed)
+    if args.markdown_transit: cfg = replace(cfg, markdown_transit=True)
     text = loader.load_prd(args.prd); examples = [] if args.dry_run else _load_examples(args, text)
     profile = get_profile(args.profile); minimum = args.min_cases_per_requirement or profile["minCasesPerRequirement"]
     if not args.stub and not args.dry_run and cfg.requires_api_key() and not cfg.api_key:
         print("✗ 未配置 LLM 凭证：设置对应 Provider 的 API Key（或使用 --stub/--dry-run）"); return 2
+    # 原型等交互式设计产物：解析为 UI 契约真值（真实标识符/页面/文案），
+    # 供阶段 3 引用与门禁校验；解析失败只告警，不阻断生成。
+    attachments = list(getattr(args, "attach", None) or [])
+    if attachments:
+        from prd2tc import prototype as _proto
+        for raw in attachments:
+            try:
+                spec = _proto.parse_prototype(raw)
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                print(f"⚠ 附件跳过 {raw}: {exc}")
+                continue
+            print(f"✔ 已解析原型 {Path(raw).name}："
+                  f"页面 {[p['key'] for p in spec.pages]}、"
+                  f"页签 {[t['key'] for t in spec.tabs]}、"
+                  f"锚点 {len(spec.anchor_values())}、"
+                  f"文案 {len(spec.messages)}、"
+                  f"URL 路由 {'有' if spec.has_url_routing else '无'}")
     request = GenerateRequest(prd=args.prd, out=args.out, product=args.product,
                               version=args.ver or extract_version(text, Path(args.prd)), examples=examples,
-                              stub=args.stub, dry_run=args.dry_run, jobs=args.jobs, stage=args.stage,
+                              stub=args.stub, dry_run=args.dry_run, jobs=args.jobs or cfg.jobs, stage=args.stage,
                               profile=args.profile, min_cases_per_requirement=minimum,
                               max_gate_retries=args.max_gate_retries, allow_gate_fail=args.allow_gate_fail,
-                              no_gate=args.no_gate, resume=args.resume, force=args.force)
+                              no_gate=args.no_gate, resume=args.resume, force=args.force,
+                              attachments=attachments,
+                              image_dirs=list(getattr(args, "images_dir", None) or []),
+                              fetch_images=bool(getattr(args, "fetch_images", False)),
+                              analyze_images=not bool(getattr(args, "no_images", False)))
     def progress(stage, percent):
         print(f"✔ {stage} ({percent}%)")
         if args.review and stage in {"analysis", "plan"}: input("按 Enter 确认后继续…")
     try:
         result = PipelineRunner(cfg, llm=_stub_chat if args.stub else None).generate(request, progress_callback=progress)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
-        print(f"✗ {exc}"); return 1
+        print(f"✗ {format_exception(exc)}"); return 1
     if args.dry_run:
         for name, prompt in result.prompts.items(): print(f"\n===== {name} prompt =====\n{prompt}")
     _print_tokens(result.root)
@@ -122,6 +144,56 @@ def cmd_probe_cache(args):
         print("✗ 两端缓存字段均无回显（或为 0）：该端点未启用/不支持 Prompt 缓存（或缓存阈值高于本探测前缀）")
         print("  提示：若你在真实 run 里看到每批 input_tokens 全额计费，则缓存未生效，需从输入瘦身（P0/P3 已做）继续压成本")
     return 0
+
+def cmd_check_llm(args):
+    """保存配置前自检：真实探测端点，区分「地址填错」与「密钥填错」。"""
+    from prd2tc.llm import probe_provider
+    cfg = Config.from_env(args.provider)
+    if args.api_base: cfg = replace(cfg, api_base=args.api_base.rstrip("/"))
+    if args.model: cfg = replace(cfg, model=args.model)
+    if args.api_key: cfg = replace(cfg, api_key=args.api_key)
+    print(f"探测：provider={cfg.provider} model={cfg.model}")
+    probe = probe_provider(cfg)
+    print(f"  请求地址: {probe.endpoint or '(未构造)'}")
+    if probe.ok:
+        print(f"✔ {probe.message}（{probe.latency_ms}ms，model={probe.model}）")
+        return 0
+    print(f"✗ {probe.summary()}")
+    if probe.suggested_base:
+        print(f"  建议改为: {probe.suggested_base}")
+    print("  提示：用 --api-base / --model / --api-key 覆盖后重试")
+    return 2
+
+
+def cmd_export(args):
+    """从用例 JSON 导出 Excel / XMind。"""
+    from prd2tc.export import export_cases
+    cases_path = Path(args.cases)
+    # run_root = <output>/<product>/<version>；用例目录为 <run_root>/cases/cases
+    run_root = cases_path.parent.parent
+    # --product/--version 未显式给出时从路径推断，与 generate 的产物布局一致，
+    # 这样默认调用也能产出可辨识的文件名而非一律「用例集.xlsx」。
+    product = args.product if args.product is not None else run_root.parent.name
+    version = args.ver if args.ver is not None else run_root.name
+    try:
+        result = export_cases(
+            cases_dir=cases_path,
+            formats=[args.format] if args.format != "all" else ["excel", "xmind"],
+            out=Path(args.out) if args.out else None,
+            root=run_root,
+            xmind_mode=args.xmind_mode,
+            sheet_name=args.sheet_name,
+            include_traceability=not args.no_traceability,
+            product=product,
+            version=version,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"✗ {format_exception(exc)}"); return 1
+    for path in result["files"]:
+        size_kb = path.stat().st_size / 1024
+        print(f"✔ 已导出 {path.name}（{size_kb:.1f} KB，共 {result['case_count']} 条用例）")
+    return 0
+
 
 def cmd_init(args):
     root = Path(args.out) / args.product / args.ver; init_output(root, args.product, args.ver, args.prd); print(f"✔ 已初始化: {root}"); return 0
@@ -199,8 +271,21 @@ def cmd_compare_runs(args):
 def build_parser():
     parser = argparse.ArgumentParser(prog="prd2tc", description="PRD → 测试方案 → 测试用例")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}"); sub = parser.add_subparsers(dest="command", required=True)
-    g = sub.add_parser("generate"); g.add_argument("--prd", required=True); g.add_argument("--product"); g.add_argument("--version", dest="ver"); g.add_argument("--out", default="output"); g.add_argument("--provider", choices=["openai","anthropic","ollama"]); g.add_argument("--api-base"); g.add_argument("--model"); g.add_argument("--stage", choices=["1","2","3","all"], default="all"); g.add_argument("--dry-run", action="store_true"); g.add_argument("--stub", action="store_true"); g.add_argument("--review", action="store_true"); g.add_argument("--examples"); g.add_argument("--examples-k", type=int, default=3); g.add_argument("--max-gate-retries", type=int, default=2); g.add_argument("--allow-gate-fail", action="store_true"); g.add_argument("--no-gate", action="store_true"); g.add_argument("--jobs", type=int, default=1); g.add_argument("--resume", action="store_true"); g.add_argument("--force", action="store_true"); g.add_argument("--profile", choices=["generic","ecommerce"], default="generic"); g.add_argument("--min-cases-per-requirement", type=int); g.set_defaults(func=cmd_generate)
+    g = sub.add_parser("generate"); g.add_argument("--prd", required=True); g.add_argument("--product"); g.add_argument("--version", dest="ver"); g.add_argument("--out", default="output"); g.add_argument("--provider", choices=["openai","anthropic","ollama"]); g.add_argument("--api-base"); g.add_argument("--model"); g.add_argument("--stage", choices=["1","2","3","all"], default="all"); g.add_argument("--dry-run", action="store_true"); g.add_argument("--stub", action="store_true"); g.add_argument("--review", action="store_true"); g.add_argument("--examples"); g.add_argument("--examples-k", type=int, default=3); g.add_argument("--max-gate-retries", type=int, default=2); g.add_argument("--allow-gate-fail", action="store_true"); g.add_argument("--no-gate", action="store_true"); g.add_argument("--jobs", type=int, help="并发批次数（默认取 PRD2TC_JOBS，未设则 1）：阶段1分段与阶段3模块并行"); g.add_argument("--resume", action="store_true"); g.add_argument("--force", action="store_true"); g.add_argument("--profile", choices=["generic","ecommerce"], default="generic"); g.add_argument("--min-cases-per-requirement", type=int); g.set_defaults(func=cmd_generate)
     i = sub.add_parser("init"); i.add_argument("--product", required=True); i.add_argument("--version", required=True, dest="ver"); i.add_argument("--prd"); i.add_argument("--out", default="output"); i.set_defaults(func=cmd_init)
+    ex = sub.add_parser("export", help="导出用例为 Excel / XMind（零第三方依赖）")
+    ex.add_argument("--cases", required=True, help="用例目录，如 output/<p>/<v>/cases/cases")
+    ex.add_argument("--format", choices=["excel", "xmind", "all"], default="all")
+    ex.add_argument("--out", default=None, help="输出文件路径；默认写回 cases/ 目录")
+    ex.add_argument("--product", default=None, help="产品名（默认从 --cases 路径推断）")
+    ex.add_argument("--version", dest="ver", default=None, help="版本（默认从 --cases 路径推断）")
+    ex.add_argument("--xmind-mode", choices=["module", "case", "full"], default="case", help="导图展开粒度：module 仅模块 / case 到用例（默认）/ full 到步骤")
+    ex.add_argument("--sheet-name", default="用例明细", help="Excel 首个 sheet 名")
+    ex.add_argument("--no-traceability", action="store_true", help="不导出需求覆盖 sheet")
+    ex.set_defaults(func=cmd_export)
+    ck = sub.add_parser("check-llm", help="保存配置前自检：探测 Provider 端点可用性（区分地址/密钥/模型问题）")
+    ck.add_argument("--provider", choices=["openai", "anthropic", "ollama"]); ck.add_argument("--api-base"); ck.add_argument("--model"); ck.add_argument("--api-key")
+    ck.set_defaults(func=cmd_check_llm)
     p = sub.add_parser("prompts"); p.set_defaults(func=cmd_prompts)
     v = sub.add_parser("validate"); v.add_argument("--dir", required=True); v.set_defaults(func=cmd_validate)
     s = sub.add_parser("stats"); s.add_argument("--dir", required=True); s.set_defaults(func=cmd_stats)
@@ -211,6 +296,19 @@ def build_parser():
     pc.add_argument("--provider", choices=["openai", "anthropic", "ollama"]); pc.add_argument("--api-base"); pc.add_argument("--model"); pc.set_defaults(func=cmd_probe_cache)
     e = sub.add_parser("promote-examples"); e.add_argument("--cases", required=True); e.add_argument("--out", required=True); e.add_argument("--design-logic", required=True); e.add_argument("--reviewed", action="store_true"); e.set_defaults(func=cmd_promote_examples)
     g.add_argument("--repro", action="store_true", help="可复现模式：三阶段温度归零（回归验收基线）")
+    g.add_argument("--attach", action="append", metavar="FILE",
+                   help="交互式设计产物（如原型 HTML）。可重复。解析为 UI 契约真值后："
+                        "① 阶段3 引用其中的真实标识符/页面/文案，避免编造；"
+                        "② 门禁按契约校验 target 与 goto 地址")
+    g.add_argument("--images-dir", action="append", metavar="DIR", dest="images_dir",
+                   help="PRD 配图所在目录（可重复）。用法：PRD 下载为 md 后图片常在同一"
+                        "文件夹或子目录（如 `<stem>.assets/`），默认会按约定名自动探测；"
+                        "目录名不常规时用本参数显式指定")
+    g.add_argument("--fetch-images", action="store_true",
+                   help="允许下载 PRD 中的远程图片（飞书等链接通常需鉴权，多半取不到）")
+    g.add_argument("--no-images", action="store_true",
+                   help="跳过图片识别与分析（默认开启）")
+    g.add_argument("--markdown-transit", action="store_true", help="阶段3 改为输出 Markdown 表格再由程序转 JSON：规避嵌套转义导致的整轮失败，字符约省 50%%")
     g.add_argument("--seed", type=int, help="采样种子（OpenAI 兼容端点生效；Anthropic/MiniMax 忽略）")
     cr = sub.add_parser("compare-runs", help="结构级复现对拍：同源且结构指纹一致 → 复现")
     cr.add_argument("dir_a", metavar="RUN_A"); cr.add_argument("dir_b", metavar="RUN_B"); cr.add_argument("--out"); cr.add_argument("--fail-on-drift", action="store_true"); cr.set_defaults(func=cmd_compare_runs)

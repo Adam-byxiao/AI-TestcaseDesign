@@ -1,4 +1,6 @@
 """长文档处理测试：程序化渲染 + 多分段 stub 端到端（防输出截断架构）。"""
+from pathlib import Path
+
 from prd2tc import stages
 from prd2tc.config import Config
 from prd2tc.llm import LLMResult
@@ -17,7 +19,7 @@ def test_render_analysis_head_deterministic():
     modules = [{"id": "AUTH", "name": "账号", "entry": "/login", "requirementIds": ["REQ-AUTH-001", "REQ-AUTH-002"]}]
     reqs = [
         {"id": "REQ-AUTH-001", "module": "AUTH", "priority": "P0", "title": "登录", "description": "登录",
-         "acceptanceCriteria": ["跳转首页"], "exceptionFlows": ["密码错误提示"]},
+         "acceptanceCriteria": ["登录成功后跳转至首页"], "exceptionFlows": ["密码错误提示"]},
         {"id": "REQ-AUTH-002", "module": "AUTH", "priority": "P1", "title": "注册", "description": "注册",
          "acceptanceCriteria": [], "exceptionFlows": []},
     ]
@@ -130,11 +132,111 @@ def test_module_batching_and_renumber():
 
 
 def test_module_batch_size_adaptive():
-    """P3：批次容量按输出预算自适应；小模块单批全量、大模块按预算分批。"""
-    cfg = _cfg()  # max_tokens=8192 → budget 6963 → 6963//450 = 15
-    assert stages._module_batch_size(cfg, 40) == 15
-    assert stages._module_batch_size(cfg, 10) == 10  # 小模块：整模块一批（单模块全量）
+    """P3：批次容量按输出预算自适应；小模块单批全量、大模块按预算分批。
+
+    期望值由模块自身的 TOKENS_PER_REQ_EST 推导，避免调参后测试与实现脱节。
+    max_tokens=8192 → budget = int(8192*0.85) = 6963。
+    """
+    cfg = _cfg()
+    budget = int(cfg.max_tokens * stages.OUTPUT_BUDGET_RATIO)
+    expected = max(1, min(budget // stages.TOKENS_PER_REQ_EST, stages.CASE_BATCH_CAP))
+    assert stages._module_batch_size(cfg, 40) == expected
     assert stages._module_batch_size(cfg, 1) == 1
+    # 需求数少于单批容量时，整模块一批（单模块全量）
+    assert stages._module_batch_size(cfg, min(expected, 10)) == min(expected, 10)
+
+
+def test_tokens_per_req_estimate_is_calibrated():
+    """估算值必须与实测相符：唯一完整跑完的 KB 模块是 1700 tok/需求，被截断模块 ≥2731。
+
+    取 450（旧值）会让 6~7 条需求的模块只分 1 批，单次输出必然撞满 max_tokens。
+    """
+    assert stages.TOKENS_PER_REQ_EST >= 1500, (
+        "估算低于实测（1700 tok/需求）会导致批次过大："
+        f"当前 {stages.TOKENS_PER_REQ_EST}"
+    )
+    cfg = _cfg()
+    # 6~7 条需求的模块（AGENT/SCENE 的规模）必须拆成 ≥2 批
+    for count in (6, 7):
+        size = stages._module_batch_size(cfg, count)
+        assert size < count, f"{count} 条需求只分了 1 批（每批 {size}），截断风险高"
+
+
+def test_raising_max_tokens_actually_buys_headroom():
+    """**关键不变量**：调高 max_tokens 必须真正换来输出余量，而不是被批次膨胀抵消。
+
+    批次容量与 max_tokens 成正比（预算 = max_tokens × OUTPUT_BUDGET_RATIO）。
+    若 OUTPUT_BUDGET_RATIO 太高（如 0.85），调高 max_tokens 只会让每批容纳更多需求，
+    安全余量恒为 1/0.85≈1.18x，截断率毫无改善 —— 这正是「改了 max_tokens 却没用」的陷阱。
+    """
+    assert stages.OUTPUT_BUDGET_RATIO <= 0.70, (
+        f"预算占用比 {stages.OUTPUT_BUDGET_RATIO} 过高：调高 max_tokens 会被批次膨胀抵消"
+    )
+    cfg = _cfg()
+    size = stages._module_batch_size(cfg, 6)
+    expected_output = size * stages.TOKENS_PER_REQ_EST
+    margin = cfg.max_tokens / expected_output
+    assert margin >= 1.5, (
+        f"单批余量仅 {margin:.2f}x，不足以吸收估算偏差（实测偏差可达 1.5 倍）"
+    )
+
+
+def test_batch_size_bounded_by_cap():
+    """批次不得随预算无限膨胀：CASE_BATCH_CAP 必须真正生效。"""
+    cfg = _cfg()
+    # 构造一个极大预算，确认 cap 仍能压住批次
+    huge = Config(**{**cfg.__dict__, "max_tokens": 200000})
+    assert stages._module_batch_size(huge, 500) == stages.CASE_BATCH_CAP
+
+
+def _base_cfg(**over) -> Config:
+    """构造测试配置（默认 max_tokens=8192，用于覆盖非默认上限的场景）。"""
+    base = dict(api_key="k", api_base="https://x", model="m", temperature=0.4,
+                timeout=10, max_retries=1, chunk_size=12000, chunk_overlap=20,
+                provider="openai", max_tokens=8192)
+    base.update(over)
+    return Config(**base)
+
+
+def test_max_tokens_recorded_in_manifest(tmp_path):
+    """max_tokens 决定输出是否被截断，必须记入 manifest 供审计。"""
+    import json as _json
+    from prd2tc.pipeline import GenerateRequest, PipelineRunner
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    cfg = _base_cfg(max_tokens=16384)
+    res = PipelineRunner(cfg).generate(
+        GenerateRequest(prd=sample, out=tmp_path / "o", product="p", version="v1", stub=True))
+    manifest = _json.loads((res.root / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["parameters"].get("maxTokens") == 16384
+
+
+def test_max_tokens_change_invalidates_resume(tmp_path):
+    """max_tokens 变化会改变 configHash → --resume 不得复用旧检查点。
+
+    否则会复用「在上限更小时生成的」检查点，那些内容可能本身就不完整。
+    """
+    import json as _json
+    from prd2tc.pipeline import GenerateRequest, PipelineRunner
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    base = dict(prd=sample, out=tmp_path / "o", product="p", version="v1", stub=True)
+    big = _base_cfg(max_tokens=16384)
+    small = _base_cfg(max_tokens=8192)
+
+    first = PipelineRunner(big).generate(GenerateRequest(**base))
+    hash_big = _json.loads((first.root / "run-state.json").read_text(encoding="utf-8"))["configHash"]
+
+    same = PipelineRunner(big).generate(GenerateRequest(**base, resume=True))
+    modules_same = _json.loads((same.root / "run-state.json").read_text(encoding="utf-8"))["modules"]
+    assert all(v == "skipped" for v in modules_same.values()), (
+        f"同配置 --resume 应复用检查点，实际 {modules_same}"
+    )
+
+    changed = PipelineRunner(small).generate(GenerateRequest(**base, resume=True))
+    state = _json.loads((changed.root / "run-state.json").read_text(encoding="utf-8"))
+    assert state["configHash"] != hash_big
+    assert any(v == "succeeded" for v in state["modules"].values()), (
+        f"max_tokens 变化后不应复用旧检查点，实际 {state['modules']}"
+    )
 
 
 def test_module_batch_size_override(monkeypatch):
@@ -156,8 +258,8 @@ def test_module_context_slimmed():
     def fake_llm(cfg, user_text, **kwargs):
         captured["user"] = user_text
         return LLMResult("```json\n[{\"id\":\"TC-AUTH-001\",\"module\":\"AUTH\",\"title\":\"登录\","
-                         "\"priority\":\"P1\",\"tags\":[\"@regression\"],\"requirement\":[\"REQ-AUTH-001\"],"
-                         "\"steps\":[{\"action\":\"goto\",\"target\":\"/\"}],\"expected\":[\"渲染\"]}]\n```", "fake")
+                         "\"design_method\":\"场景法\",\"priority\":\"P1\",\"tags\":[\"@regression\"],\"requirement\":[\"REQ-AUTH-001\"],"
+                         "\"steps\":[{\"action\":\"goto\",\"target\":\"/\"}],\"expected\":[\"页面成功渲染并显示预期内容\"]}]\n```", "fake")
 
     reqs = [{"id": "REQ-AUTH-001", "module": "AUTH", "title": "登录"}]
     stages.run_stage_3_modules(
@@ -177,7 +279,7 @@ def test_compact_analysis_replaces_big_table():
     reqs = [{"id": "REQ-AUTH-001", "module": "AUTH", "priority": "P0", "title": "登录"}]
     out = stages.compact_analysis(md, reqs)
     assert "REQ-AUTH-001 [P0] 登录" in out
-    assert "跳转首页" not in out  # 大表已替换
+    assert "登录成功后跳转至首页" not in out  # 大表已替换
 
 
 def test_compact_partial_strips_sections():
@@ -193,12 +295,12 @@ def test_compact_partial_strips_sections():
 def test_generate_with_feedback_repair_path():
     """增量修正：重试只回传失败输出+错误，不重发大输入（BIG_PLAN）。"""
     responses = [
-        LLMResult(content='```json\n[{"id":"TC-AUTH-001","module":"AUTH","title":"t","priority":"P1",'
+        LLMResult(content='```json\n[{"id":"TC-AUTH-001","module":"AUTH","title":"t","design_method": "场景法", "priority":"P1",'
                           '"tags":["@regression"],"requirement":["REQ-AUTH-001"],'
                           '"steps":[{"action":"click"}],"expected":[]}]\n```', model="fake"),
-        LLMResult(content='```json\n[{"id":"TC-AUTH-001","module":"AUTH","title":"t","priority":"P1",'
+        LLMResult(content='```json\n[{"id":"TC-AUTH-001","module":"AUTH","title":"t","design_method": "场景法", "priority":"P1",'
                           '"tags":["@regression"],"requirement":["REQ-AUTH-001"],'
-                          '"steps":[{"action":"click","target":"按钮"}],"expected":["渲染"]}]\n```', model="fake"),
+                          '"steps":[{"action":"click","target":"按钮"}],"expected":["页面成功渲染并显示预期内容"]}]\n```', model="fake"),
     ]
 
     class Fake:
@@ -232,12 +334,12 @@ def test_generate_with_feedback_accumulates_cache_tokens():
 
     def fake(cfg, user, **kwargs):
         calls["n"] += 1
-        bad = ("```json\n[{\"id\":\"TC-AUTH-001\",\"module\":\"AUTH\",\"title\":\"t\",\"priority\":\"P1\","
+        bad = ("```json\n[{\"id\":\"TC-AUTH-001\",\"module\":\"AUTH\",\"title\":\"t\",\"design_method\":\"场景法\",\"priority\":\"P1\","
                "\"tags\":[\"@regression\"],\"requirement\":[\"REQ-AUTH-001\"],"
                "\"steps\":[{\"action\":\"click\"}],\"expected\":[]}]\n```")
-        good = ("```json\n[{\"id\":\"TC-AUTH-001\",\"module\":\"AUTH\",\"title\":\"t\",\"priority\":\"P1\","
+        good = ("```json\n[{\"id\":\"TC-AUTH-001\",\"module\":\"AUTH\",\"title\":\"t\",\"design_method\":\"场景法\",\"priority\":\"P1\","
                 "\"tags\":[\"@regression\"],\"requirement\":[\"REQ-AUTH-001\"],"
-                "\"steps\":[{\"action\":\"click\",\"target\":\"按钮\"}],\"expected\":[\"渲染\"]}]\n```")
+                "\"steps\":[{\"action\":\"click\",\"target\":\"按钮\"}],\"expected\":[\"页面成功渲染并显示预期内容\"]}]\n```")
         cache_read = 0 if calls["n"] == 1 else 500  # 第 2 轮命中缓存
         return LLMResult(good if calls["n"] > 1 else bad, "fake", 100, 50,
                          cache_read_input_tokens=cache_read, cache_creation_input_tokens=200)

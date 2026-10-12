@@ -13,7 +13,7 @@ import json
 import re
 
 from prd2tc import stages as _stages  # noqa: F401  （仅类型提示，避免循环依赖在模块级）
-from prd2tc.validator import validate_case
+from prd2tc.validator import check_duplicate, validate_case
 from prd2tc.traceability import build_traceability, validate_traceability
 
 REQ_RE = re.compile(r"REQ-[A-Z][A-Z0-9_]*-\d{3}")
@@ -65,16 +65,24 @@ def check_four_sections(text: str) -> list[str]:
     return _missing_sections(text, ["角色清单", "业务规则", "非功能需求", "风险与疑点"])
 
 
-def check_cases_text(text: str, allowed_modules: set[str] | None = None) -> list[str]:
-    """阶段 3 门禁：JSON 可解析 + 用例字段强校验（id 唯一/枚举/非空）。"""
+def check_cases_text(text: str, allowed_modules: set[str] | None = None,
+                     *, markdown_transit: bool = False) -> list[str]:
+    """阶段 3 门禁：JSON（或 Markdown 表格）可解析 + 用例字段强校验 + 批内重复检测。"""
     try:
-        cases = _stages.extract_and_normalize(text)
+        cases = _stages.extract_and_normalize(text, markdown_transit=markdown_transit)
     except (ValueError, json.JSONDecodeError) as e:
-        return [f"用例 JSON 解析失败: {e}（请只输出一个 JSON 数组）"]
+        kind = "用例表格" if markdown_transit else "用例 JSON"
+        return [f"{kind}解析失败: {e}" + ("" if markdown_transit else "（请只输出一个 JSON 数组）")]
     if not cases:
         return ["未生成任何用例"]
     seen: set[str] = set()
     errors = [e for i, c in enumerate(cases) for e in validate_case(c, i, seen, allowed_modules)]
+    # C-007 批内重复检测：同一批生成的用例不得「同模块 + 同步骤 + 同预期」。
+    # 放在门禁里（而非只在上层 validate）才能把具体错误反馈给模型重出。
+    signatures: dict[str, str] = {}
+    for c in cases:
+        at = f"[用例 {c.get('id', '(无id)')}]"
+        errors.extend(check_duplicate(c, at, signatures))
     return errors
 
 

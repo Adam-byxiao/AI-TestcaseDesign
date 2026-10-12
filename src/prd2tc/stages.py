@@ -15,6 +15,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from prd2tc import constraints, loader
+from prd2tc import metrics as _metrics
 from prd2tc.config import Config
 from prd2tc.examples import Example, render_examples
 from prd2tc.llm import LLMResult, chat_completion
@@ -49,7 +50,9 @@ SYSTEM_ROLES = {
 }
 
 # 分阶段温度：事实/抽取类任务低温度，创造性任务略高（可被 PRD2TC_TEMP_Sx / PRD2TC_TEMPERATURE 覆盖）
-_DEFAULT_TEMP = {1: 0.2, 2: 0.3, 3: 0.5}
+# 阶段 3 是全链路最需要确定性的环节（结构化 JSON + 字段强校验 + 程序化重编号），
+# 故与阶段 2 同为 0.3，不再用 0.5（对齐 spec2case 的用例生成温度）。
+_DEFAULT_TEMP = {1: 0.2, 2: 0.3, 3: 0.3}
 
 
 def stage_temperature(stage: int, cfg: Config) -> float:
@@ -99,6 +102,26 @@ def build_user_message(
     return "\n\n".join(parts)
 
 
+def _table_instruction() -> str:
+    """Markdown 中转模式的输出格式说明（替代 JSON 字段约束）。"""
+    from prd2tc.markdown_transit import COLUMNS
+    return (
+        "输出格式：Markdown 表格（**这是唯一允许的输出**，不要输出 JSON、不要输出思考过程）。\n"
+        "表头必须逐字如下（列顺序不可变）：\n\n"
+        "| " + " | ".join(COLUMNS) + " |\n"
+        "|" + "|".join(["---"] * len(COLUMNS)) + "|\n\n"
+        "单元格填写规则（务必逐条遵守）：\n"
+        "- `id` / `module` / `subModule` / `title` / `design_method` / `priority`：纯文本；\n"
+        "- `tags` / `requirement` / `preconditions` / `expected`：多项用**英文逗号**分隔；\n"
+        "- `testData`：多项用**分号**分隔的「键=值」标量（如 `phone=13800138000;password=123456`）；"
+        "禁止嵌套对象或数组，复杂数据写进 `preconditions`；\n"
+        "- `steps`：多项用**分号**分隔，每项为「动作 目标」或「动作 目标=数据」"
+        "（如 `goto /login;fill 手机号输入框=13800138000;click 登录按钮;expectUrl /`）；\n"
+        "- **单元格内不得出现竖线 `|` 或换行**；需要竖线时用「｜」；\n"
+        "- `title` 用动宾短语，≤ 30 字；`expected` 给可断言结果。\n"
+    )
+
+
 def field_spec(allowed_modules: set[str] | None = None) -> str:
     """阶段 3 注入的字段约束（与 validator 枚举保持同源）。
 
@@ -116,18 +139,28 @@ def field_spec(allowed_modules: set[str] | None = None) -> str:
         f"- priority ∈ {PRIORITIES}；P0 必须带 @smoke 标签\n"
         f"- id 格式 TC-<MOD>[-<SUB>]-<3位序号>，全局唯一（id 前缀必须与 module 一致）\n"
         f"- requirement 为 REQ-* 编号数组（只能引用本模块真实存在的 REQ）\n"
-        f"- steps[].action ∈ {ACTIONS}，target 非空\n"
+        f"- steps[].action ∈ {ACTIONS}，target 非空，data 必须是字符串\n"
+        "- testData 必须是「键=值」字符串数组（如 [\"phone=13800138000\",\"password=123456\"]），"
+        "值只能是标量（数字/布尔/短文本）；禁止嵌套对象或数组、禁止值里出现双引号或反斜杠；"
+        "复杂数据请写进 preconditions\n"
         f"- expected 非空数组\n"
         "输出为一个 JSON 数组（可用 ```json 围栏包裹）。"
     )
 
 
 def build_stage_1_user(
-    prd_text: str, *, examples: list[Example] | None = None, feedback: str | None = None
+    prd_text: str, *, examples: list[Example] | None = None, feedback: str | None = None,
+    image_context: str = "",
 ) -> str:
-    """阶段 1 user 消息：任务指令 + 测试原理 + PRD +（可选）参考示例 +（可选）门禁反馈。"""
+    """阶段 1 user 消息：任务指令 + 测试原理 + PRD + 图片证据 +（可选）参考示例/门禁反馈。
+
+    `image_context`（PRD 图片的视觉证据）放在**输入区**而非指令区：
+    它是「补充的 PRD 事实」，属于被测对象的一部分，需与 PRD 全文并列供模型对照。
+    """
     prompt = loader.load_asset(PROMPT_1)
     inputs: dict[str, str] = {"PRD 全文": prd_text}
+    if image_context:
+        inputs["PRD 配图证据（从 PRD 内嵌/随附图片中识别，属推断，冲突时以 PRD 明文为准）"] = image_context
     if examples:
         inputs["参考示例（历史 PRD-用例对，学习其模块划分与设计逻辑）"] = render_examples(examples)
     extras = [constraints.load_principles()]
@@ -174,25 +207,36 @@ def build_stage_3_user(
     return build_user_message(prompt, inputs=inputs or None, extra_requirements="\n\n".join(reqs) or None)
 
 
-def stage_3_system(plan_md: str, examples: list[Example] | None = None) -> str:
+def stage_3_system(plan_md: str, examples: list[Example] | None = None,
+                   *, markdown_transit: bool = False, ui_spec=None,
+                   image_context: str = "") -> str:
     """阶段 3 稳定 system 前缀：角色 + 测试方案 + 字段约束 + 用例约束 + 参考示例。
 
     各模块/批次共享、字节保持一致，作为缓存友好的不变前缀。
+    `ui_spec`（原型 UI 契约）与 `image_context`（PRD 图片视觉证据）也放在这里：
+    它们对整轮运行恒定，放 system 可命中 prompt 缓存，且能强约束所有批次。
     """
     parts = [
         SYSTEM_ROLES[3],
         "以下是本次任务各模块共享、保持不变的上下文（测试方案 / 字段约束 / 用例生成约束 / 参考示例）：",
         "## 测试方案\n" + plan_md,
-        "## 字段约束\n" + field_spec(),
+        "## 字段约束\n" + (_table_instruction() if markdown_transit else field_spec()),
         "## 用例生成约束\n" + constraints.build_case_constraints(examples),
     ]
+    if ui_spec is not None:
+        from prd2tc.prototype import render_ui_spec
+        rendered = render_ui_spec(ui_spec)
+        if rendered:
+            parts.append(rendered)
+    if image_context:
+        parts.append(image_context)
     if examples:
         parts.append("## 参考示例\n" + render_examples(examples))
     return "\n\n".join(parts)
 
 
-def extract_cases(text: str) -> list[dict]:
-    """从模型输出提取 JSON 数组：优先 ```json 围栏，其次首尾方括号。"""
+def _extract_from(text: str) -> list[dict]:
+    """从一段文本里取 JSON 数组：优先 ```json 围栏，其次首尾方括号。"""
     m = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
     if m:
         return json.loads(m.group(1))
@@ -208,6 +252,27 @@ def extract_cases(text: str) -> list[dict]:
     raise ValueError("模型输出中未找到 JSON 数组")
 
 
+def extract_cases(text: str) -> list[dict]:
+    """提取 JSON 数组。
+
+    优先从**剥离思考后**的正文提取：M3 会在 <think> 里贴示例 JSON，
+    直接取「首尾方括号」会把思考内容当成真用例。剥离后失败再回退原文，
+    保证旧行为不退化。
+    """
+    from prd2tc.reasoning import strip_think
+    stripped = strip_think(text or "")
+    candidates = [stripped] if stripped.strip() == (text or "").strip() else [stripped, text or ""]
+    last_error: Exception | None = None
+    for candidate in candidates:
+        if not candidate.strip():
+            continue
+        try:
+            return _extract_from(candidate)
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+    raise ValueError(f"模型输出中未找到 JSON 数组（{last_error}）")
+
+
 # 无 DOM 定位目标的动作：模型省略 target 属合理行为，给予默认值而非判错
 DEFAULT_STEP_TARGETS = {"reload": "当前页面", "waitFor": "页面就绪"}
 
@@ -221,20 +286,47 @@ def normalize_step_targets(cases: list[dict]) -> list[dict]:
     return cases
 
 
-def extract_and_normalize(text: str) -> list[dict]:
-    """提取 JSON 并补齐无目标动作的默认 target。"""
-    return normalize_step_targets(extract_cases(text))
+def extract_and_normalize(text: str, *, markdown_transit: bool = False) -> list[dict]:
+    """提取 JSON 并规范化：补齐无目标动作的默认 target，并扁平化 testData。
+
+    在这里归一化而非仅在落盘时，是为了让门禁看到的形态与最终产物一致。
+    markdown_transit=True 时优先按 Markdown 表格解析，失败再回退 JSON——
+    这样即使模型不听话地输出了 JSON，流程仍能继续。
+    """
+    from prd2tc.schema import normalize_test_data
+    cases = None
+    if markdown_transit:
+        from prd2tc.markdown_transit import extract_table_cases
+        try:
+            cases = extract_table_cases(text)
+        except ValueError:
+            cases = None
+    if cases is None:
+        cases = extract_cases(text)
+    return [normalize_test_data(case) for case in normalize_step_targets(cases)]
 
 
 # ---- 阶段3 Token 优化（P0 module_context 瘦身 / P3 批次自适应）----
 # P0：PRD 原文上下文按需求检索取段数量（越小越省；0 = 不携带原文上下文）
 CTX_TOP_K = int(os.environ.get("PRD2TC_CTX_TOP_K", "2"))
 
-# P3：批次容量按输出预算自适应（需求数/批 = 输出预算 ÷ 每条需求预估完成 token）。
+# P3：批次容量按输出预算自适应（需求数/批 = 预算 ÷ 每条需求预估完成 token）。
 # 小/中模块自动退化为「单模块一次全量」，大模块按预算分批；PRD2TC_CASE_BATCH_SIZE 可硬覆盖（旧参数兼容）。
-TOKENS_PER_REQ_EST = int(os.environ.get("PRD2TC_TOKENS_PER_REQ", "450"))
-CASE_BATCH_CAP = int(os.environ.get("PRD2TC_CASE_BATCH_CAP", "24"))
-OUTPUT_BUDGET_RATIO = float(os.environ.get("PRD2TC_CASE_OUTPUT_BUDGET", "0.85"))
+#
+# 三个常数共同决定「单次请求的输出是否有余量」，缺一不可：
+#
+# - TOKENS_PER_REQ_EST = 1800：实测校准值。唯一完整跑完的 KB 模块是 1700 tok/需求；
+#   被截断的模块给出下限（TOOL 仅 3 条需求就撞满 8192 → ≥2731 tok/需求）。
+#   旧值 450 严重偏低，是运行 9d97060e 大面积截断的直接原因。
+#
+# - OUTPUT_BUDGET_RATIO = 0.60：**关键**。批次容量与 max_tokens 成正比，若沿用 0.85，
+#   则「调高 max_tokens」只会让批次同比例变大，安全余量恒为 1/0.85≈1.18x，截断率不变。
+#   降到 0.60 才真正换来 1.67x 余量，让上调 max_tokens 生效。
+#
+# - CASE_BATCH_CAP = 8：防止批次随预算无限膨胀（旧值 24 可让 30+ 条需求挤进一批）。
+TOKENS_PER_REQ_EST = int(os.environ.get("PRD2TC_TOKENS_PER_REQ", "1800"))
+CASE_BATCH_CAP = int(os.environ.get("PRD2TC_CASE_BATCH_CAP", "8"))
+OUTPUT_BUDGET_RATIO = float(os.environ.get("PRD2TC_CASE_OUTPUT_BUDGET", "0.60"))
 
 
 def _module_batch_size(cfg: Config, req_count: int) -> int:
@@ -484,6 +576,58 @@ def align_analysis_ids(analysis_md: str, requirements: list[dict]) -> str:
     return analysis_md
 
 
+def dedup_cross_batch(
+    per_batch: list[tuple[list[dict], set[str]]],
+) -> tuple[list[dict], list[tuple[str, int, int]]]:
+    """跨批次去重：同一需求只由**一个**批次供例，返回（保留的用例, 冲突记录）。
+
+    背景（实测运行 c653dc92）：KB 有 16 条需求 → 切成 2 批（各 8 条），但两批都产出了
+    覆盖**全部 16 条需求**的用例 —— 批次提示只是自然语言建议，模型并未遵守。
+    当时门禁的允许集合是**模块级**（`allowed = {module}`），越界引用不会被拦，
+    于是 `all_cases.extend()` 把两批直接叠加：16 条需求各被独立覆盖两次，
+    KB 42 条用例中 52% 是语义重复，全库约 30% 用例量是重复膨胀。
+    而 `renumber()` 顺序重编号又抹掉了批次边界，`case_signature()` 基于文本比较，
+    两批对同一元素用了不同 testid/路由，因此**跨批重复一路合格出厂**。
+
+    规则（确定性、不丢覆盖）：
+      1. 某需求的**供例批次** = 拥有该需求的批次（r ∈ batch_req_ids）；若拥有批未产出，
+         则取最早产出它的批次。
+      2. 每个批次只保留「其引用的需求全部由本批供例」的用例；混合引用则裁剪掉
+         非本批供例的引用；裁剪后无引用则丢弃该用例。
+    由规则 1 可知供例批次必然产出了该需求的用例，故不会产生覆盖缺口。
+    """
+    produced: dict[str, list[int]] = {}
+    for index, (cases, _) in enumerate(per_batch):
+        for case in cases:
+            for ref in case.get("requirement") or []:
+                produced.setdefault(str(ref), [])
+                if index not in produced[str(ref)]:
+                    produced[str(ref)].append(index)
+
+    owners = [set(ids) for _, ids in per_batch]
+    provider: dict[str, int] = {}
+    conflicts: list[tuple[str, int, int]] = []
+    for ref, batches in produced.items():
+        owning = [i for i in batches if ref in owners[i]]
+        provider[ref] = owning[0] if owning else batches[0]
+        for i in batches:
+            if i != provider[ref]:
+                conflicts.append((ref, provider[ref], i))
+
+    kept: list[dict] = []
+    for index, (cases, _) in enumerate(per_batch):
+        for case in cases:
+            refs = [str(r) for r in (case.get("requirement") or [])]
+            if not refs:
+                kept.append(case)          # 未引用需求，无从归属，交由覆盖率门禁处理
+                continue
+            mine = [r for r in refs if provider.get(r) == index]
+            if not mine:
+                continue                    # 该用例覆盖的需求全部由别批供例 → 整体重复
+            kept.append(case if len(mine) == len(refs) else {**case, "requirement": mine})
+    return kept, conflicts
+
+
 def run_stage_3_modules(
     cfg: Config,
     plan_md: str,
@@ -501,8 +645,18 @@ def run_stage_3_modules(
     token_callback=None,
     reporter=print,
     status_callback=None,
+    batch_callback=None,
+    split_callback=None,
+    ui_spec=None,
+    image_context: str = "",
 ) -> tuple[list[dict], LLMResult]:
-    """按模块并发生成；模块内再按需求分批生成，避免大模块单次输出超限（截断/字段丢失）。"""
+    """按模块并发生成；模块内再按需求分批生成，避免大模块单次输出超限（截断/字段丢失）。
+
+    `ui_spec`：原型 UI 契约（见 `prd2tc.prototype`）。提供时：
+      1. 作为 system 前缀注入真实标识符/文案，模型不再需要编造；
+      2. 门禁按契约校验 target 与 goto 地址。
+    `image_context`：PRD 图片的视觉证据（见 `prd2tc.images`），注入 system 前缀。
+    """
     grouped: dict[str, list[dict]] = defaultdict(list)
     for req in requirements:
         if req.get("module"):
@@ -513,6 +667,10 @@ def run_stage_3_modules(
     # P0：module_context 瘦身——按配置 chunk_size 分段（更细），配合 CTX_TOP_K 只携带相关片段，
     # 不再用默认 12000 字符/段把整份 PRD 全量送进每个模块批次（原每次 ~30K 字符 ≈ 5.6K token）。
     chunks = split_document(prd_text, chunk_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
+    # 指标与取消标志存在线程本地，线程池 worker 不会自动继承，必须在 worker 内显式绑定，
+    # 否则阶段3（耗时最长）拿不到任何实时指标。
+    _live, _ = _metrics.active()
+    _flag = _metrics.cancel_flag()
 
     def renumber(cases: list[dict], module: str) -> list[dict]:
         for i, case in enumerate(cases, 1):
@@ -520,7 +678,15 @@ def run_stage_3_modules(
             case["module"] = module  # 模块码为批次输入，确定性强制（与 id 重编号同构，非削弱门禁）
         return cases
 
+    def _emit_batch_split(module_name, new_depth, original, halves, reason):
+        if split_callback:
+            split_callback(module_name, new_depth, original, halves, reason)
+
     def generate_one(module: str, module_reqs: list[dict]):
+        from prd2tc import metrics as _metrics
+        # worker 线程内重新绑定：线程本地不跨线程继承（含取消标志，否则取消对流式无效）
+        _metrics.bind(_live, module)
+        _metrics.bind_cancel(_flag)
         cached = load_checkpoint(module) if load_checkpoint else None
         if cached is not None:
             seen: set[str] = set()
@@ -542,14 +708,35 @@ def run_stage_3_modules(
         allowed = {module}
         expected_req_ids = {str(r.get("id")) for r in module_reqs}
         all_cases: list[dict] = []
+        # 跨批去重的输入：每批的用例 + 该批「拥有」的需求集合（批次固定输入，确定性）
+        per_batch: list[tuple[list[dict], set[str]]] = []
         total_prompt = total_completion = total_gate_retries = total_cache_read = total_cache_creation = 0
         last_model = cfg.model
-        sys3 = stage_3_system(plan_md, module_examples)
+        sys3 = stage_3_system(plan_md, module_examples,
+                              markdown_transit=cfg.markdown_transit,
+                              ui_spec=ui_spec, image_context=image_context)
+        live, _ = _metrics.active()
+        if live is not None:
+            live.begin_module(module, requirements=len(module_reqs),
+                              batches=max(1, -(-len(module_reqs) // max(1, _module_batch_size(cfg, len(module_reqs))))))
 
         # P3：批次容量按输出预算自适应（_module_batch_size 内部取 min(budget, cap, 模块需求数)）
         batch_size = _module_batch_size(cfg, len(module_reqs))
         batches = [module_reqs[i:i + batch_size] for i in range(0, len(module_reqs), batch_size)]
-        for batch_index, batch in enumerate(batches, 1):
+        if batch_callback:
+            try: batch_callback(module, 0, len(batches), "module_started")
+            except Exception: pass
+        # 自愈队列：预算被思考耗尽时，把该批对半拆开重试，减少单次所需输出量。
+        # 只重试同样大的任务通常会再次耗尽（实测 M3 的失败模式），拆分才是有效动作。
+        pending: list[tuple[list[dict], int]] = [(list(b), 0) for b in batches]
+        processed = 0
+        while pending:
+            batch, depth = pending.pop(0)
+            processed += 1
+            batch_index = processed
+            if batch_callback:
+                try: batch_callback(module, batch_index, len(pending) + processed - 1, "batch_started")
+                except Exception: pass
             query = module + " " + " ".join(str(r.get("title", "")) for r in batch)
             context = "\n\n".join(c.text for c in locate(chunks, query, top_k=CTX_TOP_K))
             hint = (
@@ -563,7 +750,40 @@ def run_stage_3_modules(
                 return build_stage_3_user(plan_md, examples=module_examples, feedback=feedback,
                                           requirements=b, module_context=c, batch_hint=h)
 
-            gate = lambda value: __import__("prd2tc.gates", fromlist=["check_cases_text"]).check_cases_text(value, allowed)
+            # 本批「拥有」的需求：批次切分是固定的，越界引用必然与拥有批重复覆盖。
+            batch_req_ids = frozenset(str(r.get("id")) for r in batch)
+
+            def gate(value, _allowed=allowed, _bids=batch_req_ids):
+                """门禁 = 通用用例校验 + **批次范围**校验。
+
+                此前门禁的允许集合只有模块码，越界引用（批1 生成批2 的需求）不会被拦，
+                这正是 KB 两批各覆盖全部 16 条需求的根因。加上范围校验后，
+                越界会成为门禁错误并回灌给模型，由既有重试机制要求其收窄到本批。
+                """
+                errs = __import__("prd2tc.gates", fromlist=["check_cases_text"]).check_cases_text(
+                    value, _allowed, markdown_transit=cfg.markdown_transit)
+                # 越界检查**独立于**其它门禁错误：若写成「仅在无其它错误时才查」，
+                # 一旦同时存在 C-007 类错误，越界就会被掩盖而放行（实测踩到此坑）。
+                try:
+                    parsed = extract_and_normalize(value, markdown_transit=cfg.markdown_transit)
+                except Exception:
+                    parsed = []
+                out_of_scope = sorted({str(x) for c in parsed
+                                       for x in (c.get("requirement") or [])
+                                       if str(x) not in _bids})
+                if out_of_scope:
+                    errs.append(
+                        f"越界引用：本批只负责 {sorted(_bids)}，但用例引用了 {out_of_scope}。"
+                        f"这些需求由其它批次负责，重复覆盖会产生同质用例；"
+                        f"请只为本批需求生成用例。")
+                # 原型契约校验：拦编造标识符与编造 URL 路由
+                # （实测无此校验时 143 个标识符全部编造、7 种 URL 路径全部不存在）
+                if ui_spec is not None and parsed:
+                    from prd2tc.prototype import validate_targets
+                    errs.extend(validate_targets(parsed, ui_spec))
+                return errs
+
+            content = ""
 
             if use_gate:
                 content, result, errors = generate_with_feedback(
@@ -573,10 +793,15 @@ def run_stage_3_modules(
                     repair_builder=stage3_repair_builder(expected_req_ids, module),
                 )
                 if errors:
+                    split = _split_batch_if_budget_exhausted(
+                        module, batch, depth, content, result, errors,
+                        pending, emit=_emit_batch_split)
+                    if split:
+                        continue
                     if save_failure:
                         save_failure(module, content)
                     raise ValidationError([f"[{module} 批{batch_index}] {e}" for e in errors])
-                cases = extract_and_normalize(content)
+                cases = extract_and_normalize(content, markdown_transit=cfg.markdown_transit)
             else:
                 cases, result = run_stage_3(cfg, plan_md, llm=llm, examples=module_examples,
                                             requirements=batch, module_context=context,
@@ -595,8 +820,17 @@ def run_stage_3_modules(
                 if save_failure:
                     save_failure(module, content if use_gate else json.dumps(cases, ensure_ascii=False, indent=2))
                 raise ValidationError([f"用例 {cid} 引用了其他模块或不存在的需求 {ref}" for cid, ref in wrong_refs])
-            all_cases.extend(cases)
+            per_batch.append((cases, set(batch_req_ids)))
 
+        # 跨批去重：同一需求只由一个批次供例（此前的裸 extend 会叠加两批的同质用例）
+        all_cases, _cross_batch_conflicts = dedup_cross_batch(per_batch)
+        if _cross_batch_conflicts and reporter is not None:
+            try:
+                _sample = _cross_batch_conflicts[:3]
+                reporter(f"⚠ 模块 {module} 检测到跨批次重复覆盖 {len(_cross_batch_conflicts)} 处，"
+                         f"已按「需求归属批次」保留唯一供例：{_sample}")
+            except Exception:
+                pass
         all_cases = renumber(all_cases, module)
         seen: set[str] = set()
         errs = [e for i, c in enumerate(all_cases) for e in validate_case(c, i, seen, allowed)]
@@ -651,11 +885,75 @@ def run_stage_3_modules(
     return all_cases, LLMResult("", model, total_prompt, total_completion, total_gate_retries)
 
 
+_LLM_HOOKS = ("on_delta", "on_reasoning_delta", "should_cancel")
+
+
+def _llm_hook_params(llm) -> set[str]:
+    """探测自定义 llm 实现支持哪些流式钩子。
+
+    测试里的假实现常只接受 (cfg, user_text, **kwargs) 或更少参数，
+    盲传会 TypeError，故按签名能力选择性注入。
+    """
+    try:
+        import inspect
+        parameters = inspect.signature(llm).parameters
+    except (TypeError, ValueError):
+        return set()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return set(_LLM_HOOKS)
+    return {name for name in _LLM_HOOKS if name in parameters}
+
+
+def call_llm(cfg: Config, user: str, *, system: str | None = None,
+             temperature: float | None = None, llm=chat_completion) -> LLMResult:
+    """统一 LLM 调用入口：接线流式回调、实时指标与取消检查。
+
+    指标/模块来自线程本地绑定（见 metrics.bind），因此无需改动各 stage 的签名，
+    也不会把 on_delta 穿过 6 层函数。
+    """
+    from prd2tc import metrics as _metrics
+    live, module = _metrics.active()
+    flag = _metrics.cancel_flag()
+    hooks = _llm_hook_params(llm)
+
+    kwargs: dict = {"system": system, "temperature": temperature}
+    if "on_delta" in hooks or "on_reasoning_delta" in hooks:
+        if live is not None:
+            if module:
+                live.begin_request(module)
+            target = module or "default"
+            if "on_delta" in hooks:
+                kwargs["on_delta"] = lambda text, _m=target: live.delta(_m, text)
+            if "on_reasoning_delta" in hooks:
+                # 独立推理通道：与正文分开统计，否则指标会把思考算成产出
+                kwargs["on_reasoning_delta"] = lambda text, _m=target: live.delta(_m, text, reasoning=True)
+        else:
+            if "on_delta" in hooks:
+                kwargs["on_delta"] = None
+            if "on_reasoning_delta" in hooks:
+                kwargs["on_reasoning_delta"] = None
+    if "should_cancel" in hooks:
+        kwargs["should_cancel"] = flag.cancelled if flag is not None else None
+
+    result = llm(cfg, user, **kwargs)
+
+    if live is not None:
+        live.end_request(module or "default",
+                         prompt_tokens=result.prompt_tokens,
+                         completion_tokens=result.completion_tokens,
+                         cache_read=result.cache_read_input_tokens,
+                         cache_creation=result.cache_creation_input_tokens,
+                         estimated=result.usage_estimated,
+                         reasoning_chars=getattr(result, "reasoning_chars", 0))
+    return result
+
+
 def run_stage_1(
-    cfg: Config, prd_text: str, *, llm=chat_completion, examples: list[Example] | None = None
+    cfg: Config, prd_text: str, *, llm=chat_completion, examples: list[Example] | None = None,
+    image_context: str = "",
 ) -> tuple[str, LLMResult]:
-    user = build_stage_1_user(prd_text, examples=examples)
-    result = llm(cfg, user, system=SYSTEM_ROLES[1], temperature=stage_temperature(1, cfg))
+    user = build_stage_1_user(prd_text, examples=examples, image_context=image_context)
+    result = call_llm(cfg, user, system=SYSTEM_ROLES[1], temperature=stage_temperature(1, cfg), llm=llm)
     return result.content, result
 
 
@@ -702,16 +1000,22 @@ def render_analysis_head(modules: list[dict], requirements: list[dict]) -> str:
 def generate_stage_1(
     cfg: Config, prd_text: str, *, llm=chat_completion, examples: list[Example] | None = None,
     jobs: int = 1, use_gate: bool = True, max_gate_retries: int = 2, reporter=print,
+    image_context: str = "",
 ) -> tuple[str, LLMResult, list[str]]:
     """小文档单次生成；长文档分段并发抽取后合并并执行全量门禁。"""
     from prd2tc import gates
+    # 分段 worker 需要显式绑定指标/取消标志（线程本地不跨线程继承）
+    _live, _ = _metrics.active()
+    _flag = _metrics.cancel_flag()
     chunks = split_document(prd_text, chunk_size=cfg.chunk_size, overlap=cfg.chunk_overlap)
     if len(chunks) <= 1:
         if not use_gate:
-            content, result = run_stage_1(cfg, prd_text, llm=llm, examples=examples)
+            content, result = run_stage_1(cfg, prd_text, llm=llm, examples=examples,
+                                          image_context=image_context)
             return content, result, []
         return generate_with_feedback(
-            cfg, lambda fb: build_stage_1_user(prd_text, examples=examples, feedback=fb),
+            cfg, lambda fb: build_stage_1_user(prd_text, examples=examples, feedback=fb,
+                                               image_context=image_context),
             lambda value: gates.check_analysis(value, prd_text), llm=llm,
             max_retries=max_gate_retries, label="阶段1 需求分析", system=SYSTEM_ROLES[1],
             temperature=stage_temperature(1, cfg), reporter=reporter,
@@ -722,7 +1026,11 @@ def generate_stage_1(
     failures: list[str] = []
 
     def extract_one(index: int, text: str):
-        content, result = run_stage_1(cfg, text, llm=llm, examples=examples)
+        # 分段并发同样在 worker 线程：绑定指标/取消标志，让分段进度与取消可见
+        _metrics.bind(_live, "analysis")
+        _metrics.bind_cancel(_flag)
+        content, result = run_stage_1(cfg, text, llm=llm, examples=examples,
+                                      image_context=image_context)
         return index, content, result
 
     with ThreadPoolExecutor(max_workers=max(1, min(jobs, len(chunks)))) as pool:
@@ -776,8 +1084,45 @@ def generate_stage_1(
 
 def run_stage_2(cfg: Config, analysis_md: str, *, llm=chat_completion) -> tuple[str, LLMResult]:
     user = build_stage_2_user(analysis_md)
-    result = llm(cfg, user, system=SYSTEM_ROLES[2], temperature=stage_temperature(2, cfg))
+    result = call_llm(cfg, user, system=SYSTEM_ROLES[2], temperature=stage_temperature(2, cfg), llm=llm)
     return result.content, result
+
+
+# 截断时允许的对半拆分深度：2 层足够把 8 条需求降到 2 条
+MAX_BATCH_SPLIT_DEPTH = 2
+
+
+def _split_batch_if_budget_exhausted(module: str, batch: list[dict], depth: int,
+                                     content: str, result: LLMResult, errors: list[str],
+                                     pending: list, *, emit=None) -> bool:
+    """输出被截断时，把该批对半拆开重排，返回 True。
+
+    触发条件刻意放宽为**任何 finish_reason=length**（不再限于「思考耗尽」）：
+    截断的本质是「单次要输出的内容超过 max_tokens」，无论是模型啰嗦、推理占用，
+    还是批量过大，正确杠杆都是**降低单次输出量**。原地重试同样大的批次几乎必然
+    再次截断（实测运行 9d97060e：AGENT 6 条需求 / SCENE 7 条需求各一次就撞满 8192）。
+
+    函数名保留（历史原因），实际语义是「截断 → 拆批」。
+    """
+    if depth >= MAX_BATCH_SPLIT_DEPTH or len(batch) <= 1:
+        return False
+    if not getattr(result, "truncated", False):
+        return False
+    from prd2tc.reasoning import looks_like_reasoning_exhausted
+    reasoning_only = looks_like_reasoning_exhausted(
+        content, finish_reason=getattr(result, "finish_reason", ""))
+    mid = len(batch) // 2
+    halves = (batch[:mid], batch[mid:])
+    for offset, half in enumerate(halves):
+        pending.insert(offset, (half, depth + 1))
+    if emit is not None:
+        try:
+            emit(module, depth + 1, len(batch), [len(h) for h in halves],
+                 "输出被截断（推理耗尽输出预算），自动拆分批次重试" if reasoning_only
+                 else "输出被长度截断，自动拆分批次以减少单次输出量")
+        except Exception:
+            pass
+    return True
 
 
 def run_stage_3(
@@ -786,8 +1131,10 @@ def run_stage_3(
     allowed_modules: set[str] | None = None
 ) -> tuple[list[dict], LLMResult]:
     user = build_stage_3_user(plan_md, examples=examples, requirements=requirements, module_context=module_context)
-    result = llm(cfg, user, system=stage_3_system(plan_md, examples), temperature=stage_temperature(3, cfg))
-    cases = extract_and_normalize(result.content)
+    result = call_llm(cfg, user, system=stage_3_system(plan_md, examples,
+                                                       markdown_transit=cfg.markdown_transit),
+                      temperature=stage_temperature(3, cfg), llm=llm)
+    cases = extract_and_normalize(result.content, markdown_transit=cfg.markdown_transit)
     seen: set[str] = set()
     errors = [e for i, c in enumerate(cases) for e in validate_case(c, i, seen, allowed_modules)]
     if errors:
@@ -828,7 +1175,7 @@ def generate_with_feedback(
             user = repair_builder(last_content, "\n".join(errors))
         else:
             user = build_user(feedback)
-        result = llm(cfg, user, system=system, temperature=temperature)
+        result = call_llm(cfg, user, system=system, temperature=temperature, llm=llm)
         total_prompt += result.prompt_tokens
         total_completion += result.completion_tokens
         total_cache_read += result.cache_read_input_tokens
@@ -836,13 +1183,33 @@ def generate_with_feedback(
         result.gate_retries = attempt
         last_content = result.content
         errors = gate_fn(result.content) if gate_fn else []
-        if errors and result.truncated:
-            # 输出被长度截断是独立于内容错误的根因，必须显式暴露给模型与 UI
-            hint = (
-                f"⚠ 诊断：模型输出被长度截断（finish_reason={result.finish_reason}）。"
-                "请大幅精简输出（表格每条一行、描述不超过 40 字），并确保所有必备章节完整输出到结尾。"
-            )
-            errors = [hint] + errors
+        if result.truncated:
+            # 截断是**独立于内容错误**的根因，必须无条件报错。
+            #
+            # 实测故障（运行 9d97060e）：输出被 max_tokens 截断后，extract_cases 的
+            # 「修补截断 JSON」回退会 rfind("]") 找到用例内部 tags/requirement 的 `]`，
+            # 从而修补出一个**合法但残缺**的数组 → 门禁只看修补后的部分 → 零错误 →
+            # 模块被判 succeeded、检查点只存下残缺用例，直到最后 traceability 才发现
+            # P0 未覆盖。当时 AGENT 只产出 1 条（6 条需求）、SCENE 只 2 条（7 条需求）。
+            #
+            # 因此这里刻意**不看 errors 是否为空**：只要 finish_reason=length，
+            # 本次输出就不完整，绝不能当作通过。
+            from prd2tc.reasoning import looks_like_reasoning_exhausted
+            if looks_like_reasoning_exhausted(result.content, finish_reason=result.finish_reason):
+                # 另一种实测故障：M3 把全部输出预算花在 <think> 自我纠错上，正文一个字符都没写。
+                errors = [
+                    "⚠ 诊断：输出预算被**思考过程**耗尽（finish_reason=length，正文为空）。"
+                    "你的 <think> 推理占据了全部输出长度，导致 JSON 一个字符都没写出来。"
+                    "请**直接输出 JSON 数组**：禁止输出 <think> 或任何思考过程；"
+                    "若内容确实过多，只保留最关键的用例并精简 title/steps/expected 文案。"
+                ] + errors
+            else:
+                errors = [
+                    f"⚠ 诊断：模型输出被长度截断（finish_reason={result.finish_reason}），"
+                    "本次输出**不完整**——即使前半段能被解析，也可能已丢失用例/章节，不得视为完整结果。"
+                    "请精简输出：title ≤ 30 字、expected 每条 ≤ 40 字、steps 只保留必要动作；"
+                    "并确保输出完整闭合到结尾。"
+                ] + errors
         if not errors:
             result.prompt_tokens = total_prompt
             result.completion_tokens = total_completion

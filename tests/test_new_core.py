@@ -107,9 +107,9 @@ def test_module_generation_and_checkpoint_resume():
         module = "B" if '"module": "B"' in user_text else "A"
         calls.append(module)
         content = json.dumps([{"id": f"TC-{module}-001", "module": module, "title": "场景",
-                               "priority": "P1", "tags": ["@regression"],
+                               "design_method": "场景法", "priority": "P1", "tags": ["@regression"],
                                "requirement": [f"REQ-{module}-001"],
-                               "steps": [{"action": "goto", "target": "/"}], "expected": ["成功"]}])
+                               "steps": [{"action": "goto", "target": "/"}], "expected": ["操作成功并跳转首页"]}])
         return LLMResult(content, "fake", 2, 3)
 
     reqs = [{"id": "REQ-A-001", "module": "A", "title": "A"},
@@ -127,9 +127,9 @@ def test_module_generation_and_checkpoint_resume():
 
 
 def test_dynamic_module_validation():
-    case = {"id": "TC-CRM_2-001", "module": "CRM_2", "title": "客户查询", "priority": "P1",
+    case = {"id": "TC-CRM_2-001", "module": "CRM_2", "title": "客户查询", "design_method": "场景法", "priority": "P1",
             "tags": ["@regression"], "requirement": ["REQ-CRM_2-001"],
-            "steps": [{"action": "goto", "target": "/customers"}], "expected": ["显示列表"]}
+            "steps": [{"action": "goto", "target": "/customers"}], "expected": ["客户列表页成功显示数据"]}
     from prd2tc.validator import validate_case
     assert validate_case(case, 0, set(), {"CRM_2"}) == []
 
@@ -172,9 +172,9 @@ REQ-B-001 B
 def test_import_results_cli_writes_schema_v2(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "output"
-    save_cases(source, [{"id": "TC-A-001", "module": "A", "title": "x", "priority": "P1",
+    save_cases(source, [{"id": "TC-A-001", "module": "A", "title": "x", "design_method": "场景法", "priority": "P1",
                          "tags": ["@regression"], "requirement": ["REQ-A-001"],
-                         "steps": [{"action": "goto", "target": "/"}], "expected": ["ok"]}])
+                         "steps": [{"action": "goto", "target": "/"}], "expected": ["页面成功渲染并显示预期内容"]}])
     results = tmp_path / "results.json"
     results.write_text(json.dumps(make_execution_result("run-1", [
         {"caseId": "TC-A-001", "status": "passed", "durationMs": 2}
@@ -246,8 +246,8 @@ def test_merge_cli_preserves_changed_and_removed_history(tmp_path):
     old_root = tmp_path / "old"
     new_root = tmp_path / "new"
     output = tmp_path / "merged"
-    base = {"module": "A", "title": "x", "priority": "P1", "tags": ["@regression"],
-            "steps": [{"action": "goto", "target": "/"}], "expected": ["ok"]}
+    base = {"module": "A", "title": "x", "design_method": "场景法", "priority": "P1", "tags": ["@regression"],
+            "steps": [{"action": "goto", "target": "/"}], "expected": ["页面成功渲染并显示预期内容"]}
     save_cases(old_root / "cases" / "cases", [
         {**base, "id": "TC-A-001", "requirement": ["REQ-A-001"]},
         {**base, "id": "TC-A-002", "requirement": ["REQ-A-002"]},
@@ -267,6 +267,115 @@ def test_merge_cli_preserves_changed_and_removed_history(tmp_path):
     assert {(case["id"], case["status"]) for case in history} == {
         ("TC-A-001", "needs_review"), ("TC-A-002", "deprecated")}
     assert summary["from"] == str(old_root.resolve()) and summary["new"] == str(new_root.resolve())
+
+
+# ---- 覆盖率门禁失败时的产物保全（运行 9d97060e 的教训）----
+
+_ANALYSIS_2_REQS = """# 需求分析报告
+## 1. 功能模块清单
+| 模块代号 | 模块名 | 页面/入口 | 需求点编号 |
+| A | 模块A | /a | REQ-A-001 ~ REQ-A-002 |
+## 2. 角色清单
+| 角色 | 说明 | 关键权限/状态 |
+| 用户 | 普通 | - |
+## 3. 需求点明细
+| REQ 编号 | 优先级 | 需求描述 | 验收标准 | 异常分支/边界 |
+| REQ-A-001 | P0 | 需求一 | 成功渲染页面 | - |
+| REQ-A-002 | P0 | 需求二 | 成功渲染列表 | - |
+## 4. 业务规则
+| 编号 | 规则 | 影响面 | 测试要点 |
+| BR-1 | 无 | - | - |
+## 5. 非功能需求
+| 编号 | 类别 | 可验证指标 |
+| NFR-1 | 性能 | 2s |
+## 6. 风险与疑点
+| 风险 | 影响 | 应对 |
+| 无 | - | - |
+"""
+
+_PLAN_7 = """# 测试方案
+## 1. 测试范围
+In Scope: A
+## 2. 测试策略
+功能
+## 3. 优先级口径
+P0-P3
+## 4. 风险与应对
+无
+## 5. 测试环境与数据
+stub
+## 6. 准入 / 准出标准
+通过
+## 7. 用例量目标
+2
+"""
+
+
+def _coverage_failing_pipeline(tmp_path):
+    """构造「用例只覆盖 REQ-A-001、漏掉 P0 的 REQ-A-002」的运行。"""
+    def fake(cfg, user_text, **kwargs):
+        if "PRD 全文" in user_text:
+            return LLMResult(_ANALYSIS_2_REQS, "m")
+        if "测试方案排版模板" in user_text:
+            return LLMResult(_PLAN_7, "m")
+        return LLMResult("```json\n" + json.dumps([{
+            "id": "TC-A-001", "module": "A", "title": "需求一验证",
+            "design_method": "场景法", "priority": "P0", "tags": ["@smoke"],
+            "requirement": ["REQ-A-001"],
+            "steps": [{"action": "goto", "target": "/a", "data": ""}],
+            "expected": ["页面成功渲染并显示数据"]}], ensure_ascii=False) + "\n```", "m")
+
+    cfg = Config(api_key="", api_base="local", model="m", temperature=0.0,
+                 timeout=10, max_retries=0, provider="ollama")
+    prd = tmp_path / "prd.md"
+    prd.write_text("# PRD\nREQ-A-001 REQ-A-002\n", encoding="utf-8")
+    runner = PipelineRunner(cfg, llm=fake)
+    return runner.generate(GenerateRequest(prd=prd, out=tmp_path / "out", product="p",
+                                           version="v1", stub=True, no_gate=True))
+
+
+def test_partial_cases_preserved_when_coverage_gate_fails(tmp_path):
+    """覆盖率门禁失败时不得丢弃已生成用例（实测曾丢弃 43 条）。
+
+    改为写入 cases/partial/ 并附「勿直接采信」标记；正式 cases/cases/ 保持为空，
+    避免失败产物被当成正式结果。
+    """
+    result = _coverage_failing_pipeline(tmp_path)
+    assert result.status == "failed"
+    assert any("P0" in e for e in result.errors), result.errors
+
+    partial = result.root / "cases" / "partial"
+    assert partial.is_dir(), "已生成用例应落到 cases/partial/"
+    kept = json.loads((partial / "A.json").read_text(encoding="utf-8"))["cases"]
+    assert len(kept) == 1 and kept[0]["id"] == "TC-A-001"
+
+    notes = [p.name for p in partial.glob("*.md")]
+    assert notes and any("未通过门禁" in n or "READ-ME" in n for n in notes), notes
+
+    official = result.root / "cases" / "cases"
+    assert not list(official.glob("*.json")), (
+        "正式产物目录不得写入未通过门禁的用例"
+    )
+
+
+def test_partial_manifest_records_case_count(tmp_path):
+    """manifest 记录部分用例数量，便于 UI/用户判断损失范围。"""
+    result = _coverage_failing_pipeline(tmp_path)
+    manifest = json.loads((result.root / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["cases"].get("partialCaseCount") == 1
+
+
+def test_no_partial_dir_when_run_succeeds(tmp_path):
+    """对照：正常成功时不应产生 partial 目录。"""
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    out = tmp_path / "ok"
+    result = PipelineRunner(
+        Config(api_key="", api_base="local", model="m", temperature=0.0, timeout=10,
+               max_retries=1, provider="ollama")
+    ).generate(GenerateRequest(prd=sample, out=out, product="p", version="v1", stub=True))
+    assert result.status == "succeeded"
+    assert not (result.root / "cases" / "partial").exists()
+    assert list((result.root / "cases" / "cases").glob("*.json"))
 
 
 def test_generate_module_failure_persists_independent_statuses(tmp_path, monkeypatch):
@@ -293,9 +402,9 @@ def test_generate_module_failure_persists_independent_statuses(tmp_path, monkeyp
         module = "B" if '"module": "B"' in user_text else "A"
         if module == "B":
             raise RuntimeError("simulated module failure")
-        case = {"id": "TC-A-001", "module": "A", "title": "查询", "priority": "P1",
+        case = {"id": "TC-A-001", "module": "A", "title": "查询", "design_method": "场景法", "priority": "P1",
                 "tags": ["@regression"], "requirement": ["REQ-A-001"],
-                "steps": [{"action": "goto", "target": "/"}], "expected": ["ok"]}
+                "steps": [{"action": "goto", "target": "/"}], "expected": ["页面成功渲染并显示预期内容"]}
         return LLMResult(json.dumps([case]), "fake")
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only")

@@ -9,7 +9,10 @@ from prd2tc.validator import validate_dir
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = REPO_ROOT / "examples"
-SAMPLE_PRD = REPO_ROOT.parent / "PRD_File" / "youxuan-mall" / "PRD-优选商城-v0.3.md"
+# 端到端 fixture 用仓库内自带的 PRD（旧版指向仓库外 PRD_File/，导致新克隆者必失败）
+SAMPLE_PRD = REPO_ROOT / "examples" / "sample-prd.md"
+PRODUCT = "examples"
+VERSION = "v0.1"
 
 
 def test_load_examples():
@@ -57,7 +60,7 @@ def test_generate_with_examples_end_to_end(tmp_path):
         "--out", str(tmp_path),
     ])
     assert code == 0
-    out = tmp_path / "youxuan-mall" / "v0.3"
+    out = tmp_path / PRODUCT / VERSION
     assert (out / "cases" / "用例集.md").is_file()
     total, errors = validate_dir(out / "cases" / "cases")
     assert errors == []

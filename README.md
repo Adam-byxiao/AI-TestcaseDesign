@@ -58,10 +58,26 @@ prd2tc stats    --dir output/sample-mall/v0.1/cases/cases
 | `PRD2TC_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | - | Provider 凭证；Ollama 不需要 |
 | `PRD2TC_API_BASE` | Provider 默认地址 | 可覆盖 OpenAI、Anthropic 或 Ollama 地址 |
 | `PRD2TC_MODEL` | 随 Provider 选择 | 模型名 |
-| `PRD2TC_MAX_TOKENS` | `4096` | Anthropic 最大输出 token |
+| `PRD2TC_MAX_TOKENS` | `16384` | 单次输出上限。**只是上限，按实际输出计费，调高不增加固定成本**；实测用例约 1700 tok/需求，个别模块 3 条需求即超过 8192。不得超过 Provider 的模型输出上限（Anthropic 尤甚） |
+| `PRD2TC_TOKENS_PER_REQ` | `1800` | 批次容量估算：每条需求预期输出 token（实测校准值） |
+| `PRD2TC_CASE_BATCH_CAP` | `8` | 单批需求数上限，防止批次随预算膨胀 |
+| `PRD2TC_CASE_OUTPUT_BUDGET` | `0.60` | 单批允许占用 `max_tokens` 的比例。**调高它会让 `PRD2TC_MAX_TOKENS` 失效**：批次会同比例变大，安全余量恒为 `1/该值`，截断率不变 |
 | `PRD2TC_TEMPERATURE` | `0.4` | 采样温度 |
 | `PRD2TC_TIMEOUT` | `120` | 请求超时（秒） |
 | `PRD2TC_MAX_RETRIES` | `3` | 失败重试次数（指数退避） |
+| `PRD2TC_STREAM` | `1` | 流式输出（实时进度/Token）；`0` 关闭。`--repro` 时强制关闭 |
+| `PRD2TC_STREAM_PUSH_MS` | `500` | 实时指标推送间隔（毫秒），限流用 |
+| `PRD2TC_JOBS` | `1` | 默认并发批次数（阶段1分段 / 阶段3模块并行）。工作台默认 4；实测串行 5 模块约 1013s，并发约 332s |
+| `PRD2TC_MARKDOWN_TRANSIT` | `0` | 阶段3 改输出 Markdown 表格再由程序转 JSON（`--markdown-transit`）。规避免嵌套转义导致的整轮失败，字符约省 50% |
+
+> **配置自检**：CLI 用 `prd2tc check-llm`；工作台在「模型配置」保存前会真实探测一次端点，
+> 不通过则拒绝保存并给出具体原因（区分「接口地址填错」与「密钥填错」）与可用的修正地址，
+> 避免错误配置到运行阶段才以无信息量的形式暴露（例如把官网地址当成 API 地址，只会得到一句 HTTP 404）。
+>
+> **实时进度**：默认开启流式。运行期间可在工作台看到当前阶段/模块/批次、实时 Token（估算值标 `≈`）、
+> 首 Token 延迟与**静默时长**（判断「是否卡住」的直接证据），并可随时取消（流式会立即停止接收，不再计费）。
+> 流式实时推送依赖 WebSocket，故 `pip install '.[service]'` 会一并安装 `websockets`；
+> 缺少它时 uvicorn 无法完成 WebSocket 升级，实时推送会静默退化为 10 秒轮询。
 
 Provider 示例：
 
@@ -96,6 +112,32 @@ prd2tc diff --prd PRD-v0.4.md --from output/product/v0.3 --out output
 ```
 
 Python 调用方可使用 `prd2tc.pipeline.PipelineRunner`，执行结果契约见 `prd2tc.execution`。
+
+### 产物导出（Excel / XMind）
+
+`generate` 成功后会**自动**在 `cases/` 下产出两种可分发格式，无需额外操作：
+
+```bash
+# 自动：generate 结束即产出 <product>-<version>-用例集.xlsx / .xmind
+prd2tc generate --prd examples/sample-prd.md --product mall --version v0.3 --stub
+
+# 手动导出（对已有产物，可指定格式与展开粒度）
+prd2tc export --cases output/mall/v0.3/cases/cases                     # 两种格式
+prd2tc export --cases output/mall/v0.3/cases/cases --format excel
+prd2tc export --cases output/mall/v0.3/cases/cases --format xmind --xmind-mode full
+```
+
+| 导出 | 内容 |
+| --- | --- |
+| **`.xlsx`** | 3 个 sheet：`用例明细`（13 列，P0/P1 条件着色、冻结表头、自动筛选）、`需求覆盖`（REQ↔TC 映射，覆盖不足/未覆盖标红）、`统计概览` |
+| **`.xmind`** | 模块 → 子模块 → 用例 三级导图；优先级渲染为图标，标签与设计方法为文本标签，完整用例详情在节点备注中 |
+
+两种格式都**用标准库直接生成**（ZIP + XML/JSON 子集），未引入 openpyxl 等依赖，保持「零第三方运行时依赖」；产物已用 openpyxl 交叉验证可被严格解析器读取。ZIP 时间戳与节点 id 均确定性生成，因此**同输入产出字节一致**，可参与 `compare-runs` 对拍。
+
+导出失败**不会**阻断生成流程，只降级为告警（产物其余部分照常落盘）。
+服务模式下工作台「运行详情」提供导出按钮，接口为 `GET /api/v1/exports/{run_id}/{excel|xmind}`。
+
+> 设计细节、字段映射与实现取舍见 [docs/export-excel-xmind.md](docs/export-excel-xmind.md)。
 
 长文档会按 Markdown 标题/段落切分，阶段 1 分段抽取后统一合并，阶段 3 按需求模块并发生成。可用 `--jobs 4` 控制并发；中断后用 `--resume` 复用输入、Prompt、模型和参数指纹一致的模块检查点，`--force` 明确放弃旧检查点。
 
@@ -224,6 +266,23 @@ prd2tc generate --prd <prd> --no-gate             # 退回纯 prompt 自检
 - `prd2tc validate`：用例 JSON 强校验（与 `docs/case-template.md` 一致）。
 - `tests/`：14 个单元/端到端测试（含 stub 模式离线跑通全流程）。
 - 与配套的 Playwright 测试工程对齐：`check_coverage.py`（AiWebTestCenter/02-Playwright-Automation）校验用例 JSON ↔ Python 测试映射（P0 必达）。
+
+### 输出健壮性（针对推理型模型）
+
+实测 MiniMax-M3 在这套流程上有三个坑，均已针对性处理（`PRD2TC_*` 可调）：
+
+1. **`testData` 禁止嵌套**。契约收紧为「键=值」字符串数组（`["phone=13800138000"]`），
+   值只能是标量。嵌套对象/数组需要多层引号转义，实测导致模型在思考里反复自我纠错、
+   整轮输出归零。旧版 object 产物**仍可读取**（自动归一化）。
+2. **思考与产出分离**。M3 会把推理写进 `content` 的 `<think>`（部分端点走独立
+   `reasoning_content`），两者都会被单独统计：实时指标区分「思考中 / 产出中」，
+   `extract_cases` 优先从**剥离思考后的正文**提取，避免把思考里的示例 JSON 当产物。
+3. **预算耗尽自愈**。若输出被截断且正文为空、思考占满预算，系统会给出可行动诊断，
+   并把该批次**对半拆分重试**（最多 2 层）——原地重试同样大的批次几乎必然再次失败。
+
+`--markdown-transit`（或 `PRD2TC_MARKDOWN_TRANSIT=1`）可让阶段 3 改为输出 Markdown 表格、
+再由程序转成 JSON：表格没有引号嵌套，转义类失败从根上消失；实测同一内容字符数约省 50%，
+**落盘产物仍是 JSON，下游契约不变**。
 
 ## 开源
 

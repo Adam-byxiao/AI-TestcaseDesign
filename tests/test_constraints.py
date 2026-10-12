@@ -6,7 +6,6 @@ from prd2tc.config import Config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = REPO_ROOT / "examples"
-SAMPLE_PRD = REPO_ROOT.parent / "PRD_File" / "youxuan-mall" / "PRD-优选商城-v0.3.md"
 
 
 def test_seed_examples_valid_json():

@@ -8,11 +8,11 @@ from prd2tc.reproduce import compare_fingerprints, compare_runs, run_fingerprint
 
 def _req(module, idx, title):
     return {"id": f"REQ-{module}-{idx:03d}", "module": module, "title": title, "description": title,
-            "acceptanceCriteria": [], "exceptionFlows": [], "priority": "P1"}
+            "acceptanceCriteria": [], "exceptionFlows": [], "design_method": "场景法", "priority": "P1"}
 
 
 def _case(cid, module, req, title):
-    return {"id": cid, "module": module, "title": title, "priority": "P1",
+    return {"id": cid, "module": module, "title": title, "design_method": "场景法", "priority": "P1",
             "tags": ["@regression"], "requirement": [req],
             "steps": [{"action": "goto", "target": "/"}], "expected": [title]}
 

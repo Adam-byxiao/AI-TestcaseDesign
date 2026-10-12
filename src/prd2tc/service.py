@@ -9,12 +9,17 @@ from prd2tc import __version__, stages
 from prd2tc.config import Config
 from prd2tc.io import (atomic_write_text, now_iso, save_cases, save_requirements,
                        save_traceability, write_stage, render_cases_md)
+from prd2tc.llm import LLMCancelled, probe_provider
 from prd2tc.pipeline import GenerateRequest, PipelineRunner
 from prd2tc.traceability import build_traceability, validate_traceability
-from prd2tc.validator import validate_case
+from prd2tc.validator import format_exception, validate_case
 
 ALLOWED_PRD = {".md", ".markdown", ".txt"}
 STAGES = ("analysis", "plan", "cases")
+# 这些产物是二进制，不能用 read_text 读取
+BINARY_ARTIFACT_SUFFIXES = {".xlsx", ".xmind", ".zip", ".png", ".pdf"}
+# mimetypes 不认识 .xmind，注册后 artifact 接口才能给出正确 Content-Type
+mimetypes.add_type("application/vnd.xmind.workbook", ".xmind")
 
 class TaskStore:
     """旧 `/runs` API 的兼容状态存储。"""
@@ -37,6 +42,8 @@ class WorkspaceStore:
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve(); self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock(); self.sessions: dict[str, tuple[float, dict]] = {}
+        self.live: dict[str, Any] = {}       # taskId -> LiveMetrics（内存态实时指标）
+        self.runners: dict[str, Any] = {}    # taskId -> PipelineRunner（用于取消止损）
         self.tasks = self.root / "tasks"; self.prds = self.root / "prds"; self.events = self.root / "events"
         for d in (self.tasks, self.prds, self.events): d.mkdir(exist_ok=True)
         for path in self.tasks.glob("*.json"):
@@ -51,7 +58,10 @@ class WorkspaceStore:
         if path != self.root and self.root not in path.parents: raise ValueError("路径超出工作区")
         return path
     def _json(self, path: Path, default=None):
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else (default if default is not None else {})
+        # 读取同样要加锁：心跳/进度线程在写 task.json 与事件文件时，
+        # 无锁读会在 Windows 上撞上 os.replace 而抛 PermissionError
+        with self._lock:
+            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else (default if default is not None else {})
     def save_json(self, path: Path, data: dict):
         atomic_write_text(self._safe(path), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     def save_task(self, task_id: str, **values):
@@ -69,8 +79,9 @@ class WorkspaceStore:
         self.save_task(run_id, lastEventId=event["eventId"]); return event
     def event_list(self, run_id):
         path = self.events / f"{run_id}.jsonl"
-        if not path.exists(): return []
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        with self._lock:
+            if not path.exists(): return []
+            return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     def put_session(self, values: dict, ttl: int = 3600):
         sid = secrets.token_urlsafe(24); self.sessions[sid] = (time.time() + ttl, dict(values)); return sid
     def get_session(self, sid: str):
@@ -119,19 +130,25 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         version = _safe_component(body.get("version") or meta.get("version"), "v0.1")
         return GenerateRequest(
             prd=root / meta["path"], out=root / "outputs" / task_id, product=product,
-            version=version, stub=bool(body.get("stub", False)), jobs=int(body.get("jobs", 1)),
+            version=version, stub=bool(body.get("stub", False)),
+            jobs=max(1, int(body.get("jobs") or base_config.jobs or 1)),
             profile=body.get("profile", "generic"), stage=stage,
             max_gate_retries=int(body.get("maxGateRetries", 2)),
             allow_gate_fail=bool(body.get("allowGateFail", False)), no_gate=bool(body.get("noGate", False)))
 
-    def stage_name(value: str): return {"1": "analysis", "2": "plan", "3": "cases", "all": "done"}[value]
+    def stage_name(value: str): return {"1": "analysis", "2": "plan", "3": "cases", "all": "done"}.get(value, "unknown")
     def request_dict(req: GenerateRequest):
         return {"prd": str(req.prd), "out": str(req.out), "product": req.product, "version": req.version,
                 "stub": req.stub, "jobs": req.jobs, "profile": req.profile,
                 "max_gate_retries": req.max_gate_retries, "allow_gate_fail": req.allow_gate_fail,
                 "no_gate": req.no_gate}
+    def require_stage(value: object) -> str:
+        if value not in {"1", "2", "3", "all"}:
+            raise HTTPException(400, f"stage 必须为 1/2/3/all，收到 {value!r}")
+        return str(value)
+
     def request_from(data: dict, stage: str, resume=True):
-        return GenerateRequest(**data, stage=stage, resume=resume)
+        return GenerateRequest(**data, stage=require_stage(stage), resume=resume)
 
     def run_task(task_id: str, req: GenerateRequest, session_id: str | None = None, review_mode: bool = True):
         session = store.get_session(session_id) if session_id else None
@@ -142,10 +159,48 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
             current = stage_name(req.stage); task = store.task(task_id) or {}; stage_states = dict(task.get("stageStates", {})); stage_states[current] = "running"
             store.save_task(task_id, status="running", currentStage=current, failedStage=None, stageStates=stage_states)
             store.event(task_id, stage=current, type="run_started", status="running", percent=task.get("percent", 0), message=f"开始 {current}")
+            runner = PipelineRunner(runner_config)
+            store.runners[task_id] = runner; store.live[task_id] = runner.live
+            heartbeat = threading.Event()
+
             def progress(stage, percent):
+                # 已取消时不得把状态改回 running（否则取消会被覆盖、运行继续烧 token）
+                if (store.task(task_id) or {}).get("status") == "cancelled":
+                    runner.cancel(); return
                 store.save_task(task_id, status="running", currentStage=stage, percent=percent)
-                store.event(task_id, stage=stage, type="stage_progress", status="running", percent=percent, message=f"{stage} 进度 {percent}%")
-            result = PipelineRunner(runner_config).generate(req, progress_callback=progress)
+                store.event(task_id, stage=stage, type="stage_progress", status="running",
+                            percent=percent, message=f"{stage} 进度 {percent}%")
+
+            def on_event(payload: dict):
+                """P0/P1 结构化事件：模块/批次/阶段开始，走独立通道，不污染阶段进度语义。"""
+                fields = dict(payload or {})
+                kind = str(fields.pop("type", "stage_progress"))
+                module = fields.pop("module", None)
+                fields.pop("percent", None)
+                detail = " · ".join(f"{k}={v}" for k, v in fields.items() if k in {"batch", "state", "tokens"})
+                store.event(task_id, stage=str(fields.get("stage") or current), type=kind,
+                            status="running", percent=(store.task(task_id) or {}).get("percent", 0),
+                            module=module, message=f"{module or current} {kind}{(' · ' + detail) if detail else ''}")
+
+            def beat():
+                """心跳：长耗时期间也持续发事件，避免 UI 静默误判为卡死。"""
+                while not heartbeat.wait(5.0):
+                    snapshot = runner.live.snapshot(force=True) or {}
+                    store.event(task_id, stage=str(snapshot.get("stage") or current), type="heartbeat",
+                                status="running", percent=(store.task(task_id) or {}).get("percent", 0),
+                                message=f"静默 {int((snapshot.get('silentMs') or 0) / 1000)}s · "
+                                        f"已用 {int((snapshot.get('elapsedMs') or 0) / 1000)}s")
+                    if (store.task(task_id) or {}).get("status") in {"succeeded", "failed", "cancelled", "awaiting_review"}:
+                        return
+
+            beat_thread = threading.Thread(target=beat, name=f"heartbeat-{task_id[:8]}", daemon=True)
+            beat_thread.start()
+            try:
+                result = runner.generate(req, progress_callback=progress, event_callback=on_event)
+            finally:
+                heartbeat.set()
+                runner.live.final_snapshot()
+                store.runners.pop(task_id, None)
             pipeline_state = store._json(result.root / "run-state.json", {})
             modules = pipeline_state.get("modules", {})
             manifest = store._json(result.root / "run-manifest.json", {})
@@ -172,10 +227,17 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
                     review.setdefault(sub, {"status": "auto", "approvedBy": "one-click", "approvedAt": now_iso()})
             store.save_task(task_id, status=status_value, currentStage=current if status_value == "awaiting_review" else "done", percent={"analysis":33,"plan":66,"cases":100,"done":100}[current], runId=result.run_id, output=str(result.root), errors=result.errors, stageStates=stage_states, review=review, modules=modules, qualityGate=gates, tokens=tokens)
             store.event(task_id, stage=current, type="stage_ready" if status_value == "awaiting_review" else "run_finished", status=status_value, percent={"analysis":33,"plan":66,"cases":100,"done":100}[current], message="等待用户审阅" if status_value == "awaiting_review" else "运行完成")
+        except LLMCancelled:
+            # 用户取消不是失败：落 cancelled，并保留已产出的部分进度
+            store.save_task(task_id, status="cancelled", currentStage="cancelled",
+                            stageStates=dict((store.task(task_id) or {}).get("stageStates", {})))
+            store.event(task_id, type="run_cancelled", status="cancelled", percent=0, message="任务已取消（流式响应已停止）")
         except Exception as exc:
             failed = stage_name(req.stage); stage_states = dict((store.task(task_id) or {}).get("stageStates", {})); stage_states[failed] = "failed"
-            safe_error = store.redact(f"{type(exc).__name__}: {exc}")
-            store.save_task(task_id, status="failed", currentStage=failed, failedStage=failed, stageStates=stage_states, error=safe_error)
+            safe_error = store.redact(format_exception(exc))
+            errors = [store.redact(str(e)) for e in (getattr(exc, "errors", None) or [safe_error])]
+            store.save_task(task_id, status="failed", currentStage=failed, failedStage=failed,
+                            stageStates=stage_states, error=safe_error, errors=errors)
             store.event(task_id, stage=failed, type="run_failed", status="failed", percent=0, message=f"{failed} 失败")
 
     @app.post("/api/v1/prds")
@@ -223,8 +285,33 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         if provider not in {"openai", "anthropic", "ollama"}: raise HTTPException(400, "Provider 不支持")
         defaults = Config.from_env(provider)
         model = body.get("model") or defaults.model; api_base = (body.get("apiBase") or defaults.api_base).rstrip("/")
-        sid = store.put_session({"provider": provider, "model": model, "apiBase": api_base, "apiKey": body.get("apiKey", ""), "temperature": body.get("temperature", defaults.temperature), "timeout": body.get("timeout", defaults.timeout)})
-        return {"sessionId": sid, "provider": provider, "model": model, "apiBase": _safe_address(api_base), "expiresIn": 3600}
+        candidate = replace(defaults, provider=provider, model=model, api_base=api_base,
+                            api_key=str(body.get("apiKey", "") or ""),
+                            temperature=float(body.get("temperature", defaults.temperature) or defaults.temperature),
+                            timeout=int(body.get("timeout", defaults.timeout) or defaults.timeout))
+        probe = probe_provider(candidate)
+        if not probe.ok:
+            # 保存前拒绝带病配置：否则错误要到运行阶段才以无信息量的形式暴露
+            raise HTTPException(400, detail={"notice": "LLM 配置检测未通过，已拒绝保存",
+                                             **probe.to_dict()})
+        sid = store.put_session({"provider": provider, "model": probe.model or model, "apiBase": api_base,
+                                 "apiKey": body.get("apiKey", ""), "temperature": candidate.temperature,
+                                 "timeout": candidate.timeout})
+        return {"sessionId": sid, "provider": provider, "model": probe.model or model,
+                "apiBase": _safe_address(api_base), "expiresIn": 3600, "probe": probe.to_dict()}
+
+    @app.post("/api/v1/sessions/llm-config/verify")
+    def verify_llm_config(body: dict):
+        """只探测不保存：供 UI「检测连接」按钮复用，不写入任何会话状态。"""
+        provider = str(body.get("provider", "openai")).lower()
+        if provider not in {"openai", "anthropic", "ollama"}: raise HTTPException(400, "Provider 不支持")
+        defaults = Config.from_env(provider)
+        candidate = replace(defaults, provider=provider,
+                            model=body.get("model") or defaults.model,
+                            api_base=(body.get("apiBase") or defaults.api_base).rstrip("/"),
+                            api_key=str(body.get("apiKey", "") or ""),
+                            timeout=int(body.get("timeout", defaults.timeout) or defaults.timeout))
+        return probe_provider(candidate).to_dict()
 
     @app.post("/api/v1/runs", status_code=202)
     def create_run(body: dict):
@@ -246,6 +333,10 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         require_id(run_id, "runId")
         data = store.task(run_id)
         if not data: raise HTTPException(404, "运行不存在")
+        live = store.live.get(run_id)
+        if live is not None:
+            snapshot = live.snapshot(force=True)
+            if snapshot is not None: data["metrics"] = {**snapshot, "runId": run_id}
         data["events"] = store.event_list(run_id)[-100:]; return data
     @app.get("/api/v1/runs/{run_id}/events")
     def get_events(run_id: str): return store.event_list(run_id)
@@ -321,7 +412,12 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         if modules.get(module) != "failed": raise HTTPException(409, "仅失败模块可重试")
         req=request_from(task["request"],"3",True); store.save_task(run_id,status="pending",currentStage="cases",retryModule=module); executor.submit(run_task,run_id,req,task.get("sessionId"),True); return store.task(run_id)
     @app.post("/api/v1/runs/{run_id}/cancel")
-    def cancel_run(run_id: str): return store.save_task(run_id, status="cancelled", currentStage="cancelled")
+    def cancel_run(run_id: str):
+        # 真正止损：置取消标志，流式回调命中后立即停止接收响应
+        runner = store.runners.get(run_id)
+        if runner is not None: runner.cancel()
+        store.event(run_id, type="run_cancelled", status="cancelled", percent=0, message="已请求取消")
+        return store.save_task(run_id, status="cancelled", currentStage="cancelled")
     @app.post("/api/v1/runs/{run_id}/resume")
     def resume_run(run_id: str):
         task = store.task(run_id)
@@ -344,18 +440,61 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         task = store.task(run_id); output = Path(task.get("output", "")).resolve() if task else Path()
         target = (output / artifact_path).resolve()
         if not task or output not in target.parents or not target.is_file(): raise HTTPException(404, "产物不存在")
-        if target.suffix in {".json"}: return JSONResponse(json.loads(target.read_text(encoding="utf-8")))
+        if target.suffix == ".json": return JSONResponse(json.loads(target.read_text(encoding="utf-8")))
+        # 二进制产物（.xlsx / .xmind 等）不能用 read_text 读取，否则抛 UnicodeDecodeError；
+        # 按扩展名区分，二进制走 FileResponse 以便浏览器直接下载/打开。
+        if target.suffix.lower() in BINARY_ARTIFACT_SUFFIXES:
+            return FileResponse(target, media_type=mimetypes.guess_type(target.name)[0]
+                                or "application/octet-stream", filename=target.name)
         return PlainTextResponse(target.read_text(encoding="utf-8"))
+
+    @app.get("/api/v1/exports/{run_id}/{fmt}")
+    def download_export(run_id: str, fmt: str):
+        """按需生成并返回导出文件（fmt: excel | xmind）。
+
+        输出目录固定在运行产物内，不接受外部路径参数，因此无需 _safe 校验（无穿越面）。
+        """
+        if fmt not in {"excel", "xmind"}: raise HTTPException(400, f"不支持的格式: {fmt}")
+        require_id(run_id, "runId")
+        task = store.task(run_id)
+        if not task: raise HTTPException(404, "运行不存在")
+        output = Path(task.get("output") or "").resolve()
+        cases_dir = output / "cases" / "cases"
+        if not cases_dir.is_dir(): raise HTTPException(404, "该运行尚无用例产物")
+        from prd2tc.export import export_cases, MEDIA_TYPES
+        try:
+            result = export_cases(cases_dir=cases_dir, formats=[fmt], out=None, root=output)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(400, format_exception(exc)) from exc
+        path = Path(result["files"][0])
+        return FileResponse(path, media_type=MEDIA_TYPES[fmt], filename=path.name)
     @app.websocket("/api/v1/runs/{run_id}/events")
     @app.websocket("/api/v1/runs/{run_id}/events/ws")
     async def events_ws(websocket: WebSocket, run_id: str):
         import asyncio
+        # ?metrics=1 才推送 run_metrics：旧客户端/旧测试不会收到未知消息类型
+        wants_metrics = str(websocket.query_params.get("metrics", "")).lower() in {"1", "true", "yes"}
         await websocket.accept(); sent = 0
+        metrics_pushed = False
         while True:
             events = store.event_list(run_id)
             for event in events[sent:]: await websocket.send_json(event)
-            sent = len(events); task = store.task(run_id)
-            if task and task.get("status") in {"succeeded", "failed", "cancelled"}: await websocket.close(); return
+            sent = len(events)
+            task = store.task(run_id)
+            terminal = bool(task and task.get("status") in {"succeeded", "failed", "cancelled"})
+            if wants_metrics:
+                live = store.live.get(run_id)
+                if live is not None:
+                    # 终态时必须 force：否则限流窗口内返回 None，UI 拿不到收尾快照
+                    snapshot = live.snapshot(force=terminal or not metrics_pushed)
+                    if snapshot is not None:
+                        snapshot["runId"] = run_id
+                        await websocket.send_json(snapshot)
+                        metrics_pushed = True
+            # 关键：终态也必须先把指标推出去再关闭，否则短运行（连接建立前已结束）
+            # 会让客户端一帧都收不到，实时面板永远空着。
+            if terminal and (not wants_metrics or metrics_pushed):
+                await websocket.close(); return
             await asyncio.sleep(.5)
     @app.on_event("shutdown")
     def shutdown(): executor.shutdown(wait=False, cancel_futures=True)
@@ -364,7 +503,7 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
     def legacy_create_run(body: dict):
         prd = Path(str(body.get("prd", "")))
         if not prd.is_file(): raise HTTPException(400, "prd 必须指向可读取文件")
-        task_id = str(uuid.uuid4()); req = GenerateRequest(prd=prd, out=body.get("out", "output"), product=body.get("product"), version=body.get("version"), stub=bool(body.get("stub", False)), jobs=int(body.get("jobs", 1)), stage=body.get("stage", "all"))
+        task_id = str(uuid.uuid4()); req = GenerateRequest(prd=prd, out=body.get("out", "output"), product=body.get("product"), version=body.get("version"), stub=bool(body.get("stub", False)), jobs=max(1, int(body.get("jobs") or base_config.jobs or 1)), stage=require_stage(body.get("stage", "all")))
         store.save_task(task_id, status="pending", currentStage="queued", percent=0, request=request_dict(req), stageStates={}); executor.submit(run_task, task_id, req, None, False); return store.task(task_id)
     @app.get("/runs/{run_id}")
     def legacy_get_run(run_id: str):

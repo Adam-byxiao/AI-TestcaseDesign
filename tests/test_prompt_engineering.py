@@ -52,11 +52,15 @@ def test_feedback_placed_last():
 
 
 def test_stage_roles_and_temperature():
-    """原则 5/8：分阶段角色与温度（事实抽取低温度）。"""
+    """原则 5/8：分阶段角色与温度（事实抽取低温度）。
+
+    阶段 3 自 v0.6.0 起由 0.5 降为 0.3：它是全链路最需要确定性的环节
+    （结构化 JSON + 字段强校验 + 程序化重编号），不应是温度最高的一环。
+    """
     for stage, role_kw, expected_temp in [
         (1, "测试架构师", 0.2),
         (2, "测试经理", 0.3),
-        (3, "测试设计专家", 0.5),
+        (3, "测试设计专家", 0.3),
     ]:
         fake = _CaptureLLM()
         if stage == 1:

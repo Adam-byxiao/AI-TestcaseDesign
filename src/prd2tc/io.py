@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,10 +34,22 @@ def atomic_write_text(path: Path, content: str) -> Path:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(temp_name, path)
+        # Windows 上 os.replace 会因目标文件正被其他线程读取而抛 PermissionError
+        # （实时心跳与状态轮询会并发读写同一文件）。短暂重试即可让读者让出，避免偶发失败。
+        for attempt in range(5):
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     finally:
         if os.path.exists(temp_name):
-            os.unlink(temp_name)
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
     return path
 
 

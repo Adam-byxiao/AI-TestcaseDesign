@@ -9,7 +9,9 @@ class Response:
     def read(self): return json.dumps(self.payload).encode()
 
 def config(provider, base, key="key"):
-    return Config(key, base, "model", .2, 10, 1, provider=provider)
+    # 本文件校验「非流式」请求/响应形状（stream=False 即 --repro 走的路径）；
+    # 流式协议见 tests/test_llm_stream.py。
+    return Config(key, base, "model", .2, 10, 1, provider=provider, stream=False)
 
 def test_openai_adapter_request_and_response(monkeypatch):
     captured = {}
@@ -31,7 +33,7 @@ def test_anthropic_adapter_request_and_response(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", open_url)
     result = AnthropicClient(config("anthropic", "https://api.anthropic.com")).chat("hello", system="system")
     assert captured["url"] == "https://api.anthropic.com/v1/messages"
-    assert captured["body"]["system"] == "system" and captured["body"]["max_tokens"] == 8192
+    assert captured["body"]["system"] == "system" and captured["body"]["max_tokens"] == 16384
     assert any(k.lower() == "x-api-key" and v == "key" for k, v in captured["headers"].items())
     assert (result.content, result.total_tokens) == ("part1part2", 10)
 
