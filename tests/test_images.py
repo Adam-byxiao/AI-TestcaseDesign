@@ -42,11 +42,17 @@ PRD = """# 某后台改造 PRD
 
 
 def _write_images(dirpath, names):
+    """写出图片文件。
+
+    每个文件的**字节内容不同**（把文件名附加在 PNG 魔数之后）：
+    `ingest` 会按内容哈希去重，若三张图字节相同只会有 1 张成为资产 ——
+    那是正确行为，但会让「关联 3 条引用」的断言失去意义。
+    """
     dirpath.mkdir(parents=True, exist_ok=True)
     out = []
     for n in names:
         p = dirpath / n
-        p.write_bytes(PNG)
+        p.write_bytes(PNG + n.encode("utf-8"))
         out.append(p)
     return out
 
@@ -525,36 +531,45 @@ def test_stage_3_system_includes_image_context():
 
 
 def test_pipeline_loads_images_and_writes_spec(tmp_path):
+    """流水线从 bundle.assets 取图（不再依赖 --images-dir 扫盘）。"""
+    from prd2tc import loader
     from prd2tc.pipeline import PipelineRunner
+
     prd = tmp_path / "prd.md"
     prd.write_text(PRD, encoding="utf-8")
     d = tmp_path / "assets"
     _write_images(d, ["智能体配置整体.jpeg", "添加文档知识弹窗.png", "rag接口清单.jpeg"])
+    bundle = loader.load_bundle([prd, d])
 
     class Req:
-        image_dirs = [str(d)]
         fetch_images = False
         stub = True
     runner = PipelineRunner(Config("k", "https://x", "m", 0.4, 10, 1))
-    spec = runner._load_images(PRD, prd, request=Req(), root=tmp_path / "out",
-                              llm=None, reporter=None)
+    out = tmp_path / "out"
+    out.mkdir()
+    spec = runner._load_images(bundle, out, request=Req(), llm=None, reporter=None)
     assert spec is not None and len(spec.refs) == 3
-    saved = json.loads((tmp_path / "out" / "analysis" / "image-spec.json").read_text(encoding="utf-8"))
+    # 三条引用都应按文件名/图注关联到资产（match=alt/filename，均来自内存资产）
+    assert all(r.resolved for r in spec.refs), [r.resolved for r in spec.refs]
+    assert all(r.match in {"alt", "filename"} for r in spec.refs), [r.match for r in spec.refs]
+    saved = json.loads((out / "analysis" / "image-spec.json").read_text(encoding="utf-8"))
     assert saved["summary"]["resolvedCount"] == 3
     assert saved["summary"]["analyzedCount"] == 0
 
 
 def test_pipeline_image_failure_is_non_fatal(tmp_path):
+    """bundle 里没有图片时直接返回 None，不得报错。"""
+    from prd2tc import loader
     from prd2tc.pipeline import PipelineRunner
 
+    prd = tmp_path / "prd.md"
+    prd.write_text("# 无图\n", encoding="utf-8")
+    bundle = loader.load_bundle([prd])
+
     class Req:
-        image_dirs = ["/no/such/dir"]
         fetch_images = False
         stub = True
     runner = PipelineRunner(Config("k", "https://x", "m", 0.4, 10, 1))
-    prd = tmp_path / "prd.md"
-    prd.write_text(PRD, encoding="utf-8")
-    spec = runner._load_images(PRD, prd, request=Req(), root=tmp_path / "out",
-                              llm=None, reporter=None)
-    assert spec is not None and len(spec.refs) == 3      # 仍产出清单
-    assert len(spec.warnings) == 3                        # 但明确告警未识别
+    out = tmp_path / "out"
+    out.mkdir()
+    assert runner._load_images(bundle, out, request=Req(), llm=None, reporter=None) is None

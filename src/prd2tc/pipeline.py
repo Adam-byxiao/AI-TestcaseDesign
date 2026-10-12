@@ -15,6 +15,7 @@ from prd2tc.llm import LLMResult
 from prd2tc.metrics import CancelFlag, LiveMetrics
 from prd2tc import metrics
 from prd2tc import images
+from prd2tc import ingest
 from prd2tc import prototype
 from prd2tc.profiles import get_profile
 from prd2tc.schema import normalize_cases
@@ -23,7 +24,10 @@ from prd2tc.validator import ValidationError, format_exception
 
 @dataclass
 class GenerateRequest:
-    prd: str | Path
+    # prd 可为：单个文件 / 目录 / 路径列表 / (name, bytes) 列表（多格式多文件）
+    prd: str | Path | list | None = None
+    # 已摄取的 Bundle（服务层上传后直接传入，避免重新读盘）
+    bundle: object | None = None
     out: str | Path = "output"
     product: str | None = None
     version: str | None = None
@@ -63,6 +67,30 @@ def extract_version(text: str, path: Path) -> str:
     if m: return m.group(1)
     m = re.search(r"PRD-[^-]+-(v[\d.]+)\.md$", path.name)
     return m.group(1) if m else "v0.1"
+
+def _prd_path(request, bundle) -> Path:
+    """推断用于「产品名 / 版本号 / manifest」的 PRD 路径。
+
+    多文件或纯上传场景可能没有真实磁盘路径，此时退回主文件来源名，
+    仅用于命名与留痕（不参与内容读取）。
+    """
+    prd = getattr(request, "prd", None)
+    if isinstance(prd, (str, Path)):
+        return Path(prd)
+    if isinstance(prd, (list, tuple)) and prd:
+        first = prd[0]
+        if isinstance(first, (str, Path)):
+            return Path(first)
+    if bundle is not None:
+        for src in bundle.sources:
+            if src.role == "primary" and src.origin:
+                cand = Path(src.origin)
+                if cand.exists():
+                    return cand
+        if bundle.primary:
+            return Path(bundle.primary)
+    return Path("prd")
+
 
 class PipelineRunner:
     def __init__(self, config: Config, *, llm=None):
@@ -108,22 +136,23 @@ class PipelineRunner:
             warnings.warn(f"UI 契约留痕失败（不影响生成）: {exc}")
         return merged, metas
 
-    def _load_images(self, prd_text: str, prd_path: Path, *, request, root: Path,
-                     llm, reporter=None):
-        """发现并分析 PRD 图片，落盘留痕；失败只告警不中断。
+    def _load_images(self, bundle, root: Path, *, request, llm, reporter=None):
+        """从摄取结果构建图片证据，落盘留痕；失败只告警不中断。
 
         为什么必要：PRD 的**关键 UI 事实常只在图里**（线框图、字段布局、弹窗按钮、
         状态枚举、以及用红框标注的「本次改动点」）。实测真实 PRD 含 8 处图片引用，
         此前全部未参与生成 —— 这正是模型臆造交互（如三选项弹窗）的直接原因。
 
-        注意：图片结论标记为「图片推断」，与 PRD 明文区分（渲染时会显式声明）。
+        图片来自 `bundle.assets`（上传 / 压缩包 / DOCX 内嵌 / 目录），
+        因此不再需要「先把图落到某个目录、再用 --images-dir 指过去」的绕道。
         """
-        extra = [Path(p) for p in (getattr(request, "image_dirs", None) or [])]
+        images_in = bundle.images() if bundle is not None else []
+        if not images_in:
+            return None
         try:
-            spec = images.prepare(
-                prd_text, prd_path,
+            spec = images.prepare_from_assets(
+                images_in, text=bundle.text,
                 allow_remote=bool(getattr(request, "fetch_images", False)),
-                extra_dirs=extra or None,
                 cfg=self.config, vision_llm=llm,
                 cache_dir=root / "analysis" / ".image-cache",
                 reporter=reporter,
@@ -154,24 +183,47 @@ class PipelineRunner:
         if request.jobs < 1: raise ValueError("jobs 必须大于等于 1")
         profile = get_profile(request.profile)
         min_cases = request.min_cases_per_requirement or profile["minCasesPerRequirement"]
-        text = loader.load_prd(request.prd); path = Path(request.prd)
+        # PRD 摄取：统一走 ingest（支持 md/txt/docx/pdf/zip/图片/多文件）。
+        # 服务层上传后可直接传 bundle，避免重复读盘与重复解析。
+        bundle = request.bundle if request.bundle is not None else loader.load_bundle(
+            request.prd, extra_dirs=getattr(request, "image_dirs", None))
+        text = bundle.text
+        path = _prd_path(request, bundle)
+        if not text.strip() and not bundle.images():
+            raise ValueError("PRD 无可用内容（既没有文本，也没有可识别的图片）")
         product = request.product or path.parent.name; version = request.version or extract_version(text, path)
         root = Path(request.out) / product / version
         if not request.stub and not request.dry_run and self.config.requires_api_key() and not self.config.api_key: raise ValueError("未配置 LLM 凭证")
         if not request.resume or request.force or (not (root / MANIFEST_NAME).exists() and not (root / LEGACY_MANIFEST_NAME).exists()):
             init_output(root, product, version, str(path.resolve()))
+        # 两个哈希各司其职（不可混用）：
+        #   prdHash    = 正文文本哈希。**已发布契约** —— `cmd_diff` 用它判断
+        #                「新 PRD 是否与历史运行同一份」，掺入资产指纹会让它永不匹配，
+        #                导致 diff 把未改动的 PRD 误判为 modified（实测踩到）。
+        #   inputHash  = 正文 + 资产（含图片内容）。`--resume` 用它，
+        #                这样换了附件/图片就会使旧检查点失效。
         prd_hash = hashlib.sha256(text.encode()).hexdigest()
+        bundle_hash = bundle.fingerprint()
+        input_hash = hashlib.sha256(f"{prd_hash}\x00{bundle_hash}".encode()).hexdigest()
         # llm 提前确定：图片视觉分析需要它，而图片结论要参与随后的 configHash
         # （它只依赖 self.llm / self._custom_llm / request.stub，无副作用，可安全前移）
         llm = self.llm if self._custom_llm or not request.stub else stub_chat
         # 原型/交互式设计产物 → UI 契约（真值）。内容纳入 configHash：
         # 改了原型就必须重新生成，不能复用按旧标识符产出的检查点。
         ui_spec, attachments_meta = self._load_attachments(request.attachments, root)
-        # PRD 图片 → 视觉证据。图片常与 PRD 分目录下载，故支持显式目录 + 约定名探测。
+        # PRD 图片 → 视觉证据（来自 bundle.assets：上传/压缩包/DOCX 内嵌/目录）
         image_spec = None
         if request.analyze_images:
             image_spec = self._load_images(
-                text, path, request=request, root=root, llm=llm, reporter=lambda *_: None)
+                bundle, root, request=request, llm=llm, reporter=lambda *_: None)
+        # 摄取留痕：让「正文与资产是从哪些文件来的」可追溯（含告警与内容指纹）
+        if bundle.sources:
+            try:
+                atomic_write_text(root / "analysis" / "prd-bundle.json",
+                                  json.dumps(ingest.to_json(bundle), ensure_ascii=False,
+                                             indent=2) + "\n")
+            except Exception as exc:
+                warnings.warn(f"摄取留痕失败（不影响生成）: {exc}")
         examples = request.examples or []
         example_hashes = []
         examples_meta = []
@@ -196,6 +248,8 @@ class PipelineRunner:
             "temperature": self.config.temperature, "maxGateRetries": request.max_gate_retries,
             "promptHash": prompt_hash, "profile": request.profile, "minCases": min_cases,
             "repro": getattr(self.config, "repro", False), "seed": getattr(self.config, "seed", None),
+            # 摄取结果（正文 + 资产内容）变更必须使旧检查点失效
+            "bundleHash": bundle_hash,
             # 原型契约决定所有 target 与文案的真值：变更必须使旧检查点失效
             "uiSpecHash": hashlib.sha256(json.dumps(
                 prototype.to_json(ui_spec), ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -214,12 +268,13 @@ class PipelineRunner:
         old_manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         if request.resume and not request.force and old_manifest.get("prdHash") and old_manifest["prdHash"] != prd_hash:
             raise ValueError("--resume 输入 PRD 与历史运行不一致；如确认覆盖请使用 --force")
-        can_resume = bool(request.resume and not request.force and old_state.get("inputHash") == prd_hash
+        can_resume = bool(request.resume and not request.force and old_state.get("inputHash") == input_hash
                           and old_state.get("promptHash") == prompt_hash
                           and old_state.get("model", self.config.model) == self.config.model
                           and old_state.get("configHash") == config_hash)
         run_id = old_manifest.get("runId") if can_resume and old_manifest.get("runId") else str(uuid.uuid4())
-        update_manifest(root, runId=run_id, prdHash=prd_hash, model=self.config.model,
+        update_manifest(root, runId=run_id, prdHash=prd_hash, bundleHash=bundle_hash,
+                        model=self.config.model,
                         prompts=prompt_meta, examples=examples_meta, attachments=attachments_meta,
                         parameters={"provider": self.config.provider, "apiBase": self.config.api_base,
                                     "temperature": self.config.temperature, "timeout": self.config.timeout,
@@ -229,7 +284,7 @@ class PipelineRunner:
                                     "repro": getattr(self.config, "repro", False),
                                     "seed": getattr(self.config, "seed", None)},
                         status="running")
-        update_run_state(root, runId=run_id, inputHash=prd_hash, promptHash=prompt_hash,
+        update_run_state(root, runId=run_id, inputHash=input_hash, promptHash=prompt_hash,
                          configHash=config_hash, model=self.config.model, status="running", stage="init",
                          modules=old_state.get("modules", {}) if can_resume else {})
         result = RunResult(run_id, root)

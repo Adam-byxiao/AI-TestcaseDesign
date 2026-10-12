@@ -259,17 +259,69 @@ def _collect(prd_path: Path, extra_dirs: list[Path] | None = None) -> list[Path]
     return files
 
 
+def assign_by_name(refs: list[ImageRef], names: list[str], *,
+                   used: set[str] | None = None) -> dict[int, tuple[str, str]]:
+    """把引用分配给候选**名称**（filename → alt → order），全局唯一。
+
+    这是关联逻辑的**唯一实现**，被两条来源共用：
+      - `resolve_refs`：候选来自磁盘文件（`Path.name`）；
+      - `prepare_from_assets`：候选来自已摄取的资产（上传/压缩包内的文件名）。
+
+    两处各写一套会出现「改了一处、测试仍全绿」的假安全感（开发中踩过），故抽出共用。
+    返回 `{ref.index: (name, how)}`；`used` 中的名称不会被再分配。
+    """
+    taken: set[str] = set(used or ())
+    result: dict[int, tuple[str, str]] = {}
+    pending = [r for r in refs if not r.resolved]
+
+    # 阶段 1：同名匹配（target 的 basename 与候选同名/同形）
+    for ref in pending:
+        basename = Path(ref.target).name
+        if not basename:
+            continue
+        want = _norm(Path(basename).stem)
+        for name in names:
+            if name in taken:
+                continue
+            if name == basename or _norm(Path(name).stem) == want:
+                result[ref.index] = (name, "filename")
+                taken.add(name)
+                break
+
+    # 阶段 2：图注评分，全局贪心（每个候选至多分配一次）
+    pairs: list[tuple[int, int, str]] = []
+    for ref in pending:
+        if ref.index in result:
+            continue
+        for name in names:
+            if name in taken:
+                continue
+            score = _alt_score(ref.alt, Path(name).stem)
+            if score >= MIN_ALT_OVERLAP:
+                pairs.append((score, ref.index, name))
+    pairs.sort(key=lambda x: (-x[0], x[1], x[2]))
+    for _score, index, name in pairs:
+        if name in taken or index in result:
+            continue
+        result[index] = (name, "alt")
+        taken.add(name)
+
+    # 阶段 3：顺序兜底（低置信）。仅当剩余引用数与剩余候选数相等 ——
+    # 实测 PRD 图序与目录排序并不一致，故标记 "order" 供人工复核。
+    left_refs = [r for r in pending if r.index not in result]
+    left_names = [n for n in names if n not in taken]
+    if left_refs and len(left_refs) == len(left_names):
+        for ref, name in zip(left_refs, left_names):
+            result[ref.index] = (name, "order")
+    return result
+
+
 def resolve_refs(refs: list[ImageRef], prd_path: Path, *,
                  extra_dirs: list[Path] | None = None) -> list[ImageRef]:
-    """为全部引用补齐本地文件（**唯一**的关联实现）。
+    """为全部引用补齐**磁盘上的**本地文件。
 
-    分三阶段做**全局唯一分配**：
-      0. `explicit`：target 就是存在的相对路径；
-      1. `filename`：与 target 的 basename 同名（或规范化后同形）；
-      2. `alt`：按**最长公共子串**评分贪心分配，每个文件只用一次。
-
-    最后才做顺序兜底（`order`），且**仅当剩余引用数与剩余文件数相等**；
-    该方式置信度低（实测 PRD 图序与目录排序并不一致），故显式标记以便复核。
+    阶段 0（`explicit`：target 就是存在的相对路径）在此单独处理，
+    因为它依赖真实路径而非候选名；其余交给 `assign_by_name`。
     """
     for ref in refs:
         ref.resolved, ref.match = "", ""
@@ -287,51 +339,14 @@ def resolve_refs(refs: list[ImageRef], prd_path: Path, *,
     if not files:
         return refs
 
-    used: set[str] = {r.resolved for r in refs if r.resolved}
-    # 阶段 1：同名匹配
-    for ref in refs:
-        if ref.resolved:
-            continue
-        basename = Path(ref.target).name
-        if not basename:
-            continue
-        for f in files:
-            if str(f.resolve()) in used:
-                continue
-            if f.name == basename or _norm(f.stem) == _norm(Path(basename).stem):
-                ref.resolved, ref.match = str(f), "filename"
-                used.add(str(f.resolve()))
-                break
-
-    # 阶段 2：图注评分，全局贪心（每个文件至多分配一次）
-    pairs: list[tuple[int, int, Path]] = []
-    for ref in refs:
-        if ref.resolved:
-            continue
-        for f in files:
-            if str(f.resolve()) in used:
-                continue
-            score = _alt_score(ref.alt, f.stem)
-            if score >= MIN_ALT_OVERLAP:
-                pairs.append((score, ref.index, f))
-    pairs.sort(key=lambda x: (-x[0], x[1], x[2].name))
-    by_index = {r.index: r for r in refs}
-    for score, index, f in pairs:
-        key = str(f.resolve())
-        if key in used:
-            continue
-        ref = by_index.get(index)
-        if ref is None or ref.resolved:
-            continue
-        ref.resolved, ref.match = str(f), "alt"
-        used.add(key)
-
-    # 阶段 3：顺序兜底（低置信）
-    left_refs = [r for r in refs if not r.resolved]
-    left_files = [f for f in files if str(f.resolve()) not in used]
-    if left_refs and len(left_refs) == len(left_files):
-        for ref, f in zip(left_refs, left_files):
-            ref.resolved, ref.match = str(f), "order"
+    by_name: dict[str, Path] = {}
+    for f in files:
+        by_name.setdefault(f.name, f)
+    used = {Path(r.resolved).name for r in refs if r.resolved}
+    for index, (name, how) in assign_by_name(refs, list(by_name), used=used).items():
+        ref = next((r for r in refs if r.index == index), None)
+        if ref is not None and not ref.resolved:
+            ref.resolved, ref.match = str(by_name[name]), how
     return refs
 
 
@@ -533,6 +548,70 @@ def analyze_images(
 # ---------------------------------------------------------------------------
 # 编排：从 PRD 到 ImageSpec
 # ---------------------------------------------------------------------------
+
+def prepare_from_assets(assets, *, text: str = "", allow_remote: bool = False,
+                        cfg=None, vision_llm=None, cache_dir: Path | None = None,
+                        reporter=None, analyze: bool = True) -> ImageSpec:
+    """从**已摄取的资产**构建图片证据（字节已在内存，不再扫磁盘）。
+
+    用途：`ingest` 会把上传/压缩包里的图片解析成资产，
+    这样 UI 上传的图片不再需要「先落到某个目录、再用 --images-dir 指过去」的绕道。
+
+    `text` 有值时用其中的 `![]()` 引用补齐 alt/所在小节等上下文（按文件名与图注关联）；
+    没有引用的资产（如纯图片 PRD）也会全部纳入，alt 回退为文件名。
+
+    与 `prepare` 的分工：`prepare` 面向「文本 + 磁盘目录」，本函数面向「文本 + 内存资产」。
+    两者共用 `assign_by_name`，因此关联规则不会漂移。
+    """
+    spec = ImageSpec()
+    refs = discover_refs(text) if text else []
+    name_of = {}
+    for a in assets:
+        name_of.setdefault(a.name, a)
+    names = list(name_of)
+
+    if refs:
+        for index, (name, how) in assign_by_name(refs, names).items():
+            ref = next((r for r in refs if r.index == index), None)
+            if ref is not None:
+                ref.resolved, ref.match = name, how
+    spec.refs = refs
+
+    items: list[tuple[ImageRef, bytes, str]] = []
+    claimed: set[str] = set()
+    # 已被引用认领的资产
+    for ref in refs:
+        if ref.resolved and ref.resolved in name_of:
+            a = name_of[ref.resolved]
+            items.append((ref, a.data, a.mime))
+            claimed.add(a.name)
+    # 未被任何引用认领的资产（纯图片 PRD、或图片未写进 Markdown）
+    next_index = max((r.index for r in refs), default=0)
+    for a in assets:
+        if a.name in claimed:
+            continue
+        next_index += 1
+        ref = ImageRef(index=next_index, alt=a.name, target=a.name,
+                       section="", resolved=a.name, match="asset",
+                       remote=False)
+        spec.refs.append(ref)
+        items.append((ref, a.data, a.mime))
+
+    if not items:
+        return spec
+    if not analyze or cfg is None:
+        spec.warnings.append(
+            f"已定位 {len(items)} 张图片，但未做视觉识别"
+            + ("（stub 模式）" if not analyze else "（未提供视觉模型配置）")
+            + "；请配置支持图片输入的模型后重跑以获取图片证据")
+        return spec
+
+    spec.insights = analyze_images(cfg, items, vision_llm=vision_llm,
+                                   cache_dir=cache_dir, reporter=reporter)
+    if not spec.insights:
+        spec.warnings.append("视觉分析未产出任何结论（模型可能不支持图片输入）")
+    return spec
+
 
 def prepare(
     prd_text: str, prd_path: Path, *, allow_remote: bool = False,

@@ -39,7 +39,22 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if args.repro: cfg = replace(cfg, repro=True)
     if args.seed is not None: cfg = replace(cfg, seed=args.seed)
     if args.markdown_transit: cfg = replace(cfg, markdown_transit=True)
-    text = loader.load_prd(args.prd); examples = [] if args.dry_run else _load_examples(args, text)
+    # PRD 摄取：--prd 可重复，支持 md/txt/docx/pdf/zip/图片，也支持目录。
+    # 在此统一摄取一次并把 bundle 交给 pipeline，避免重复读盘与重复解析。
+    prds = list(args.prd) if isinstance(args.prd, list) else [args.prd]
+    try:
+        bundle = loader.load_bundle(prds, extra_dirs=list(getattr(args, "images_dir", None) or []))
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"✗ PRD 读取失败：{format_exception(exc)}"); return 1
+    image_dirs = list(getattr(args, "images_dir", None) or [])
+    text = bundle.text
+    summary = bundle.summary()
+    print(f"✔ 已摄取 PRD：正文 {summary['textChars']} 字符"
+          f"（{bundle.primary or '无文本'}）、来源 {summary['sourceCount']} 个"
+          f"、图片 {summary['imageCount']} 张、格式 {','.join(summary['kinds']) or '无'}")
+    for warning in bundle.warnings:
+        print(f"  ⚠ {warning}")
+    examples = [] if args.dry_run else _load_examples(args, text)
     profile = get_profile(args.profile); minimum = args.min_cases_per_requirement or profile["minCasesPerRequirement"]
     if not args.stub and not args.dry_run and cfg.requires_api_key() and not cfg.api_key:
         print("✗ 未配置 LLM 凭证：设置对应 Provider 的 API Key（或使用 --stub/--dry-run）"); return 2
@@ -60,14 +75,15 @@ def cmd_generate(args: argparse.Namespace) -> int:
                   f"锚点 {len(spec.anchor_values())}、"
                   f"文案 {len(spec.messages)}、"
                   f"URL 路由 {'有' if spec.has_url_routing else '无'}")
-    request = GenerateRequest(prd=args.prd, out=args.out, product=args.product,
-                              version=args.ver or extract_version(text, Path(args.prd)), examples=examples,
+    prd_ref = prds[0] if len(prds) == 1 else prds
+    request = GenerateRequest(prd=prd_ref, bundle=bundle, out=args.out, product=args.product,
+                              version=args.ver or extract_version(text, Path(prds[0])), examples=examples,
                               stub=args.stub, dry_run=args.dry_run, jobs=args.jobs or cfg.jobs, stage=args.stage,
                               profile=args.profile, min_cases_per_requirement=minimum,
                               max_gate_retries=args.max_gate_retries, allow_gate_fail=args.allow_gate_fail,
                               no_gate=args.no_gate, resume=args.resume, force=args.force,
                               attachments=attachments,
-                              image_dirs=list(getattr(args, "images_dir", None) or []),
+                              image_dirs=image_dirs,
                               fetch_images=bool(getattr(args, "fetch_images", False)),
                               analyze_images=not bool(getattr(args, "no_images", False)))
     def progress(stage, percent):
@@ -271,7 +287,9 @@ def cmd_compare_runs(args):
 def build_parser():
     parser = argparse.ArgumentParser(prog="prd2tc", description="PRD → 测试方案 → 测试用例")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}"); sub = parser.add_subparsers(dest="command", required=True)
-    g = sub.add_parser("generate"); g.add_argument("--prd", required=True); g.add_argument("--product"); g.add_argument("--version", dest="ver"); g.add_argument("--out", default="output"); g.add_argument("--provider", choices=["openai","anthropic","ollama"]); g.add_argument("--api-base"); g.add_argument("--model"); g.add_argument("--stage", choices=["1","2","3","all"], default="all"); g.add_argument("--dry-run", action="store_true"); g.add_argument("--stub", action="store_true"); g.add_argument("--review", action="store_true"); g.add_argument("--examples"); g.add_argument("--examples-k", type=int, default=3); g.add_argument("--max-gate-retries", type=int, default=2); g.add_argument("--allow-gate-fail", action="store_true"); g.add_argument("--no-gate", action="store_true"); g.add_argument("--jobs", type=int, help="并发批次数（默认取 PRD2TC_JOBS，未设则 1）：阶段1分段与阶段3模块并行"); g.add_argument("--resume", action="store_true"); g.add_argument("--force", action="store_true"); g.add_argument("--profile", choices=["generic","ecommerce"], default="generic"); g.add_argument("--min-cases-per-requirement", type=int); g.set_defaults(func=cmd_generate)
+    g = sub.add_parser("generate"); g.add_argument("--prd", required=True, action="append", metavar="PATH",
+        help="PRD 输入，可重复。支持 .md/.txt/.docx/.pdf/.zip/图片，也可直接给目录"
+             "（如 Wiki 导出的「md + 图片」文件夹）"); g.add_argument("--product"); g.add_argument("--version", dest="ver"); g.add_argument("--out", default="output"); g.add_argument("--provider", choices=["openai","anthropic","ollama"]); g.add_argument("--api-base"); g.add_argument("--model"); g.add_argument("--stage", choices=["1","2","3","all"], default="all"); g.add_argument("--dry-run", action="store_true"); g.add_argument("--stub", action="store_true"); g.add_argument("--review", action="store_true"); g.add_argument("--examples"); g.add_argument("--examples-k", type=int, default=3); g.add_argument("--max-gate-retries", type=int, default=2); g.add_argument("--allow-gate-fail", action="store_true"); g.add_argument("--no-gate", action="store_true"); g.add_argument("--jobs", type=int, help="并发批次数（默认取 PRD2TC_JOBS，未设则 1）：阶段1分段与阶段3模块并行"); g.add_argument("--resume", action="store_true"); g.add_argument("--force", action="store_true"); g.add_argument("--profile", choices=["generic","ecommerce"], default="generic"); g.add_argument("--min-cases-per-requirement", type=int); g.set_defaults(func=cmd_generate)
     i = sub.add_parser("init"); i.add_argument("--product", required=True); i.add_argument("--version", required=True, dest="ver"); i.add_argument("--prd"); i.add_argument("--out", default="output"); i.set_defaults(func=cmd_init)
     ex = sub.add_parser("export", help="导出用例为 Excel / XMind（零第三方依赖）")
     ex.add_argument("--cases", required=True, help="用例目录，如 output/<p>/<v>/cases/cases")

@@ -124,6 +124,24 @@ def test_decode_text_handles_common_encodings():
     assert decode_text("中文€".encode("gb18030")) == "中文€"
 
 
+def test_decode_text_normalizes_newlines():
+    """换行必须统一为 LF。
+
+    真实回归：`Path.read_text()` 走 universal-newlines 会把 CRLF 折成 LF，
+    而按字节解码会保留 `\\r\\n`。不归一化会让同一份 PRD 出现两种正文形态，
+    导致 sourceRefs 偏移错位、diff 把未改动 PRD 误判为 modified。
+    """
+    assert decode_text(b"a\r\nb") == "a\nb"
+    assert decode_text(b"a\rb") == "a\nb"
+    assert decode_text("行1\r\n行2".encode("utf-8")) == "行1\n行2"
+    # 与 read_text 的行为对齐
+    import tempfile
+    from pathlib import Path
+    p = Path(tempfile.mkdtemp()) / "x.md"
+    p.write_text("# 标题\n\n正文\n", encoding="utf-8")     # Windows 上落盘为 CRLF
+    assert decode_text(p.read_bytes()) == p.read_text(encoding="utf-8")
+
+
 def test_decode_text_never_raises():
     assert isinstance(decode_text(b"\xff\xfe\x00\x01\x02"), str)
 
@@ -239,7 +257,60 @@ def test_ingest_picks_longest_markdown_as_primary():
     assert "## 附件：a.md" in b.text
 
 
+def test_ingest_prefers_explicitly_given_file_as_primary():
+    """**核心回归**：显式给出的文件必须是主文件，不能只按长度选。
+
+    实测：把「PRD + 图片和附件」一起摄入时，附件 `rag-service.md`（43KB 接口文档）
+    比真正的 PRD（17KB）长得多 —— 只看长度会把附件当正文、PRD 降级为附件。
+    """
+    short_prd = "# 真正的 PRD\n\n需求点：支持上传。\n"
+    long_attachment = "# RAG 服务接口说明\n\n" + "接口细节。" * 3000
+    b = ingest.ingest([("probe.md", short_prd.encode(), "u"),
+                       ("rag-service.md", long_attachment.encode(), "u")],
+                      preferred_primary="probe.md")
+    assert b.primary == "probe.md", b.primary
+    assert b.text.startswith("# 真正的 PRD")
+    assert "## 附件：rag-service.md" in b.text
+
+
+def test_ingest_prefers_prd_named_file_over_longer_others():
+    """名字含 prd/需求 的文件优先于更长的其它 md。"""
+    long_other = "# 附录\n\n" + "内容。" * 5000
+    b = ingest.ingest([("appendix.md", long_other.encode(), "u"),
+                       ("PRD-v2.md", b"# PRD\n", "u")])
+    assert b.primary == "PRD-v2.md", b.primary
+
+
+def test_ingest_prefers_longest_when_no_hint():
+    """无线索时仍取最长的 md（保持原行为，语义上更可能承载完整需求）。"""
+    b = ingest.ingest([("a.md", b"# a\n", "u"),
+                       ("b.md", ("# b\n\n" + "内容" * 500).encode(), "u")])
+    assert b.primary == "b.md"
+
+
+def test_ingest_preferred_primary_ignored_when_absent():
+    """preferred 指向不存在的文件时不得报错，回退到常规判定。"""
+    b = ingest.ingest([("prd.md", b"# prd\n", "u")], preferred_primary="nope.md")
+    assert b.primary == "prd.md"
+
+
+def test_loader_marks_first_explicit_file_as_primary(tmp_path):
+    """`loader.load_bundle` 必须把用户给的第一个文件当作 PRD。"""
+    from prd2tc import loader
+    prd = tmp_path / "sample-prd.md"
+    prd.write_text("# PRD\n\n需求。\n", encoding="utf-8")
+    d = tmp_path / "图片和附件"
+    d.mkdir()
+    (d / "rag-service.md").write_text("# 接口\n\n" + "细节。" * 3000, encoding="utf-8")
+    (d / "x.png").write_bytes(PNG)
+    b = loader.load_bundle([prd, d])
+    assert b.primary == "sample-prd.md", b.primary
+    assert "## 附件：rag-service.md" in b.text
+    assert len(b.images()) == 1
+
+
 def test_ingest_prefers_markdown_then_docx_then_pdf():
+    """无 prd 名线索时按格式优先级：md → docx → pdf。"""
     md, docx, pdf = ("a.md", b"# m\n", "u"), ("b.docx", make_docx(), "u"), ("c.pdf", make_pdf(), "u")
     assert ingest.ingest([pdf, docx, md]).primary == "a.md"
     assert ingest.ingest([pdf, docx]).primary == "b.docx"

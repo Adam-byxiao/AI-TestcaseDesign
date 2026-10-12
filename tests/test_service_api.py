@@ -43,7 +43,10 @@ def test_prd_versions_and_upload_validation(client):
     assert response.status_code == 200
     original = response.json()
     assert original["version"] == "v0.1"
-    assert client.post("/api/v1/prds", files={"file": ("story.pdf", b"%PDF", "application/pdf")}).status_code == 400
+    # PDF 现已支持（原先会被 400 拒绝）；改用真正不支持的格式验证拒绝路径
+    assert client.post("/api/v1/prds",
+                       files={"file": ("book.xlsx", b"PK\x03\x04nope", "application/vnd.ms-excel")}
+                       ).status_code == 400
 
     updated = client.put(f"/api/v1/prds/{original['prdId']}", json={"content": "# Story v2"})
     assert updated.status_code == 200
@@ -137,6 +140,55 @@ def test_legacy_run_rejects_invalid_stage(client):
     response = client.post("/runs", json={"prd": str(prd), "stage": "bogus"})
     assert response.status_code == 400
     assert "stage" in response.json()["detail"]
+
+
+def test_upload_accepts_multiple_files_and_formats(client):
+    """多文件 + 多格式上传（md + 图片 + docx）——原先只收单个 .md/.txt。"""
+    import io
+    import zipfile
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("[Content_Types].xml", "<Types/>")
+        z.writestr("word/document.xml",
+                   f'<w:document xmlns:w="{W}"><w:body><w:p><w:r>'
+                   f'<w:t>附件需求</w:t></w:r></w:p></w:body></w:document>')
+    PNG = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000a49444154789c6300010000050001")
+
+    resp = client.post("/api/v1/prds", files=[
+        ("files", ("prd.md", "# 主需求\n\n![图](https://x/A)\n".encode(), "text/markdown")),
+        ("files", ("截图.png", PNG, "image/png")),
+        ("files", ("附件.docx", buf.getvalue(),
+                   "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+    ])
+    assert resp.status_code == 200, resp.text
+    meta = resp.json()
+    assert len(meta["files"]) == 3
+    assert meta["primary"] == "prd.md"                  # 显式主文件
+    assert meta["bundle"]["sourceCount"] == 3
+    assert meta["bundle"]["imageCount"] == 1
+    assert set(meta["bundle"]["kinds"]) == {"markdown", "image", "docx"}
+    assert meta["chars"] > 0
+
+
+def test_upload_rejects_unsupported_format(client):
+    resp = client.post("/api/v1/prds",
+                       files={"file": ("book.xlsx", b"PK\x03\x04x", "application/vnd.ms-excel")})
+    assert resp.status_code == 400
+    assert "无法解析" in resp.json()["detail"]
+
+
+def test_upload_sanitizes_path_traversal(client):
+    """上传文件名可被客户端任意构造，绝不能穿越目录落盘。"""
+    resp = client.post("/api/v1/prds",
+                       files={"file": ("../../evil.md", b"# x\n", "text/markdown")})
+    assert resp.status_code == 200
+    meta = resp.json()
+    assert ".." not in meta["path"]
+    assert Path(meta["path"]).name == "evil.md"
 
 
 def test_export_endpoints(client):

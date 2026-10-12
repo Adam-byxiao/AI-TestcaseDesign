@@ -205,22 +205,26 @@ def sniff_kind(name: str, data: bytes) -> str:
 
 
 def decode_text(data: bytes) -> str:
-    """稳健解码：优先 UTF-8（含 BOM），失败则尝试常见中文编码。
+    """稳健解码：优先 UTF-8（含 BOM），失败则尝试常见中文编码，并**统一换行为 LF**。
 
     上传的 PRD 可能来自 Word/记事本，是 GBK 而非 UTF-8；
     直接 `decode("utf-8")` 会抛 UnicodeDecodeError 把整个上传拒掉。
+
+    换行归一化不是洁癖：`Path.read_text()` 走 universal-newlines 会把 CRLF 折成 LF，
+    而按字节解码会原样保留 `\\r\\n`。若不归一化，同一份文件的正文会出现两种形态，
+    导致（实测）`sourceRefs` 偏移错位（start 8 vs 6）、
+    以及 diff 把未改动的 PRD 误判为 modified。
     """
-    for enc in ("utf-8-sig", "utf-8"):
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5", "utf-16"):
         try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    for enc in ("gb18030", "gbk", "big5", "utf-16"):
-        try:
-            return data.decode(enc)
+            text = data.decode(enc)
+            break
         except (UnicodeDecodeError, LookupError):
             continue
-    return data.decode("utf-8", errors="replace")
+    if text is None:
+        text = data.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -625,13 +629,12 @@ def _iter_dir(path: Path):
         yield p.name, p.read_bytes(), str(p)
 
 
-def ingest(inputs, *, warnings: list | None = None) -> Bundle:
+def ingest(inputs, *, warnings: list | None = None, preferred_primary: str = "") -> Bundle:
     """摄取多个输入（文件路径 / 目录 / (name, bytes)），返回归一化 Bundle。
 
-    主文件判定（决定哪个是 PRD 正文）：
-    有 `.md/.markdown` 则取**字符数最多**者为主文件；否则取 `.docx`，再否则取 `.pdf`；
-    都没有则取第一个文本类来源。其余文本类来源作为**附件**按节内联，
-    图片全部作为资产交视觉识别。
+    主文件判定见 `_pick_primary`；`preferred_primary` 由调用方传入
+    （如用户显式给出的第一个 `--prd`），优先级最高。
+    其余文本类来源作为**附件**按节内联，图片全部作为资产交视觉识别。
     """
     bundle = Bundle()
     warns = warnings if warnings is not None else bundle.warnings
@@ -696,11 +699,11 @@ def ingest(inputs, *, warnings: list | None = None) -> Bundle:
             continue
         expanded.append((name, data, origin, depth))
 
-    return _assemble(expanded, warns, bundle=bundle)
+    return _assemble(expanded, warns, bundle=bundle, preferred_primary=preferred_primary)
 
 
 def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
-              bundle: Bundle | None = None) -> Bundle:
+              bundle: Bundle | None = None, preferred_primary: str = "") -> Bundle:
     """把展开后的成员归类为「正文 / 附件 / 资产」。
 
     传入 `bundle` 以复用**同一个**告警列表：若在此处新建 Bundle，
@@ -776,7 +779,7 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
     # 先按输入顺序稳定排序，再选主文件 ——
     # 反过来的话 primary_idx 会指向排序前的下标，内容与名字错位（开发中踩到过）。
     texts.sort(key=lambda x: x[3])
-    primary_idx = _pick_primary(texts)
+    primary_idx = _pick_primary(texts, preferred_primary)
     primary = texts[primary_idx]
     bundle.primary = primary[0]
 
@@ -803,14 +806,34 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
     return bundle
 
 
-def _pick_primary(texts: list[tuple[str, str, str, int]]) -> int:
-    """选主文件：`.md` 中最长者 → `.docx` → `.pdf` → 第一个。"""
+def _pick_primary(texts: list[tuple[str, str, str, int]], preferred: str = "") -> int:
+    """选主文件（决定哪份是 PRD 正文）。
+
+    优先级（**不可只看长度**）：
+      0. `preferred`：调用方显式指定的文件（如用户给的第一个 `--prd`）—— 最强信号；
+      1. 文件名线索：含 `prd`/`需求`/`requirement` 的 Markdown；
+      2. 格式优先级：`.md` → `.docx` → `.pdf` → 其它文本；
+      3. 正文长度（最长者）。
+
+    为什么不能只看长度：实测把「PRD + 图片和附件」一起摄入时，
+    附件 `rag-service.md`（43KB 接口文档）比真正的 PRD（17KB）**长得多**，
+    按长度会把附件当成正文，PRD 反被降级为附件。
+    """
+    if preferred:
+        target = Path(preferred).name
+        for i, (name, _text, _origin, _order) in enumerate(texts):
+            if name == target:
+                return i
+    hint = re.compile(r"(prd|需求|requirement|spec)", re.I)
+
     def score(item):
         name, text, _origin, order = item
         suffix = Path(name).suffix.lower()
         rank = 0 if suffix in (".md", ".markdown", ".mdown") else \
                1 if suffix in (".docx", ".docm") else 2 if suffix == ".pdf" else 3
-        return (rank, -len(text), order)
+        # 名字里带 prd/需求 的优先于一切都只是「格式更好」的
+        named = 0 if hint.search(Path(name).stem) else 1
+        return (named, rank, -len(text), order)
     return min(range(len(texts)), key=lambda i: score(texts[i]))
 
 

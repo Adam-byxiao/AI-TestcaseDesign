@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from prd2tc import __version__, stages
+from prd2tc import ingest
 from prd2tc.config import Config
+from prd2tc.export.common import atomic_write_bytes
 from prd2tc.io import (atomic_write_text, now_iso, save_cases, save_requirements,
                        save_traceability, write_stage, render_cases_md)
 from prd2tc.llm import LLMCancelled, probe_provider
@@ -14,7 +16,22 @@ from prd2tc.pipeline import GenerateRequest, PipelineRunner
 from prd2tc.traceability import build_traceability, validate_traceability
 from prd2tc.validator import format_exception, validate_case
 
-ALLOWED_PRD = {".md", ".markdown", ".txt"}
+ALLOWED_PRD = {".md", ".markdown", ".mdown", ".txt", ".text",
+               ".docx", ".docm", ".pdf", ".zip",
+               ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+MAX_UPLOAD_FILES = 50
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+
+
+def _safe_filename(name: str) -> str:
+    """清洗上传文件名：只保留基名，剔除路径分隔与危险字符。
+
+    上传的文件名可被客户端任意构造（含 `../`），直接落盘会造成目录穿越。
+    """
+    base = Path(str(name or "")).name.strip() or "upload.bin"
+    base = re.sub(r'[<>:"|?*\x00-\x1f]', "_", base)
+    base = base.lstrip(".") or "upload.bin"
+    return base[:120]
 STAGES = ("analysis", "plan", "cases")
 # 这些产物是二进制，不能用 read_text 读取
 BINARY_ARTIFACT_SUFFIXES = {".xlsx", ".xmind", ".zip", ".png", ".pdf"}
@@ -115,6 +132,7 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
                max_workers: int = 2, ui_dir: str | Path | None = None):
     try:
         from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
+        from typing import List
         from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
     except ImportError as exc: raise RuntimeError("服务模式需要安装: pip install 'prd2tc[service]'") from exc
     app = FastAPI(title="prd2tc service", version=__version__); store = WorkspaceStore(state_dir)
@@ -128,8 +146,19 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
     def build_request(meta: dict, body: dict, task_id: str, *, stage: str = "1") -> GenerateRequest:
         product = _safe_component(body.get("product") or Path(meta["filename"]).stem, "product")
         version = _safe_component(body.get("version") or meta.get("version"), "v0.1")
+        prd_path = root / meta["path"]
+        # 上传目录里的其它文件（图片/附件）一并作为输入：
+        # 这样「PRD + 图片」从 UI 上传即可直接生成，无需 --images-dir 绕道。
+        extra: list = []
+        prd_dir = meta.get("dir")
+        if prd_dir:
+            folder = root / prd_dir
+            if folder.is_dir():
+                extra = [p for p in sorted(folder.iterdir())
+                         if p.is_file() and p != prd_path and p.suffix.lower() != ".json"]
         return GenerateRequest(
-            prd=root / meta["path"], out=root / "outputs" / task_id, product=product,
+            prd=([prd_path] + extra) if extra else prd_path,
+            out=root / "outputs" / task_id, product=product,
             version=version, stub=bool(body.get("stub", False)),
             jobs=max(1, int(body.get("jobs") or base_config.jobs or 1)),
             profile=body.get("profile", "generic"), stage=stage,
@@ -241,12 +270,80 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
             store.event(task_id, stage=failed, type="run_failed", status="failed", percent=0, message=f"{failed} 失败")
 
     @app.post("/api/v1/prds")
-    async def upload_prd(file: Any = File(...)):
-        suffix = Path(file.filename or "").suffix.lower()
-        if suffix not in ALLOWED_PRD: raise HTTPException(400, "仅支持 Markdown/TXT 文件")
-        content = (await file.read()).decode("utf-8-sig")
-        prd_id = f"prd-{uuid.uuid4().hex[:12]}"; path = store.prds / f"{prd_id}{suffix}"
-        atomic_write_text(path, content); meta = {"prdId": prd_id, "filename": file.filename, "path": str(path.relative_to(root)), "version": "v0.1", "sha256": _content_hash(content), "chars": len(content), "createdAt": now_iso()}; store.save_json(store.prds / f"{prd_id}.json", meta); return meta
+    async def upload_prd(file: List[UploadFile] = File(None), files: List[UploadFile] = File(None)):
+        """上传 PRD：支持**多文件**与**多格式**（md/txt/docx/pdf/zip/图片）。
+
+        改动原因：原先只接受单个 `.md/.txt` 且强制 UTF-8 解码，
+        于是 `.docx`（PRD 最常见交付格式）、Wiki 导出的 `.zip`
+        （md + 图片 + 附件）、以及「需求本身就是截图」的多模态输入全被 400 拒绝。
+
+        参数兼容：`files`（多文件，推荐）与 `file`（单文件，向后兼容）取并集。
+        类型必须声明为 `List[UploadFile]`：用 `Any` 时 FastAPI 不按列表解析会返 422。
+
+        每个文件**保真落盘**（原始字节，不做文本化）：
+        图片与 docx 的二进制一旦被当文本处理就毁了；格式判定与解析交给 `ingest`。
+        """
+        items = list(file or []) + list(files or [])
+        if not items:
+            raise HTTPException(400, "未上传任何文件")
+        if len(items) > MAX_UPLOAD_FILES:
+            raise HTTPException(400, f"一次最多上传 {MAX_UPLOAD_FILES} 个文件")
+
+        prd_id = f"prd-{uuid.uuid4().hex[:12]}"
+        folder = store.prds / prd_id
+        folder.mkdir(parents=True, exist_ok=True)
+        saved: list[dict] = []
+        payloads: list[tuple[str, bytes, str]] = []
+        for item in items:
+            name = _safe_filename(getattr(item, "filename", "") or "upload.bin")
+            data = await item.read()
+            if not data:
+                continue
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(400, f"{name} 超过单文件上限 "
+                                         f"{MAX_UPLOAD_BYTES // 1024 // 1024}MB")
+            target = folder / name
+            # 同名文件去重（多选时可能撞名），保证不互相覆盖
+            seq = 1
+            while target.exists():
+                target = folder / f"{Path(name).stem}-{seq}{Path(name).suffix}"
+                seq += 1
+            atomic_write_bytes(target, data)
+            payloads.append((target.name, data, "upload"))
+            saved.append({"name": target.name, "size": len(data),
+                          "sha256": hashlib.sha256(data).hexdigest()})
+
+        if not saved:
+            raise HTTPException(400, "上传内容为空")
+
+        # 用摄取层做一次真实解析：立刻把「哪些是正文、哪些是资产、有哪些告警」
+        # 反馈给前端，避免用户上传后才发现格式不被支持。
+        try:
+            bundle = ingest.ingest(payloads)
+            summary = bundle.summary()
+            warnings_list = list(bundle.warnings)
+            primary = bundle.primary
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, f"无法解析上传内容：{exc}") from exc
+
+        primary_name = next((s["name"] for s in saved if s["name"] == primary), saved[0]["name"])
+        meta = {
+            "prdId": prd_id,
+            # filename 保持主文件名（下游按它生成产品名）；files 给出完整清单
+            "filename": primary_name,
+            "path": str((folder / primary_name).relative_to(root)),
+            "dir": str(folder.relative_to(root)),
+            "files": saved,
+            "primary": primary_name,
+            "bundle": summary,
+            "warnings": warnings_list,
+            "version": "v0.1",
+            "sha256": _content_hash("\n".join(s["sha256"] for s in saved)),
+            "chars": summary["textChars"],
+            "createdAt": now_iso(),
+        }
+        store.save_json(store.prds / f"{prd_id}.json", meta)
+        return meta
 
     @app.get("/api/v1/prds")
     def list_prds(): return sorted((store._json(p) for p in store.prds.glob("prd-*.json")), key=lambda item:item.get("createdAt", ""), reverse=True)
