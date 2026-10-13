@@ -355,8 +355,15 @@ def compact_analysis(analysis_md: str, requirements: list[dict]) -> str:
     return re.sub(r"## 3\. 需求点明细.*?(?=## 4\.)", replacement, analysis_md, flags=re.DOTALL)
 
 
-def stage3_repair_builder(allowed_ids: set[str], module: str):
-    """阶段 3 增量修正消息构造：只回传失败输出 + 错误 + 真实 REQ 清单，不重发方案/完整需求 JSON。"""
+def stage3_repair_builder(allowed_ids: set[str], module: str, *, scope: str = "本模块"):
+    """阶段 3 增量修正消息构造：只回传失败输出 + 错误 + 真实 REQ 清单，不重发方案/完整需求 JSON。
+
+    `allowed_ids` 必须与**本次门禁允许的集合**一致。多批次场景下若传模块级清单，
+    就会告诉模型「本模块所有需求都可引用」，而门禁只放行本批那几条 ——
+    模型照提示词生成即被判越界，重试又收到同样的模块级清单，**永远无法收敛**
+    （实测运行 5b526ce6 的 SCENE、9347c6b3 的 DOC/CTX 均因此整模块失败）。
+    `scope` 用于让文案与实际范围一致（如「本批」）。
+    """
     prompt = loader.load_asset(PROMPT_3)
     task, reqs = split_prompt(prompt)
     req_list = "\n".join(sorted(allowed_ids))
@@ -366,7 +373,7 @@ def stage3_repair_builder(allowed_ids: set[str], module: str):
             "# 任务指令",
             task,
             f"# 本模块代号固定为「{module}」：module 必须为 \"{module}\"、id 前缀 TC-{module}-、只能引用 REQ-{module}-*",
-            f"# 本模块真实存在的需求编号（只能引用这些，其余视为不存在）\n{req_list}",
+            f"# {scope}真实存在的需求编号（只能引用这些，其余视为不存在）\n{req_list}",
             "# 你的上一次输出（含失败内容）\n<上一次输出>\n" + last_content + "\n</上一次输出>",
             "# 错误清单\n- " + errors_text.replace("\n", "\n- "),
             reqs,
@@ -848,6 +855,9 @@ def run_stage_3_modules(
         allowed = {module}
         expected_req_ids = {str(r.get("id")) for r in module_reqs}
         all_cases: list[dict] = []
+        # 越界引用记录（批次号, 越界的需求号）：仅用于可观测性，
+        # 归属由 dedup_cross_batch 确定性解决，**不作门禁错误**（见 gate 的说明）。
+        scope_notes: list[tuple[int, list[str]]] = []
         # 跨批去重的输入：每批的用例 + 该批「拥有」的需求集合（批次固定输入，确定性）
         per_batch: list[tuple[list[dict], set[str]]] = []
         total_prompt = total_completion = total_gate_retries = total_cache_read = total_cache_creation = 0
@@ -893,17 +903,25 @@ def run_stage_3_modules(
             # 本批「拥有」的需求：批次切分是固定的，越界引用必然与拥有批重复覆盖。
             batch_req_ids = frozenset(str(r.get("id")) for r in batch)
 
-            def gate(value, _allowed=allowed, _bids=batch_req_ids):
-                """门禁 = 通用用例校验 + **批次范围**校验。
+            def gate(value, _allowed=allowed, _bids=batch_req_ids, _idx=batch_index):
+                """门禁 = 通用用例校验 + 原型契约校验。
 
-                此前门禁的允许集合只有模块码，越界引用（批1 生成批2 的需求）不会被拦，
-                这正是 KB 两批各覆盖全部 16 条需求的根因。加上范围校验后，
-                越界会成为门禁错误并回灌给模型，由既有重试机制要求其收窄到本批。
+                **越界引用只记录、不拦截**（历史教训）：
+                  最初把「引用了本批之外的需求」当门禁错误。但 `module_context`
+                  携带的是**整个模块**的 PRD 原文，模型天然看得见本批之外的需求；
+                  更糟的是修复提示词当时用的是模块级清单（与本批范围不一致），
+                  于是模型照提示词生成 → 被判越界 → 重试仍收到同样的模块级清单
+                  → **永远无法收敛**。实测运行 5b526ce6 的 SCENE（10 条需求/2 批）、
+                  9347c6b3 的 DOC 与 CTX 都因而整模块失败。
+
+                  而越界本身是可确定性处理的：`dedup_cross_batch` 按「需求归属批次」
+                  保留唯一供例，且当拥有批未产出时回退到最早产出它的批次（不丢覆盖）。
+                  实测两种情形（批2 正常产出 / 批2 完全无产出）均能保住全量覆盖。
+                  故此处只记录事实，归属交给 dedup —— 把可自动纠正的偏差
+                  升级成整轮运行的致命失败，代价与收益严重不成比例。
                 """
                 errs = __import__("prd2tc.gates", fromlist=["check_cases_text"]).check_cases_text(
                     value, _allowed, markdown_transit=cfg.markdown_transit)
-                # 越界检查**独立于**其它门禁错误：若写成「仅在无其它错误时才查」，
-                # 一旦同时存在 C-007 类错误，越界就会被掩盖而放行（实测踩到此坑）。
                 try:
                     parsed = extract_and_normalize(value, markdown_transit=cfg.markdown_transit)
                 except Exception:
@@ -912,10 +930,7 @@ def run_stage_3_modules(
                                        for x in (c.get("requirement") or [])
                                        if str(x) not in _bids})
                 if out_of_scope:
-                    errs.append(
-                        f"越界引用：本批只负责 {sorted(_bids)}，但用例引用了 {out_of_scope}。"
-                        f"这些需求由其它批次负责，重复覆盖会产生同质用例；"
-                        f"请只为本批需求生成用例。")
+                    scope_notes.append((_idx, out_of_scope))
                 # 原型契约校验：拦编造标识符与编造 URL 路由
                 # （实测无此校验时 143 个标识符全部编造、7 种 URL 路径全部不存在）
                 if ui_spec is not None and parsed:
@@ -930,7 +945,10 @@ def run_stage_3_modules(
                     cfg, build, gate, llm=llm, max_retries=max_gate_retries,
                     label=f"模块 {module} 批{batch_index}", system=sys3,
                     temperature=stage_temperature(3, cfg), reporter=reporter,
-                    repair_builder=stage3_repair_builder(expected_req_ids, module),
+                    # 修复提示词只列**本批**需求：必须与门禁允许集合一致，
+                    # 否则模型照提示词生成即被判越界、重试又收到同样清单 → 无法收敛。
+                    repair_builder=stage3_repair_builder(set(batch_req_ids), module,
+                                                         scope="本批（本模块的一个批次）"),
                 )
                 if errors:
                     split = _split_batch_if_budget_exhausted(
@@ -964,6 +982,14 @@ def run_stage_3_modules(
 
         # 跨批去重：同一需求只由一个批次供例（此前的裸 extend 会叠加两批的同质用例）
         all_cases, _cross_batch_conflicts = dedup_cross_batch(per_batch)
+        if scope_notes and reporter is not None:
+            try:
+                _all_oos = sorted({r for _, refs in scope_notes for r in refs})
+                reporter(f"ℹ 模块 {module}：{len(scope_notes)} 个批次生成了本批之外需求的用例"
+                         f"（涉及 {len(_all_oos)} 条需求，如 {_all_oos[:4]}）——"
+                         f"已按需求归属批次确定唯一供例，不视为失败")
+            except Exception:
+                pass
         if _cross_batch_conflicts and reporter is not None:
             try:
                 _sample = _cross_batch_conflicts[:3]

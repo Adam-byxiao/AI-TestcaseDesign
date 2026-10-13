@@ -23,14 +23,12 @@ KB 42 条里 52% 是语义重复（全库约 30% 用例量是重复膨胀）。
 完美相关：6 个模块中**只有 KB 是 2 批**，也只有 KB 出现 100% 重复覆盖。
 """
 import json
-
-import pytest
+import re
 
 from prd2tc import stages
 from prd2tc.config import Config
 from prd2tc.llm import LLMResult
 from prd2tc.stages import dedup_cross_batch
-from prd2tc.validator import format_exception
 
 
 def _case(cid: str, module: str, refs: list[str], *, title: str = "场景") -> dict:
@@ -165,89 +163,175 @@ def test_model_ignoring_batch_scope_does_not_produce_cross_batch_duplicates():
                                                             for i in range(1, total + 1)}
 
 
-def test_batch_scope_violation_is_reported_by_gate():
-    """门禁必须把「越界引用」判为错误 —— 这是让模型收窄到本批的第一道防线。
+def test_repair_prompt_scope_matches_batch():
+    """**核心回归（修复①）**：修复提示词声明可引用的编号必须与**本批范围**一致。
 
-    此前门禁只校验模块码，批1 引用批2 的需求会被放行，于是重复覆盖无从拦截。
+    实测事故（运行 5b526ce6 的 SCENE、9347c6b3 的 DOC/CTX）：
+    修复提示词用的是**模块级**清单（说本模块 10 条需求都可引用），
+    而门禁只允许本批 5 条 —— 模型照提示词生成 10 条即被判越界，
+    重试又收到同样的模块级清单，**永远无法收敛**，整模块失败。
     """
-    from prd2tc import gates
-    payload = json.dumps([_case("TC-A-001", "A", ["REQ-A-002"])], ensure_ascii=False)
-    # 模块级校验（旧行为）：不报错 → 越界一路放行
-    assert gates.check_cases_text(payload, {"A"}) == []
-    # 批次级校验（新行为）：越界必须报错
-    cfg = Config("k", "https://x", "m", 0.4, 10, 1)
-    reqs = _reqs("A", 2)
-    errs_seen: list[list[str]] = []
-
-    from prd2tc.stages import extract_and_normalize
-    batch_ids = frozenset({"REQ-A-001"})
-    parsed = extract_and_normalize(payload, markdown_transit=False)
-    out_of_scope = sorted({str(x) for c in parsed for x in c.get("requirement") or []
-                           if str(x) not in batch_ids})
-    assert out_of_scope == ["REQ-A-002"]
-    errs_seen.append([f"越界引用：{out_of_scope}"])
-    assert errs_seen and "越界" in errs_seen[0][0]
+    ids = {"REQ-A-001", "REQ-A-002"}
+    text = stages.stage3_repair_builder(ids, "A", scope="本批")( "上次输出", "错误清单")
+    assert "REQ-A-001" in text and "REQ-A-002" in text
+    assert "REQ-A-003" not in text, "不得声明本批之外的编号"
+    # 文案须与实际范围一致，避免模型误解为「整模块都可以引用」
+    assert "本批" in text
 
 
-def test_gate_feedback_narrows_model_to_batch_scope():
-    """端到端：模型首批越界 → 门禁报错并回灌 → 模型收窄到本批 → 通过。
+def test_faithful_model_obeying_repair_prompt_does_not_livelock():
+    """**核心回归（livelock）**：一个**完全遵守提示词**的模型绝不能失败。
 
-    这是主要的结构性修复：让「批次范围」成为**机器强约束**而不是自然语言建议。
+    这是修复前必然失败的行为：模型忠实引用提示词列出的编号，
+    却在重试后仍被判越界 → 重试无意义 → 模块必然失败。
+    修复后提示词只列本批编号，忠实模型自然通过。
     """
     module, total = "A", 16
     reqs = _reqs(module, total)
-    seen_feedback: list[str] = []
 
-    def narrowing_llm(cfg, user_text, **kwargs):
-        # 一旦提示词里出现越界反馈，就只生成词面上出现的那条「本批」需求
-        if "越界引用" in user_text:
-            seen_feedback.append(user_text)
-            import re
-            # 从门禁反馈里取回本批允许的需求（形如 ['REQ-A-006', ...]）
-            m = re.search(r"本批只负责 \[([^\]]*)\]", user_text)
-            allowed = re.findall(r"REQ-[A-Z]+-\d{3}", m.group(1)) if m else []
-            payload = [_case(f"TC-{module}-{i:03d}", module, [r],
-                             title=f"{r} 的场景") for i, r in enumerate(allowed, 1)]
-        else:
-            payload = [_case(f"TC-{module}-{i:03d}", module, [f"REQ-{module}-{i:03d}"],
-                             title=f"需求{i}的场景") for i in range(1, total + 1)]
+    def faithful_llm(cfg, user_text, **kwargs):
+        """只引用提示词中出现的、属于本批的结构化需求编号。"""
+        import re
+        # 结构化需求里带 "id": "REQ-A-xxx"，即本批范围
+        listed = re.findall(r'"id":\s*"(REQ-[A-Z]+-\d{3})"', user_text)
+        if not listed:      # 修复路径：提示词以纯编号列表给出本批范围
+            listed = re.findall(r"REQ-[A-Z]+-\d{3}", user_text)
+        ids = sorted(set(listed)) or [r["id"] for r in reqs]
+        payload = [_case(f"TC-{module}-{i:03d}", module, [r], title=f"{r} 的场景")
+                   for i, r in enumerate(ids, 1)]
         return LLMResult(json.dumps(payload, ensure_ascii=False), "fake", 5, 5)
 
     cfg = Config("k", "https://x", "m", 0.4, 10, 1)
     cases, _ = stages.run_stage_3_modules(
         cfg, "方案", reqs, "# A\n" + "正文\n" * 60,
-        llm=narrowing_llm, jobs=1, use_gate=True, max_gate_retries=2,
+        llm=faithful_llm, jobs=1, use_gate=True, max_gate_retries=2,
         batch_callback=lambda *_: None, reporter=lambda *_: None)
 
-    assert seen_feedback, "门禁应因越界引用而回灌反馈"
-    # 收窄后：每条需求恰被覆盖一次，且无越界残留
-    covered = {}
+    covered = {r for c in cases for r in c["requirement"]}
+    assert covered == {f"REQ-{module}-{i:03d}" for i in range(1, total + 1)}, sorted(covered)
+    counts: dict[str, int] = {}
     for c in cases:
         for r in c["requirement"]:
-            covered.setdefault(r, []).append(c["id"])
-    assert set(covered) == {f"REQ-{module}-{i:03d}" for i in range(1, total + 1)}, sorted(covered)
-    assert all(len(v) == 1 for v in covered.values()), {
-        r: v for r, v in covered.items() if len(v) > 1}
+            counts[r] = counts.get(r, 0) + 1
+    assert all(v == 1 for v in counts.values()), {r: v for r, v in counts.items() if v > 1}
 
 
-def test_persistent_scope_violation_fails_loudly_instead_of_shipping_duplicates():
-    """模型始终越界且不改正 → 必须**显式失败**，而不是静默产出重复用例。"""
+def test_out_of_scope_is_recorded_not_fatal():
+    """**核心回归（修复②）**：越界引用只记录、不由门禁致命失败。
+
+    越界是**可确定性纠正**的：`dedup_cross_batch` 按需求归属批次保留唯一供例，
+    且拥有批未产出时回退到最早产出它的批次（不丢覆盖）。
+    把它升级成整轮运行的致命失败，代价与收益严重不成比例 ——
+    实测 `module_context` 携带整个模块的 PRD 原文，模型天然会看到本批之外的需求，
+    因此越界属于预期行为而非异常。
+    """
     module, total = "A", 16
     reqs = _reqs(module, total)
+    notes: list[str] = []
 
-    def stubborn_llm(cfg, user_text, **kwargs):
+    def scope_ignoring_llm(cfg, user_text, **kwargs):
         payload = [_case(f"TC-{module}-{i:03d}", module, [f"REQ-{module}-{i:03d}"])
                    for i in range(1, total + 1)]
         return LLMResult(json.dumps(payload, ensure_ascii=False), "fake", 5, 5)
 
     cfg = Config("k", "https://x", "m", 0.4, 10, 1)
-    with pytest.raises(Exception) as exc:
-        stages.run_stage_3_modules(
-            cfg, "方案", reqs, "# A\n" + "正文\n" * 60,
-            llm=stubborn_llm, jobs=1, use_gate=True, max_gate_retries=1,
-            batch_callback=lambda *_: None, reporter=lambda *_: None)
-    detail = format_exception(exc.value)
-    assert "越界" in detail, detail
+    cases, _ = stages.run_stage_3_modules(
+        cfg, "方案", reqs, "# A\n" + "正文\n" * 50,
+        llm=scope_ignoring_llm, jobs=1, use_gate=True, max_gate_retries=1,
+        batch_callback=lambda *_: None,
+        reporter=lambda *a, **k: notes.append(" ".join(str(x) for x in a)))
+
+    # 不再致命失败
+    assert cases, "越界不应导致模块失败"
+    # 覆盖唯一且无缺口
+    counts: dict[str, int] = {}
+    for c in cases:
+        for r in c["requirement"]:
+            counts[r] = counts.get(r, 0) + 1
+    assert all(v == 1 for v in counts.values()), {r: v for r, v in counts.items() if v > 1}
+    assert set(counts) == {f"REQ-{module}-{i:03d}" for i in range(1, total + 1)}, sorted(counts)
+    # 但必须可见（不静默）
+    assert any("本批之外" in n for n in notes), notes
+
+
+def test_persistent_scope_violation_is_resolved_by_dedup():
+    """模型始终越界 → 由 dedup 收敛为唯一供例，而不是丢弃整个模块。
+
+    旧行为是「显式失败」，但那会让一个可自动纠正的归属偏差
+    毁掉整个模块的产出（实测 SCENE 整模块失败，其余模块因检查点 skipped）。
+    """
+    module, total = "A", 16
+    reqs = _reqs(module, total)
+
+    def stubborn_llm(cfg, user_text, **kwargs):
+        payload = [_case(f"TC-{module}-{i:03d}", module, [f"REQ-{module}-{i:03d}"],
+                         title=f"需求{i}场景")
+                   for i in range(1, total + 1)]
+        return LLMResult(json.dumps(payload, ensure_ascii=False), "fake", 5, 5)
+
+    cfg = Config("k", "https://x", "m", 0.4, 10, 1)
+    cases, _ = stages.run_stage_3_modules(
+        cfg, "方案", reqs, "# A\n" + "正文\n" * 60,
+        llm=stubborn_llm, jobs=1, use_gate=True, max_gate_retries=1,
+        batch_callback=lambda *_: None, reporter=lambda *_: None)
+
+    counts: dict[str, int] = {}
+    for c in cases:
+        for r in c["requirement"]:
+            counts[r] = counts.get(r, 0) + 1
+    assert set(counts) == {f"REQ-{module}-{i:03d}" for i in range(1, total + 1)}
+    assert all(v == 1 for v in counts.values()), {r: v for r, v in counts.items() if v > 1}
+    assert len(cases) == total, f"应去重为 {total} 条，实际 {len(cases)}"
+
+
+def test_repair_prompt_at_call_site_is_batch_scoped():
+    """**接线回归（修复①）**：多批次运行时，修复提示词必须只声明**本批**编号。
+
+    为什么需要单独一条：`test_repair_prompt_scope_matches_batch` 只测了构造函数本身，
+    而「调用点是否传入批次级集合」是独立的一行 —— 把它换回模块级集合后，
+    前者仍然通过。更隐蔽的是：**修复②上线后会掩盖这个错误**
+    （越界不再致命，所以即使提示词退回模块级也不会失败），
+    此时唯一的可观测差异就是「提示词声明了哪些编号」。
+
+    危害：提示词声明整模块 → 每批都重新生成整个模块的用例 → 大量跨批重复被
+    dedup 丢弃（浪费 token 与轮次，且正是我们想从源头消除的重复）。
+    """
+    module, total = "A", 16
+    reqs = _reqs(module, total)
+    repair_decls: list[list[str]] = []
+
+    def llm(cfg, user_text, **kwargs):
+        # 修复路径：只按提示词声明的编号生成（忠实模型的正常行为）
+        if "上一次输出" in user_text:
+            declared = sorted(set(re.findall(rf"REQ-{module}-\d{{3}}", user_text)))
+            repair_decls.append(declared)
+            payload = [_case(f"TC-{module}-{i:03d}", module, [r], title=f"{r} 场景")
+                       for i, r in enumerate(declared, 1)]
+            return LLMResult(json.dumps(payload, ensure_ascii=False), "fake", 5, 5)
+        # 初稿故意给非法内容 → 触发修复路径（这样才观测得到修复提示词）
+        return LLMResult("这不是 JSON 数组", "fake", 5, 5)
+
+    cfg = Config("k", "https://x", "m", 0.4, 10, 1)
+    cases, _ = stages.run_stage_3_modules(
+        cfg, "方案", reqs, "# A\n" + "正文\n" * 60,
+        llm=llm, jobs=1, use_gate=True, max_gate_retries=1,
+        batch_callback=lambda *_: None, reporter=lambda *_: None)
+
+    all_ids = {f"REQ-{module}-{i:03d}" for i in range(1, total + 1)}
+    assert repair_decls, "应至少触发一次修复（初稿是非法 JSON）"
+    for decl in repair_decls:
+        assert decl, "修复提示词必须声明编号"
+        assert len(decl) < total, (
+            f"修复提示词声明了 {len(decl)}/{total} 条 —— 说明传入了**模块级**集合，"
+            f"而非本批范围：{decl}")
+    # 各批声明集合互斥且并集为全模块 → 证明是「按批切分」而非「每批都拿全量」
+    flat = [x for decl in repair_decls for x in decl]
+    assert len(flat) == len(set(flat)) or len(repair_decls) == 1, (
+        f"各批修复提示词的声明应互斥，实际：{repair_decls}")
+    assert set(flat) <= all_ids
+    # 覆盖无缺口
+    covered = {r for c in cases for r in c["requirement"]}
+    assert covered == all_ids, sorted(all_ids - covered)
 
 
 def test_cross_batch_conflicts_are_surfaced_to_reporter():
