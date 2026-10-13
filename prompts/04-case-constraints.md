@@ -5,7 +5,11 @@
 ## A. 静态约束（测试原理）
 1. **design_method（必须字段）**：每条用例**必须**标注采用的测试设计方法，取值只能是以下之一：
    等价类划分 / 边界值分析 / 判定表 / 状态迁移 / 场景法 / 错误推测。
-2. **步骤可定位**：`target` 用「页面元素中文名 (data-testid)」格式；动作取自动作枚举（goto/fill/click/selectOption/check/hover/press/reload/expectVisible/expectText/expectUrl/waitFor）。
+2. **步骤可定位**：`target` 用「页面元素中文名 (种类=真实取值)」格式，种类取 `id` / `class` / `page` / `tab` / `text`：
+   - **必须与注入的 UI 契约里该取值所属的种类一致** —— 契约会分别列出「可用 id 锚点」「可用 class 锚点」「页签」「导航页」；
+     把页签键当元素 id 用（如 `(id=tools)`，而 `tools` 只是页签键）会被门禁拒绝。
+   - 无 UI 契约时省略括号，只写中文元素名。
+   - 动作取自动作枚举（goto/fill/click/selectOption/check/hover/press/reload/expectVisible/expectText/expectUrl/waitFor）。
 3. **预期可断言**：URL / 文本 / 状态 / 金额；金额给精确值（¥ 千分位、2 位小数，如 ¥4,727.05）。
    - `expected` 每条**必须超过 8 个字符**（不含标点计数），且写明**可观测对象**：
      具体页面/元素/字段/状态/数值。含具体数字的断言不受长度限制（如「数量 1→2」）。

@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from prd2tc.nlsteps import render_steps_nl_text
+
 # XLSX / XMIND 的固定时间戳：保证同输入产出字节一致（可复现性要求）
 FIXED_TIMESTAMP = (2020, 1, 1, 0, 0, 0)
 
@@ -25,14 +27,19 @@ def list_to_text(values: list[Any] | None, *, sep: str = "\n", empty: str = EMPT
     return sep.join(items) if items else empty
 
 
-def render_steps(steps: list[dict] | None) -> str:
-    """步骤数组 → 编号文本：`1. [action] target ← data`。
+def render_steps(steps: list[dict] | None, *, structured: bool = False) -> str:
+    """步骤数组 → 编号文本。
 
-    动作加方括号便于在 Excel 中一眼区分动作与定位目标；
-    有输入值时用 ← 标注，符合测试人员阅读习惯。
+    默认输出**自然语言**（`打开「智能体配置页」`）：Excel/XMind/Markdown 是**给人评审的**，
+    `[goto]`、`(page=config)` 这类机器标记严重妨碍阅读。
+    结构化原文仍完整保留在 `cases/cases/*.json`（门禁与自动化驱动用）。
+
+    `structured=True` 可切回 `1. [action] target ← data`（排障与对照用）。
     """
     if not steps:
         return EMPTY
+    if not structured:
+        return render_steps_nl_text(steps)
     lines = []
     for index, step in enumerate(steps, 1):
         if not isinstance(step, dict):

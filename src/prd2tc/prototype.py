@@ -621,8 +621,100 @@ def render_ui_spec(spec: UiSpec, *, max_anchors: int = 80) -> str:
 # 按契约校验用例（供门禁使用）
 # ---------------------------------------------------------------------------
 
-_IDENT_IN_TARGET_RE = re.compile(r"\((?:data-testid=)?([A-Za-z_][\w.\-]*)\)\s*$")
+# target 末尾的括号标注：`(kind=value)` 或裸 `(value)`（兼容 `(data-testid=value)`）
+_TARGET_ANNOT_RE = re.compile(r"\(([^()]*)\)\s*$")
+# 无括号的尾随标注：模型有时写成 `知识库配置页 page=knowledge`
+_BARE_ANNOT_RE = re.compile(
+    r"\s+(data-testid|id|class|page|tab|text|name|label|placeholder)"
+    r"\s*=\s*(\S+)\s*$", re.I)
+# 种类别名：模型可能写作 name=/label=，语义上都是「可见文案」
+_KIND_ALIASES = {
+    "id": "id", "class": "class", "page": "page", "tab": "tab",
+    "text": "text", "name": "text", "label": "text", "placeholder": "text",
+}
+# **严格校验的种类**：结构定位符，必须来自契约。
+# `any` 是旧式 `data-testid=` / 裸标识符的归属，同样必须严格 ——
+# 否则「编造 testid」会因落进 any 而被宽松放行（实测回归过一次）。
+# `text` 刻意**不在此列** —— 可见文案可能是用例自己造的数据名
+# （如 `text=测试草稿名称`），严格校验会产生假阳性；
+# 而假阳性会重演「门禁与提示词矛盾 → 重试无法收敛」的老问题。
+_STRICT_KINDS = ("id", "class", "page", "tab", "any")
 _PATH_IN_TARGET_RE = re.compile(r"(?:^|[\s(])(/[A-Za-z0-9_\-/{}.]+)")
+
+
+def _annotation_pools(spec: UiSpec) -> dict[str, set[str]]:
+    """按**种类**整理契约允许的取值。
+
+    为什么必须分种类：`(id=tools)` 中的 `tools` 在契约里确实存在，
+    但它只作为**页签键**（`tabs[].key`）存在，不是任何元素的 id。
+    早先只校验「值是否存在」（不分种类），这类跨命名空间误用被全部放行
+    （实测 17 处：id=tools×9、id=skills×5、id=main×3）。
+    """
+    by_kind: dict[str, set[str]] = {}
+    for a in spec.anchors:
+        by_kind.setdefault(str(a.kind), set()).add(str(a.value))
+    copy: set[str] = {str(b) for b in spec.buttons}
+    for m in spec.modals:
+        copy.add(str(m.title))
+        copy |= {str(x) for x in m.buttons}
+    copy |= {str(x) for x in spec.messages}
+    copy |= {str(f.label) for f in spec.fields if f.label}
+    copy |= {str(f.placeholder) for f in spec.fields if f.placeholder}
+    return {
+        "id": set(by_kind.get("id", set())),
+        "class": set(by_kind.get("class", set())),
+        "page": ({str(p["key"]) for p in spec.pages}
+                 | {str(p["label"]) for p in spec.pages if p.get("label")}),
+        "tab": ({str(t["key"]) for t in spec.tabs}
+                | {str(t["label"]) for t in spec.tabs if t.get("label")}),
+        "text": copy,
+        # 裸标识符（含旧式 data-testid）→ 任意结构锚点
+        "any": set(by_kind.get("id", set())) | set(by_kind.get("class", set())),
+    }
+
+
+def _check_annotation(raw: str, pools: dict[str, set[str]], at: str) -> list[str]:
+    """校验一个括号标注。返回错误列表（可能为空）。"""
+    text = raw.strip()
+    if not text:
+        return []
+    if "=" in text:
+        kind_raw, _, value = text.partition("=")
+        kind = kind_raw.strip().lower()
+        value = value.strip()
+        if kind == "data-testid":                 # 旧式写法：按任意结构锚点校验
+            kind = "any"
+        canonical = _KIND_ALIASES.get(kind, kind if kind in pools else None)
+        if canonical is None:
+            # 未知种类：宽松比对全部取值，仅当明显不存在时才提示
+            everything: set[str] = set()
+            for pool in pools.values():
+                everything |= pool
+            if value and value not in everything:
+                return [f"{at} target 标注 `{text}` 使用了未知种类 `{kind}`，"
+                        f"且取值 `{value}` 不在契约中；请改用 id= / class= / page= / tab= / text="]
+            return []
+        if canonical not in _STRICT_KINDS:
+            return []                             # text 等：宽松（见 _STRICT_KINDS 说明）
+        pool = pools.get(canonical, set())
+        if value and value not in pool:
+            sample = sorted(pool)[:10]
+            if canonical == "any":
+                # 旧式 `data-testid=` / 裸标识符：措辞面向使用者，不暴露内部种类名
+                return [f"{at} target 引用了契约中不存在的标识符 `{value}`"
+                        f"（原型仅有 {len(pool)} 个真实 id/class 锚点：{sample}…）；"
+                        f"请改用真实 id/class 或去掉该标识符"]
+            return [f"{at} target 的 `{kind}={value}` 不是契约中的真实 {canonical}"
+                    f"（契约有 {len(pool)} 个：{sample}…）；"
+                    f"请改用同种类的真实取值"]
+        return []
+    # 裸标识符：兼容旧格式
+    base = text.split(".")[0]
+    pool = pools.get("any", set())
+    if text not in pool and base not in pool:
+        return [f"{at} target 引用了契约中不存在的标识符 `{text}`（原型仅有 "
+                f"{len(pool)} 个真实 id/class 锚点）；请改用真实 id/class 或去掉该标识符"]
+    return []
 
 
 def validate_targets(cases: list[dict], spec: UiSpec, *,
@@ -630,13 +722,16 @@ def validate_targets(cases: list[dict], spec: UiSpec, *,
     """按原型契约校验用例的 target 与 goto 地址，返回错误列表。
 
     检查项：
-      1. target 中括号内的标识符必须是契约中的真实锚点（否则是编造）；
+      0. target 末尾标注**按种类**校验（`id=` 只对 id 锚点、`class=` 只对 class 锚点、
+         `page=` 对页面键、`tab=` 对页签键）；`text=` 宽松；
+      1. 裸标识符必须命中真实 id/class 锚点（兼容旧式 `(data-testid=…)`）；
       2. 原型无 URL 路由时，`goto` 不得使用 `/xxx` 路径；
       3. 原型无 URL 路由时，`goto` 应落在已知页面键或页面名上。
     """
     if not spec.anchors and not spec.pages:
         return []
     known = spec.anchor_values()
+    pools = _annotation_pools(spec)
     page_keys = {p["key"] for p in spec.pages}
     page_labels = {p["label"] for p in spec.pages}
     errors: list[str] = []
@@ -647,15 +742,16 @@ def validate_targets(cases: list[dict], spec: UiSpec, *,
                 continue
             target = str(step.get("target") or "")
             action = str(step.get("action") or "")
-            ident = _IDENT_IN_TARGET_RE.search(target)
-            if ident:
-                value = ident.group(1)
-                # 形如 `panel-text-test.collapsed` 的状态路径不是锚点，单独提示
-                base = value.split(".")[0]
-                if value not in known and base not in known:
-                    errors.append(
-                        f"{at} target 引用了契约中不存在的标识符 `{value}`（原型仅有 "
-                        f"{len(known)} 个真实锚点）；请改用真实 id/class 或去掉该标识符")
+            annot = _TARGET_ANNOT_RE.search(target)
+            if annot:
+                errors.extend(_check_annotation(annot.group(1), pools, at))
+            else:
+                # 无括号的尾随标注（`知识库配置页 page=knowledge`）同样要校验 ——
+                # 否则模型换个写法即可绕过（实测存在这种变体）。
+                bare = _BARE_ANNOT_RE.search(target)
+                if bare:
+                    errors.extend(_check_annotation(f"{bare.group(1)}={bare.group(2)}",
+                                                    pools, at))
             if not spec.has_url_routing:
                 path = _PATH_IN_TARGET_RE.search(target)
                 data = str(step.get("data") or "")

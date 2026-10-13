@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from prd2tc import __version__
 from prd2tc.models import RunManifest
+from prd2tc.nlsteps import clean_items, render_steps_nl
 from prd2tc.schema import envelope, normalize_cases
 
 OUT_STAGES = {"analysis": "需求分析报告.md", "plan": "测试方案.md", "cases": "用例集.md"}
@@ -220,4 +221,34 @@ def render_cases_md(cases: list[dict], plan_title: str = "") -> str:
             tags = " ".join(c.get("tags", []))
             lines.append(f"| {c['id']} | {c['title']} | {c['priority']} | {tags} |")
         lines.append("")
+
+    # 逐条展开：步骤用**自然语言**呈现（结构化原文保留在 cases/cases/*.json）
+    lines += ["## 4. 用例步骤（自然语言）", "",
+              "> 便于人工评审；机器可读的结构化步骤见 `cases/cases/*.json`（含 action 枚举与契约定位符）。", ""]
+    for mod in sorted(by_module):
+        for c in by_module[mod]:
+            reqs = "、".join(c.get("requirement") or []) or "—"
+            lines.append(f"#### {c['id']} {c.get('title', '')}")
+            lines.append("")
+            lines.append(f"- **关联需求**：{reqs}")
+            lines.append(f"- **优先级**：{c.get('priority', '—')}"
+                         f"　**设计方法**：{c.get('design_method', '—')}")
+            pre = c.get("preconditions") or []
+            if pre:
+                lines.append("- **前置条件**：" + "；".join(clean_items(pre)))
+            data = c.get("testData") or []
+            if data:
+                lines.append("- **测试数据**：" + "；".join(clean_items(data)))
+            lines.append("")
+            # numbered=False：`render_steps_nl` 自带序号时不加前缀，否则会出现「1. 1. …」
+            for sentence in render_steps_nl(c.get("steps"), numbered=False):
+                lines.append(f"- {sentence}")
+            lines.append("")
+            exp = c.get("expected") or []
+            if exp:
+                lines.append("**预期结果**")
+                lines.append("")
+                for e in clean_items(exp):
+                    lines.append(f"- {e}")
+                lines.append("")
     return "\n".join(lines)

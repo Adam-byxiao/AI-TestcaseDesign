@@ -267,6 +267,90 @@ def test_validate_targets_rejects_fabricated_identifier(spec):
     assert "btn-save-all-draft" in errs[0]
 
 
+# ---------- 按「种类」校验（修复：门禁曾对 id=/class=/page= 完全失明） ----------
+
+def _one(target: str, action: str = "click") -> list[dict]:
+    return [_case("TC-X-001", [{"action": action, "target": target, "data": ""}])]
+
+
+def test_kind_aware_validation_accepts_real_values(spec):
+    """符合契约且**种类正确**的标注必须放行。"""
+    for target in ("文档名称输入框 (id=docName)",
+                   "页签栏 (class=primary)",
+                   "知识库配置页 (page=knowledge)",
+                   "工具页签 (tab=tools)",
+                   "智能体配置 (page=config)"):
+        assert validate_targets(_one(target), spec) == [], target
+
+
+def test_kind_aware_validation_rejects_tab_key_used_as_id(spec):
+    """**核心回归**：把**页签键**当**元素 id** 用必须被拦。
+
+    实测 17 处：`id=tools`×9、`id=skills`×5、`id=main`×3 —— 它们在契约里
+    确实存在，但只作为**页签键**（`tabs[].key`），不是任何元素的 id。
+
+    早先的校验只查「值是否存在」（且正则压根不匹配 `id=`），
+    于是这类跨命名空间误用被全部放行 —— 实测 `validate_targets` 报 0 问题。
+    """
+    for wrong, right in (("工具页签 (id=tools)", "工具页签 (tab=tools)"),
+                         ("业务场景页签 (id=skills)", "业务场景页签 (tab=skills)"),
+                         ("主提示词页签 (id=main)", "主提示词页签 (tab=main)")):
+        errs = validate_targets(_one(wrong), spec)
+        assert len(errs) == 1, (wrong, errs)
+        assert "真实 id" in errs[0], errs[0]
+        # 同名的**正确种类**必须放行 —— 否则就是误伤
+        assert validate_targets(_one(right), spec) == [], right
+
+
+def test_kind_aware_validation_rejects_page_key_used_as_id(spec):
+    """页面键当 id 用同样要拦（同类问题）。"""
+    errs = validate_targets(_one("知识库页 (id=knowledge)"), spec)
+    assert len(errs) == 1 and "真实 id" in errs[0], errs
+
+
+def test_kind_aware_validation_rejects_wrong_page_and_class(spec):
+    """page / class 的种类内校验必须生效。"""
+    assert validate_targets(_one("某页 (page=nonexistent)"), spec), "page 不存在应报错"
+    assert validate_targets(_one("某栏 (class=nonexistent)"), spec), "class 不存在应报错"
+    # 种类互换也要拦：tabs 是 class，不是 page
+    assert validate_targets(_one("工具 (page=tools)"), spec), "tabs 当 page 用应报错"
+
+
+def test_text_kind_is_lenient_to_avoid_false_positives(spec):
+    """`text=` 必须**宽松**：可见文案可能是用例自己造的数据名。
+
+    实测 `text=测试草稿名称` 是「本用例新造的文档名」，
+    严格校验会误报；而误报会重演「门禁与提示词矛盾 → 重试无法收敛」的老问题。
+    """
+    assert validate_targets(_one("新增行 (text=测试草稿名称)"), spec) == []
+    assert validate_targets(_one("保存按钮 (text=保存)"), spec) == []
+    # 别名同样宽松
+    assert validate_targets(_one("名称输入框 (name=任意动态名)"), spec) == []
+
+
+def test_unknown_kind_with_unknown_value_is_reported(spec):
+    """未知种类 + 取值也不存在 → 提示改用合法种类。"""
+    errs = validate_targets(_one("某元素 (weird=whatever-xyz)"), spec)
+    assert len(errs) == 1 and "未知种类" in errs[0], errs
+
+
+def test_bare_identifier_still_validated(spec):
+    """裸标识符（无种类）仍按 id/class 锚点校验。"""
+    assert validate_targets(_one("文档名称输入框 (docName)"), spec) == []
+    errs = validate_targets(_one("请求 (DevTools Network)"), spec)
+    assert len(errs) == 1 and "不存在" in errs[0], errs
+
+
+def test_multi_kind_case_reports_each_violation(spec):
+    """一条用例里的多处越界都要报全（不因首个错误而截断）。"""
+    cases = [_case("TC-X-001", [
+        {"action": "click", "target": "工具页签 (id=tools)", "data": ""},
+        {"action": "click", "target": "业务场景页签 (id=skills)", "data": ""},
+    ])]
+    errs = validate_targets(cases, spec)
+    assert len(errs) == 2, errs
+
+
 def test_validate_targets_rejects_fabricated_url_route(spec):
     """**核心回归**：原型无 URL 路由时，编造 `/xxx` 必须被拦（实测 7 种全编造）。"""
     cases = [_case("TC-KB-001", [

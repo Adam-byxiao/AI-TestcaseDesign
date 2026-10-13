@@ -13,6 +13,7 @@ from typing import Any
 
 from prd2tc import __version__ as _TOOL_VERSION   # 避免写死版本随发布漂移
 from prd2tc.export.common import EMPTY, build_zip_bytes
+from prd2tc.nlsteps import clean_items, render_steps_nl, step_sentence
 
 MAX_NODES = 3000
 
@@ -59,37 +60,27 @@ def _notes_text(case: dict) -> str:
     if requirements:
         sections.append(f"【关联需求】{', '.join(requirements)}")
     if case.get("preconditions"):
-        body = "\n".join(f"{i}. {t}" for i, t in enumerate(case["preconditions"], 1))
+        body = "\n".join(f"{i}. {t}" for i, t in enumerate(clean_items(case["preconditions"]), 1))
         sections.append(f"【前置条件】\n{body}")
     if case.get("testData"):
-        sections.append("【测试数据】\n" + "\n".join(f"• {t}" for t in case["testData"]))
+        sections.append("【测试数据】\n" + "\n".join(f"• {t}" for t in clean_items(case["testData"])))
     steps = case.get("steps") or []
     if steps:
-        lines = []
-        for index, step in enumerate(steps, 1):
-            if not isinstance(step, dict):
-                lines.append(f"{index}. {step}")
-                continue
-            action = str(step.get("action") or "").strip()
-            target = str(step.get("target") or "").strip()
-            data = str(step.get("data") or "").strip()
-            line = f"{index}. [{action}] {target}" if action else f"{index}. {target}"
-            if data:
-                line += f" ← {data}"
-            lines.append(line)
-        sections.append("【测试步骤】\n" + "\n".join(lines))
+        sections.append("【测试步骤】\n" + "\n".join(render_steps_nl(steps)))
     if case.get("expected"):
-        sections.append("【预期结果】\n" + "\n".join(f"• {t}" for t in case["expected"]))
+        sections.append("【预期结果】\n" + "\n".join(f"• {t}" for t in clean_items(case["expected"])))
     return "\n".join(sections)
 
 
 def _step_text(index: int, step: Any) -> str:
+    """单步自然语言（XMind 子节点标题）。
+
+    机器标记（`[goto]`、`(page=config)`）在这里尤其碍眼 —— XMind 节点宽度有限，
+    而评审者是产品/测试人员。结构化原文仍保留在 cases/cases/*.json。
+    """
     if not isinstance(step, dict):
         return f"{index}. {step}"
-    action = str(step.get("action") or "")
-    target = str(step.get("target") or "")
-    data = str(step.get("data") or "")
-    return f"{index}. [{action}] {target}" + (f" ← {data}" if data else "")
+    return f"{index}. {step_sentence(step)}"
 
 
 def _case_topic(case: dict, ids: _IdFactory, mode: str) -> dict:

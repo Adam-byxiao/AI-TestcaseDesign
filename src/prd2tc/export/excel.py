@@ -11,6 +11,7 @@ from typing import Any
 from xml.sax.saxutils import escape
 
 from prd2tc.export.common import EMPTY, build_zip_bytes, list_to_text, render_steps
+from prd2tc.nlsteps import clean_items
 
 EXCEL_MAX_ROWS = 1_048_576
 
@@ -189,10 +190,12 @@ def _case_row(case: dict) -> list[str]:
         str(case.get("priority") or EMPTY),
         " ".join(str(t) for t in (case.get("tags") or [])) or EMPTY,
         ", ".join(str(r) for r in (case.get("requirement") or [])) or EMPTY,
-        list_to_text(case.get("preconditions")),
-        list_to_text(case.get("testData")),
+        # 自由文本字段也剥离定位符：模型有时把 `（page=config）` 写进这些字段，
+        # 在评审列里同样碍眼（JSON 原文保留）。
+        list_to_text(clean_items(case.get("preconditions"))),
+        list_to_text(clean_items(case.get("testData"))),
         render_steps(case.get("steps")),
-        list_to_text(case.get("expected")),
+        list_to_text(clean_items(case.get("expected"))),
         str(case.get("status") or "active"),
     ]
 

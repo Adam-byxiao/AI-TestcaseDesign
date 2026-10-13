@@ -37,7 +37,22 @@ SAMPLE_CASE = {
 # ---------- common ----------
 
 def test_flatten_steps_renders_numbered_lines():
+    """默认输出**自然语言**：导出物是给人评审的，机器标记妨碍阅读。
+
+    实测反馈：`[goto] 智能体配置页 (page=config)` 难以阅读。
+    结构化原文仍保留在 cases/cases/*.json。
+    """
     text = common.render_steps(SAMPLE_CASE["steps"])
+    assert text.splitlines() == [
+        "1. 打开「/login」",
+        "2. 在「手机号输入框」输入「13800138000」",
+        "3. 点击「登录按钮」",
+    ]
+
+
+def test_render_steps_structured_mode_keeps_machine_format():
+    """`structured=True` 保留原机器格式（排障与对照用）。"""
+    text = common.render_steps(SAMPLE_CASE["steps"], structured=True)
     assert text.splitlines() == [
         "1. [goto] /login",
         "2. [fill] 手机号输入框 ← 13800138000",
@@ -302,7 +317,8 @@ def test_xmind_notes_contain_key_fields():
     notes = topic["notes"]["plain"]["content"]
     assert "REQ-AUTH-002" in notes
     assert "P0" in notes
-    assert "[goto] /login" in notes
+    assert "打开「/login」" in notes        # 自然语言步骤
+    assert "[goto]" not in notes            # 机器标记不出现在导出物
 
 
 def test_xmind_markers_include_priority():
