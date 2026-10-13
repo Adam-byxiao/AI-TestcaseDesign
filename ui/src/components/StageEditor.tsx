@@ -10,8 +10,18 @@ export default function StageEditor({runId,stage,refreshToken,onDirtyChange}:{ru
   // 这里刻意不做自动保存 —— 用户可能只是想看看，而非改动。
   const [dirty,setDirty]=useState(false);
   useEffect(()=>{onDirtyChange?.(dirty)},[dirty,onDirtyChange]);
-  const [selectedCase,setSelectedCase]=useState<number>();
-  const [selectedRequirement,setSelectedRequirement]=useState<number>();
+  const [selectedCase,setSelectedCase]=useState<string>();
+  const [selectedRequirement,setSelectedRequirement]=useState<string>();
+  /** 行的**稳定标识**。
+   *
+   *  ⚠ 绝不能用 antd Table 的 `render(value, record, index)` 里的 `index` ——
+   *  那是**当前页内**的序号，不是全局下标。实测后果：
+   *    - 在第 2 页点「详情」，抽屉里打开的是第 1 页同位置的用例；
+   *    - 在第 2 页改标题/状态，会**静默改到第 1 页的那一条**（数据损坏，
+   *      比显示错误严重得多，且保存后才会发现）。
+   *  因此一律用 `id` 定位（`rowKey` 已是 id，可用且唯一），
+   *  仅当 id 缺失（契约上不该发生）才退化到全局下标。 */
+  const keyOf=(row:any,index:number)=>String(row?.id ?? row?.caseId ?? `#${index}`);
   /** 加载产物。
    *
    *  `keepEdits=true`（轮询路径）时**不覆盖**用户正在编辑的 markdown/rows ——
@@ -37,14 +47,16 @@ export default function StageEditor({runId,stage,refreshToken,onDirtyChange}:{ru
     const timer=window.setInterval(()=>load({keepEdits:true}),5000);
     return()=>window.clearInterval(timer);
   },[runId,stage]);
-  const change=(index:number,key:string,value:any)=>{setRows(current=>current.map((row,i)=>i===index?{...row,[key]:value}:row));setDirty(true)};
+  /** 按**稳定标识**改字段（不是页内序号，见 keyOf 的说明）。 */
+  const change=(key:string,field:string,value:any)=>{setRows(current=>current.map((row,i)=>keyOf(row,i)===key?{...row,[field]:value}:row));setDirty(true)};
   const save=async()=>{const body=stage==='analysis'?{markdown,requirements:rows}:stage==='plan'?{markdown}:{cases:rows};await runApi.saveDraft(runId,stage,body);setDirty(false);message.success('修改已保存')};
-  const reqColumns=[{title:'REQ ID',dataIndex:'id',width:155},{title:'模块',dataIndex:'module',width:100},{title:'标题',dataIndex:'title',render:(v:string,_:any,i:number)=><Input value={v} onChange={e=>change(i,'title',e.target.value)}/>},{title:'优先级',dataIndex:'priority',width:100,render:(v:string,_:any,i:number)=><Select value={v} onChange={x=>change(i,'priority',x)} options={['P0','P1','P2','P3'].map(x=>({value:x,label:x}))}/>},{title:'来源',dataIndex:'sourceRefs',width:100,render:(v:any[])=><Tag title={v?.map(x=>`${x.chunkId} [${x.start}-${x.end}]`).join('\n')}>{v?.length||0} 段</Tag>},{title:'编辑',render:(_:any,row:any,i:number)=><Button size="small" onClick={()=>setSelectedRequirement(i)}>详情</Button>}];
-  const caseColumns=[{title:'用例 ID',dataIndex:'id',width:180},{title:'模块',dataIndex:'module',width:100},{title:'标题',dataIndex:'title',render:(v:string,_:any,i:number)=><Input value={v} onChange={e=>change(i,'title',e.target.value)}/>},{title:'优先级',dataIndex:'priority',width:90},{title:'状态',dataIndex:'status',width:140,render:(v:string,_:any,i:number)=><Select value={v||'active'} onChange={x=>change(i,'status',x)} options={['active','needs_review','deprecated','superseded'].map(x=>({value:x,label:x}))}/>},{title:'REQ',dataIndex:'requirement',render:(v:string[])=>v?.join(', ')},{title:'编辑',render:(_:any,row:any,i:number)=><Button size="small" onClick={()=>setSelectedCase(i)}>详情</Button>}];
-  const currentCase=selectedCase===undefined?undefined:rows[selectedCase];
-  const updateCase=(key:string,value:any)=>{if(selectedCase!==undefined)change(selectedCase,key,value)};
-  const currentRequirement=selectedRequirement===undefined?undefined:rows[selectedRequirement];
-  const updateRequirement=(key:string,value:any)=>{if(selectedRequirement!==undefined)change(selectedRequirement,key,value)};
+  const reqColumns=[{title:'REQ ID',dataIndex:'id',width:155},{title:'模块',dataIndex:'module',width:100},{title:'标题',dataIndex:'title',render:(v:string,row:any,i:number)=><Input value={v} onChange={e=>change(keyOf(row,i),'title',e.target.value)}/>},{title:'优先级',dataIndex:'priority',width:100,render:(v:string,row:any,i:number)=><Select value={v} onChange={x=>change(keyOf(row,i),'priority',x)} options={['P0','P1','P2','P3'].map(x=>({value:x,label:x}))}/>},{title:'来源',dataIndex:'sourceRefs',width:100,render:(v:any[])=><Tag title={v?.map(x=>`${x.chunkId} [${x.start}-${x.end}]`).join('\n')}>{v?.length||0} 段</Tag>},{title:'编辑',render:(_:any,row:any,i:number)=><Button size="small" onClick={()=>setSelectedRequirement(keyOf(row,i))}>详情</Button>}];
+  const caseColumns=[{title:'用例 ID',dataIndex:'id',width:180},{title:'模块',dataIndex:'module',width:100},{title:'标题',dataIndex:'title',render:(v:string,row:any,i:number)=><Input value={v} onChange={e=>change(keyOf(row,i),'title',e.target.value)}/>},{title:'优先级',dataIndex:'priority',width:90},{title:'状态',dataIndex:'status',width:140,render:(v:string,row:any,i:number)=><Select value={v||'active'} onChange={x=>change(keyOf(row,i),'status',x)} options={['active','needs_review','deprecated','superseded'].map(x=>({value:x,label:x}))}/>},{title:'REQ',dataIndex:'requirement',render:(v:string[])=>v?.join(', ')},{title:'编辑',render:(_:any,row:any,i:number)=><Button size="small" onClick={()=>setSelectedCase(keyOf(row,i))}>详情</Button>}];
+  const findRow=(key?:string)=>key===undefined?undefined:rows.find((row,i)=>keyOf(row,i)===key);
+  const currentCase=findRow(selectedCase);
+  const updateCase=(field:string,value:any)=>{if(selectedCase!==undefined)change(selectedCase,field,value)};
+  const currentRequirement=findRow(selectedRequirement);
+  const updateRequirement=(field:string,value:any)=>{if(selectedRequirement!==undefined)change(selectedRequirement,field,value)};
   const markdownView=<Row gutter={16}><Col span={12}><Input.TextArea value={markdown} onChange={e=>{setMarkdown(e.target.value);setDirty(true)}} autoSize={{minRows:22}}/></Col><Col span={12}><div className="markdown compact"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml>{markdown}</ReactMarkdown></div></Col></Row>;
   const traceView=trace?<Space direction="vertical" style={{width:'100%'}}><Space><Tag color="green">覆盖 {trace.summary?.covered||0}</Tag><Tag color="orange">不足 {trace.summary?.insufficient||0}</Tag><Tag color="red">未覆盖 {trace.summary?.uncovered||0}</Tag><Tag>覆盖率 {trace.summary?.coverageRate||0}%</Tag></Space><Table size="small" rowKey="id" pagination={false} dataSource={trace.requirements||[]} columns={[{title:'REQ',dataIndex:'id'},{title:'模块',dataIndex:'module'},{title:'优先级',dataIndex:'priority'},{title:'覆盖状态',dataIndex:'status',render:(v:string)=><Tag color={v==='covered'?'green':v==='uncovered'?'red':'orange'}>{v}</Tag>},{title:'用例',dataIndex:'caseIds',render:(v:string[])=>v?.join(', ')||'-'}]}/><Table size="small" rowKey="caseId" pagination={false} dataSource={trace.caseToRequirements||[]} columns={[{title:'TC',dataIndex:'caseId'},{title:'关联 REQ',dataIndex:'requirementIds',render:(v:string[])=>v?.join(', ')||'-'}]}/>{(trace.unknownReferences?.length||trace.duplicateMappings?.length)&&<Alert type="error" message={`未知引用 ${trace.unknownReferences?.length||0} · 重复映射 ${trace.duplicateMappings?.length||0}`}/>}</Space>:<Alert type="info" message="尚无追踪矩阵"/>;
   const tabs=stage==='analysis'?[{key:'structured',label:'结构化需求',children:<Table rowKey="id" loading={loading} dataSource={rows as Requirement[]} columns={reqColumns}/>},{key:'markdown',label:'Markdown 源码与预览',children:markdownView},{key:'json',label:'JSON',children:<pre className="json-view">{JSON.stringify(rows,null,2)}</pre>}]:stage==='plan'?[{key:'markdown',label:'方案源码与预览',children:markdownView}]:[{key:'cases',label:'结构化用例',children:<Table rowKey="id" loading={loading} dataSource={rows as Case[]} columns={caseColumns} scroll={{x:1000}}/>},{key:'json',label:'JSON',children:<pre className="json-view">{JSON.stringify(rows,null,2)}</pre>},{key:'trace',label:'追踪矩阵',children:traceView}];
