@@ -12,7 +12,7 @@ pipeline 按与当前 PRD 的相关性检索 Top-K 注入各阶段 prompt，
     "keywords": ["登录", "注册", "手机号", "密码", "停用", "账号"],
     "requirement": "该模块需求要点摘要…",
     "design_logic": "为什么这么设计（P0 必带 @smoke、反向给明确断言…）",
-    "cases": [ {…与 case-template.md 字段一致的用例…} ]
+    "cases": [ {…与 case-spec.md 字段一致的用例…} ]
   }
 ]
 """

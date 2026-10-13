@@ -3,7 +3,7 @@
 为什么需要独立模块
 ------------------
 动作枚举原先散落在 6 处：`schema.py`（权威）、`stages.py` 注入的提示词、
-`prompts/04-case-constraints.md`、`docs/case-template.md`、`docs/pipeline.md`、
+`prompts/04-case-constraints.md`、`docs/case-spec.md`、`docs/pipeline.md`、
 `scripts/orchestrate.mjs`。任一处的改动都可能与其它处漂移。
 
 而词表缺口有**实测代价**：评测 v1/v2 中 `check` 的误用率高达 **87%~91%**，

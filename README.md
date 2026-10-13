@@ -1,87 +1,65 @@
-# 01-AI-TestCaseDesign / prd2tc
+# prd2tc — PRD → 测试方案 → 测试用例
 
-> 远程协作开发者请先阅读 [当前开发交接说明](docs/developer-handoff.md)，其中包含实现状态、架构/API、运行测试方式、已知限制和下一步优先级。
+> 把一份产品需求文档（PRD）变成一套**可评审、可执行、可追溯**的测试用例。
 
-**PRD → 测试方案 → 测试用例** 的独立开源工具：由大模型（默认 DeepSeek API）三阶段自动化生成，
-产物为可评审的 Markdown + 结构化用例 JSON（供 Playwright 测试体系消费）。
+`prd2tc` 用大模型完成「需求分析 → 测试方案 → 用例设计」三阶段生成，
+产物同时面向两类读者：**人**（Markdown 评审稿、Excel、XMind）与**机器**（结构化用例 JSON，
+供 Playwright 等自动化体系消费）。
 
-> 定位：**独立的大模型驱动生成工具**，不依赖本地 DSH agent，可在任何服务器/CI 上无人值守运行。
-> 技术栈：Python 3.10+，**零第三方依赖**（标准库 urllib 调 OpenAI 兼容 Chat Completions API）。
+**技术定位**：Python 3.10+，**运行时零第三方依赖**（仅标准库）。
+服务模式与前端工作台为可选依赖，不污染核心 CLI。
 
-## 双运行模式
+---
 
-| 模式 | 说明 | 适用 |
-| --- | --- | --- |
-| **prd2tc CLI（推荐）** | 独立命令行工具，直接调大模型 API，全自动三阶段 | 线上/CI/批量 |
-| **DSH skill（agent 变体）** | `skill/SKILL.md` 装载进 agent 逐阶段执行，人工可介入 | 本地深度使用/评审 |
+## 目录
 
-两者共用同一套 `prompts/`、`templates/` 与字段规范（`docs/case-template.md`）。
+- [核心能力](#核心能力)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [三条使用路径](#三条使用路径)
+- [三阶段流水线](#三阶段流水线)
+- [产物结构](#产物结构)
+- [关键机制](#关键机制)
+- [配置](#配置)
+- [文档索引](#文档索引)
+- [质量与测试现状](#质量与测试现状)
+- [开源](#开源)
+
+---
+
+## 核心能力
+
+| 能力 | 说明 |
+|---|---|
+| **多模态输入** | `.md` / `.txt` / `.docx` / `.pdf` / `.zip` / 图片；支持**整个文件夹**（含子目录）；零依赖自行解析 OOXML 与 PDF |
+| **附件按角色分流** | 需求正文 / 参考资料（接口文档，**不进正文**）/ 原型（**不进正文**，只解析为 UI 契约）/ 图片资产 —— 决定生成质量的上限 |
+| **原型 → UI 契约** | 从可运行原型 HTML 提取**真实**的页面键、元素标识符、弹窗按钮与文案，注入生成过程，防止模型编造 |
+| **图片视觉识别** | 发现 PRD 引用的图片、按内容关联、交多模态模型识别其中的 UI 事实（字段、状态、弹窗按钮） |
+| **三层约束** | prompt 自检门 → 机器门禁 → 失败反馈重出；门禁判据与提示词**同源**，避免"照抄示例却被拦" |
+| **确定性设计** | 程序化编号、模块码锚定、需求指纹、优先级重判、冒烟集判定、导出步骤渲染 —— 都可复现 |
+| **长文档与并发** | 按标题切分分段抽取；按需求模块并发生成，批次容量按输出预算自适应 |
+| **分段执行** | `--stage N` 只跑某阶段、`--from-stage N` 从某阶段跑到最后；上游产物完备性**可校验** |
+| **中断恢复** | `--resume` 按输入与参数指纹复用模块检查点；截断与预算耗尽可能**自愈**（批次对半拆分重试） |
+| **导出** | Excel（3 sheet）/ XMind（三级导图）/ Markdown 评审稿；支持按**模块 / 优先级 / 标签**（含复合条件）筛选导出 |
+| **工作台** | React + antd：三阶段独立操作、批量选择、导出对话框（可选文件名与保存位置）、实时指标与事件 |
+
+---
 
 ## 安装
 
 ```bash
 git clone <本仓库> && cd <仓库目录>
-pip install .            # 或开发模式 pip install -e .
-export PRD2TC_LLM_PROVIDER=openai  # openai / anthropic / ollama
-export OPENAI_API_KEY=sk-xxx      # openai 必填；ollama 不需要
+pip install .                      # 或开发模式：pip install -e .
+pip install -e '.[service]'        # 可选：服务模式与工作台后端
 ```
 
-## 快速开始
+配置 Provider（三选一）：
 
 ```bash
-# 在仓库目录（含 examples/）内执行；pip install . 后也可在任何目录使用
+# OpenAI 兼容（默认）—— 也支持 DeepSeek/MiniMax 等兼容端点
 export PRD2TC_LLM_PROVIDER=openai
 export OPENAI_API_KEY=sk-xxx
 
-# 全自动三阶段：PRD → 需求分析 → 测试方案 → 用例集（用仓库内置示例 PRD）
-prd2tc generate --prd examples/sample-prd.md \
-  --product sample-mall --version v0.1 --out output
-
-# 只预览发给大模型的 prompt（不调用 API）
-prd2tc generate --prd examples/sample-prd.md --dry-run
-
-# 离线自测：用内置 stub 响应跑通全流程（无需 API key）
-prd2tc generate --prd examples/sample-prd.md --stub --out /tmp/demo
-
-# 校验 / 统计
-prd2tc validate --dir output/sample-mall/v0.1/cases/cases
-prd2tc stats    --dir output/sample-mall/v0.1/cases/cases
-```
-
-> 你自己的 PRD 只需满足推荐章节（概述/角色/功能需求/业务规则/非功能需求）即可，格式参考 `examples/sample-prd.md`。
-
-## 配置（环境变量）
-
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `PRD2TC_LLM_PROVIDER` | `openai` | `openai` / `anthropic` / `ollama` |
-| `PRD2TC_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | - | Provider 凭证；Ollama 不需要 |
-| `PRD2TC_API_BASE` | Provider 默认地址 | 可覆盖 OpenAI、Anthropic 或 Ollama 地址 |
-| `PRD2TC_MODEL` | 随 Provider 选择 | 模型名 |
-| `PRD2TC_MAX_TOKENS` | `16384` | 单次输出上限。**只是上限，按实际输出计费，调高不增加固定成本**；实测用例约 1700 tok/需求，个别模块 3 条需求即超过 8192。不得超过 Provider 的模型输出上限（Anthropic 尤甚） |
-| `PRD2TC_TOKENS_PER_REQ` | `1800` | 批次容量估算：每条需求预期输出 token（实测校准值） |
-| `PRD2TC_CASE_BATCH_CAP` | `8` | 单批需求数上限，防止批次随预算膨胀 |
-| `PRD2TC_CASE_OUTPUT_BUDGET` | `0.60` | 单批允许占用 `max_tokens` 的比例。**调高它会让 `PRD2TC_MAX_TOKENS` 失效**：批次会同比例变大，安全余量恒为 `1/该值`，截断率不变 |
-| `PRD2TC_TEMPERATURE` | `0.4` | 采样温度 |
-| `PRD2TC_TIMEOUT` | `120` | 请求超时（秒） |
-| `PRD2TC_MAX_RETRIES` | `3` | 失败重试次数（指数退避） |
-| `PRD2TC_STREAM` | `1` | 流式输出（实时进度/Token）；`0` 关闭。`--repro` 时强制关闭 |
-| `PRD2TC_STREAM_PUSH_MS` | `500` | 实时指标推送间隔（毫秒），限流用 |
-| `PRD2TC_JOBS` | `1` | 默认并发批次数（阶段1分段 / 阶段3模块并行）。工作台默认 4；实测串行 5 模块约 1013s，并发约 332s |
-| `PRD2TC_MARKDOWN_TRANSIT` | `0` | 阶段3 改输出 Markdown 表格再由程序转 JSON（`--markdown-transit`）。规避免嵌套转义导致的整轮失败，字符约省 50% |
-
-> **配置自检**：CLI 用 `prd2tc check-llm`；工作台在「模型配置」保存前会真实探测一次端点，
-> 不通过则拒绝保存并给出具体原因（区分「接口地址填错」与「密钥填错」）与可用的修正地址，
-> 避免错误配置到运行阶段才以无信息量的形式暴露（例如把官网地址当成 API 地址，只会得到一句 HTTP 404）。
->
-> **实时进度**：默认开启流式。运行期间可在工作台看到当前阶段/模块/批次、实时 Token（估算值标 `≈`）、
-> 首 Token 延迟与**静默时长**（判断「是否卡住」的直接证据），并可随时取消（流式会立即停止接收，不再计费）。
-> 流式实时推送依赖 WebSocket，故 `pip install '.[service]'` 会一并安装 `websockets`；
-> 缺少它时 uvicorn 无法完成 WebSocket 升级，实时推送会静默退化为 10 秒轮询。
-
-Provider 示例：
-
-```bash
 # Anthropic
 export PRD2TC_LLM_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=sk-ant-xxx
@@ -93,207 +71,326 @@ export PRD2TC_MODEL=qwen3:8b
 export PRD2TC_API_BASE=http://localhost:11434
 ```
 
-## 三阶段 Pipeline
+> **先自检再生成**：`prd2tc check-llm` 会真实探测一次端点，
+> 明确区分「接口地址填错」与「密钥填错」，并给出可用的修正地址。
+> 把官网/控制台地址当成 API 地址是常见错误（只会得到一句 HTTP 404）。
 
-| 阶段 | Prompt | 输入 → 输出 |
-| --- | --- | --- |
-| 1 需求分析 | `prompts/01-prd-analysis.md` | PRD → `analysis/需求分析报告.md` |
-| 2 测试方案 | `prompts/02-test-plan.md` + 模板 | 分析报告 → `plan/测试方案.md` |
-| 3 用例生成 | `prompts/03-test-cases.md` + 字段约束 | 测试方案 → `cases/用例集.md` + `cases/cases/<MODULE>.json` |
+---
 
-产物目录：`output/<product>/<version>/{analysis,plan,cases}/`（含权威 `run-manifest.json` 与兼容副本 `manifest.json`）。
-
-当前版本还会额外输出 `analysis/requirements.json` 和 `cases/traceability.json`，并在 `run-manifest.json` 中记录运行 ID、PRD 哈希、模型参数、阶段用量和最终状态。为兼容旧工具会同步写出 `manifest.json`；旧版顶层数组用例 JSON 仍可读取。
-
-需求版本可通过以下命令生成确定性 Diff：
+## 快速开始
 
 ```bash
-prd2tc diff --prd PRD-v0.4.md --from output/product/v0.3 --out output
+export PRD2TC_LLM_PROVIDER=openai && export OPENAI_API_KEY=sk-xxx
+
+# 1) 全自动三阶段
+prd2tc generate --prd examples/sample-prd.md \
+  --product sample-mall --version v0.1 --out output
+
+# 2) 不调 API，只看发给模型的 prompt
+prd2tc generate --prd examples/sample-prd.md --dry-run
+
+# 3) 离线跑通全流程（内置 stub 响应，无需 API Key）
+prd2tc generate --prd examples/sample-prd.md --stub --out /tmp/demo
+
+# 4) 校验 / 统计
+prd2tc validate --dir output/sample-mall/v0.1/cases/cases
+prd2tc stats    --dir output/sample-mall/v0.1/cases/cases
 ```
 
-Python 调用方可使用 `prd2tc.pipeline.PipelineRunner`，执行结果契约见 `prd2tc.execution`。
-
-### 产物导出（Excel / XMind）
-
-`generate` 成功后会**自动**在 `cases/` 下产出两种可分发格式，无需额外操作：
+**输入可以更复杂**（`--prd` 可重复，可给目录，可混格式）：
 
 ```bash
-# 自动：generate 结束即产出 <product>-<version>-用例集.xlsx / .xmind
-prd2tc generate --prd examples/sample-prd.md --product mall --version v0.3 --stub
+# 整个文件夹：需求正文 + 图片和附件/ + 原型 HTML，自动还原层级并判定正文
+prd2tc generate --prd ./我的PRD/ --product agent --version v0.1
 
-# 手动导出（对已有产物，可指定格式与展开粒度）
-prd2tc export --cases output/mall/v0.3/cases/cases                     # 两种格式
-prd2tc export --cases output/mall/v0.3/cases/cases --format excel
-prd2tc export --cases output/mall/v0.3/cases/cases --format xmind --xmind-mode full
+# 显式指定正文，并额外指定图片目录（目录名非常规时）
+prd2tc generate --prd PRD.md --prd ./附件/ --images-dir ./截图/ \
+  --product agent --version v0.1
+
+# 原型作为 UI 契约真值（通常无需显式指定：文件夹里的 HTML 会被自动识别）
+prd2tc generate --prd PRD.md --attach ./prototype.html
 ```
 
-| 导出 | 内容 |
-| --- | --- |
-| **`.xlsx`** | 3 个 sheet：`用例明细`（13 列，P0/P1 条件着色、冻结表头、自动筛选）、`需求覆盖`（REQ↔TC 映射，覆盖不足/未覆盖标红）、`统计概览` |
-| **`.xmind`** | 模块 → 子模块 → 用例 三级导图；优先级渲染为图标，标签与设计方法为文本标签，完整用例详情在节点备注中 |
+---
 
-两种格式都**用标准库直接生成**（ZIP + XML/JSON 子集），未引入 openpyxl 等依赖，保持「零第三方运行时依赖」；产物已用 openpyxl 交叉验证可被严格解析器读取。ZIP 时间戳与节点 id 均确定性生成，因此**同输入产出字节一致**，可参与 `compare-runs` 对拍。
+## 三条使用路径
 
-导出失败**不会**阻断生成流程，只降级为告警（产物其余部分照常落盘）。
-服务模式下工作台「运行详情」提供导出按钮，接口为 `GET /api/v1/exports/{run_id}/{excel|xmind}`。
+| 路径 | 适用场景 | 入口 |
+|---|---|---|
+| **CLI** | 线上 / CI / 批量 | `prd2tc`（`src/prd2tc/cli.py`） |
+| **服务模式** | 团队共用、给前端提供 API | `uvicorn 'prd2tc.service:create_app' --factory` |
+| **工作台** | 需要人工审阅、逐步确认、批量筛选 | `cd ui && npm start` |
 
-> 设计细节、字段映射与实现取舍见 [docs/export-excel-xmind.md](docs/export-excel-xmind.md)。
-
-长文档会按 Markdown 标题/段落切分，阶段 1 分段抽取后统一合并，阶段 3 按需求模块并发生成。可用 `--jobs 4` 控制并发；中断后用 `--resume` 复用输入、Prompt、模型和参数指纹一致的模块检查点，`--force` 明确放弃旧检查点。
-
-增量用例和执行反馈命令：
+三者**共用同一个编排内核**（`src/prd2tc/pipeline.py` 的 `PipelineRunner.generate()`）——
+CLI 与服务只是它的适配器，因此行为不会漂移。
 
 ```bash
-prd2tc merge --from output/product/v0.3 --new output/product/v0.4 \
-  --diff output/product/v0.4/diff/requirement-diff.json --out output/product/v0.4/merged
-prd2tc import-results --cases output/product/v0.4/cases/cases \
-  --results execution-results.json --out output/product/v0.4/cases-with-results
-prd2tc promote-examples --cases output/product/v0.4/cases-with-results \
-  --design-logic "人工评审后的设计逻辑" --reviewed --out examples/product-v0.4.json
-```
-
-可选服务模式不会增加核心 CLI 的安装依赖：
-
-```bash
-pip install '.[service]'
+# 服务模式
+pip install -e '.[service]'
 uvicorn 'prd2tc.service:create_app' --factory --host 127.0.0.1 --port 8000
+
+# 工作台（同时起 FastAPI + Vite）
+cd ui && npm install && npm start        # 前端 5173 / 后端 8000
+
+# 生产部署
+cd ui && npm run build                   # 产物在 ui/dist
+# 然后 create_app(ui_dir="ui/dist") 托管静态文件并保留 /api/v1
 ```
 
-### 可交互前端工作台
+> 工作台默认走**真实模型**：开始运行前必须先在「模型配置」保存 LLM 会话。
+> 离线 Stub **不会**自动降级，必须在「新建运行」里显式开启；运行详情会明确标注
+> 「真实模型」或「Stub 离线验收」，避免把流程验收产物误认为模型产出。
 
-前端位于 `ui/`，开发时分别启动 API 和 Vite：
+---
+
+## 三阶段流水线
+
+| 阶段 | 输入 → 输出 | 产物 |
+|---|---|---|
+| 1 需求分析 | PRD → 结构化需求 | `analysis/需求分析报告.md`、`analysis/requirements.json` |
+| 2 测试方案 | 分析报告 → 测试方案 | `plan/测试方案.md` |
+| 3 用例设计 | 方案 + 需求 → 用例 | `cases/用例集.md`、`cases/cases/<MODULE>.json`、`cases/traceability.json` |
+
+长文档按标题切分、分段抽取后合并；阶段 3 按需求模块并发生成，每个模块内再按输出预算分批。
+
+**分段执行**（不必每次从头）：
 
 ```bash
-# 安装一次服务端可选依赖
-pip install -e ".[service]"
-# 一个命令同时启动 FastAPI + Vite
-cd ui && npm install && npm start
+prd2tc generate --prd PRD.md --stage 1      # 只跑需求分析
+prd2tc generate --prd PRD.md --stage 2      # 只跑测试方案（复用已有分析）
+prd2tc generate --prd PRD.md --from-stage 3 # 从用例设计跑到最后
+prd2tc generate --prd PRD.md --resume       # 复用检查点续跑
 ```
 
-`npm start` 是 `npm run dev:all` 的别名，会同时启动前端（5173）和后端（8000）；也可以分别使用 `npm run dev` 或 `npm run dev:backend`。
+进入某阶段前会校验上游产物**是否完备**（存在 → 非空 → 可解析 → 结构完整），
+并拒绝复用「为另一份 PRD 生成」的陈旧产物：
 
-浏览器访问 <http://127.0.0.1:5173>。工作台支持 PRD 版本管理、Markdown 预览、需求/方案/用例阶段草稿与显式审批、实时事件、追踪矩阵和产物下载。Provider 会话在“模型配置”页面创建；API Key 只保留在服务进程内存中，Ollama 不需要 Key。
+```
+阶段 3（cases）无法开始：上游产物不完备（1 项）
+  ✗ [empty] 测试方案（plan/测试方案.md）：产物为空或过小（0B），小于下限 80B
+提示：要补跑缺的上游阶段，用 `--from-stage 2`（从这里跑到最后）；
+      只跑阶段 3 而不补上游，用 `--stage 3`（会复用已有上游产物）；
+      若确认要复用旧产物，加 `--allow-stale-artifacts`。
+```
 
-工作台默认按正式流程使用真实模型：开始运行或点击“重新分析”前，必须先在“模型配置”保存当前 LLM 会话。离线 Stub 不会自动降级，只有在“新建运行”中显式打开“Stub”开关才会使用固定离线响应；运行详情会明确显示“真实模型”或“Stub 离线验收”，避免把流程验收产物误认为模型生成结果。
+---
 
-生产部署可先执行 `cd ui && npm run build`，再将 `ui/dist` 传给 `create_app(ui_dir="ui/dist")`；服务会托管静态文件并保留 `/api/v1` 接口。
+## 产物结构
 
-服务提供 `POST /runs`、`GET /runs/{task_id}` 和 WebSocket `/runs/{task_id}/events`；任务状态持久化到本地状态目录，WebSocket 不是唯一事实源。
-阶段 3 输出的用例 JSON 经内置校验（id 唯一、字段枚举、P0 必带 `@smoke`）后落盘，非法直接报错。
+```
+output/<product>/<version>/
+├── run-manifest.json          # 权威运行清单（runId、哈希、模型参数、阶段用量、状态）
+├── manifest.json              # 兼容副本
+├── reproduce.json             # --repro 的复现参数
+├── analysis/
+│   ├── 需求分析报告.md
+│   ├── requirements.json      # 结构化需求（含优先级、来源引用、模块表）
+│   ├── prd-bundle.json        # 摄取留痕：每个来源的角色与字符数
+│   ├── ui-spec.json           # 原型 UI 契约（真实标识符/页面/弹窗/文案）
+│   └── image-spec.json        # 图片视觉证据
+├── plan/测试方案.md
+└── cases/
+    ├── 用例集.md               # 评审稿（含自然语言步骤）
+    ├── 用例集.xlsx / .xmind    # 可分发产物
+    ├── traceability.json      # 需求 ↔ 用例映射与覆盖状态
+    ├── cases/<MODULE>.json    # 机读用例（结构化步骤，供自动化消费）
+    ├── .checkpoints/          # 模块级检查点（--resume 复用）
+    └── partial/               # 门禁未通过时的部分产物（附 READ-ME，明确不可直接采信）
+```
 
-## 学习能力（示例库 + 检索注入，RAG-lite）
+---
 
-让 agent 从**已有的 PRD-用例对**中学习测试设计逻辑，而不是每次从零设计。
+## 关键机制
+
+### 输入侧：附件按角色分流
+
+一份 PRD 常同时带来「需求正文」「接口文档」「可运行原型」「截图」。
+它们对生成的价值完全不同，**混在一起是生成质量崩坏的首要原因**：
+
+> 实测一份 3,993 字符的真实 PRD，因把 42KB 原型源码与 27KB 接口文档一并内联，
+> 喂入模型 **73,159 字符（94.5% 与需求无关）**，产出 **319 条需求 / 43 个模块**，
+> 其中甚至包含接口文档里某个**客户专用策略开关**（与被测项目毫无关系）。
+> 按角色分流后正文回落到 3,993 字符（↓95%）。
+
+因此摄取层把来源分为：需求载体 / **参考资料**（默认不进正文）/ **原型**（不进正文，
+只解析为 UI 契约）/ 资产。只找到参考资料时会**明确报错**，而不是静默当正文。
+
+→ 详见 [docs/ingestion.md](docs/ingestion.md)
+
+### 契约真值：原型与图片
+
+真实 PRD 常引用可运行原型，而**页面的真实标识符只存在于原型里**。
+不使用它时，模型会编造（实测 143/143 个标识符不存在、7/7 个 URL 路由不存在、
+并按臆造的「三选项弹窗」设计交互，而真值只有 1 个按钮）。
+
+`prd2tc` 从原型提取结构化 UI 契约并注入 system 前缀，门禁**按种类**校验用例引用：
+`id=` 只对元素 id、`class=` 只对 class 锚点、`page=`/`tab=` 只对页面键与页签键
+（把页签键当元素 id 用会被拒绝）。
+
+→ 详见 [docs/ingestion.md](docs/ingestion.md)
+
+### 三层约束体系
+
+| 层 | 机制 | 能力边界 |
+|---|---|---|
+| ① prompt 自检门 | 提示词内置「输出前自检清单」 | 靠模型自觉 |
+| ② 机器门禁 | `gates.py` + `validator.py` 程序校验 | **强约束** |
+| ③ 反馈重出 | 门禁错误回灌给模型修正（可配重试次数） | 修正闭环 |
+
+门禁判据与提示词示例**必须一致**，否则模型会陷入「照抄示例 → 被门禁拦 → 改写」的死循环；
+项目用测试锁住这种一致性。修复提示词的范围也必须与门禁允许集合一致 ——
+否则重试会变成死循环（实测曾因此整模块失败）。
+
+→ 详见 [docs/prompts-and-gates.md](docs/prompts-and-gates.md)
+
+### 确定性与可复现
+
+编号、模块码、优先级、冒烟集、导出步骤都由**程序**判定而非模型自由发挥：
+
+- **用例编号**程序化重排，模块码锚定到 PRD 原始编号
+- **优先级** = 需求优先级 × 测试维度修正（含「写操作防护不降级」的数据安全例外）
+- **`@smoke`** 是 P0 的**真子集**（每需求 1 条、排除边界与异常、总量 ≤20%）
+- **导出步骤**用确定性渲染成自然语言，JSON 仍保留结构化步骤
 
 ```bash
-# 指定示例库（历史 PRD-用例对），按与当前 PRD 的相关性自动检索 Top-K 注入 prompt
+prd2tc generate --prd PRD.md --repro        # 温度归零，作为回归验收基线
+prd2tc compare-runs --a output/p/v0.1 --b output/p/v0.2   # 结构化对拍
+```
+
+→ 详见 [docs/case-spec.md](docs/case-spec.md)、[docs/pipeline.md](docs/pipeline.md)
+
+### 导出与筛选
+
+`generate` 成功后**自动**产出 Excel / XMind，无需额外操作。也可手动导出并**按范围筛选**：
+
+```bash
+prd2tc export --cases output/mall/v0.3/cases/cases --format xmind --xmind-mode full
+
+# 工作台/服务侧还支持按条件筛选导出：
+#   只导出某模块、只导出 P0、只导出 @smoke，或复合条件（如「KB 模块中的回归用例」）
+```
+
+| 产物 | 内容 |
+|---|---|
+| **`.xlsx`** | 3 个 sheet：`用例明细`（条件着色、冻结表头、自动筛选）、`需求覆盖`、`统计概览` |
+| **`.xmind`** | 模块 → 子模块 → 用例 三级导图；优先级为图标，完整详情在节点备注 |
+| **`.md`** | 评审稿：统计 + 追溯表 + 逐条用例（**自然语言步骤**） |
+
+两种二进制格式都由**标准库**直接生成（ZIP + XML/JSON 子集），
+固定时间戳与稳定节点 id，因此**同输入产出字节一致**；导出失败**不阻断**生成主流程。
+
+→ 详见 [docs/export.md](docs/export.md)
+
+---
+
+## 配置
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PRD2TC_LLM_PROVIDER` | `openai` | `openai` / `anthropic` / `ollama` |
+| `PRD2TC_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | - | Provider 凭证；Ollama 不需要 |
+| `PRD2TC_API_BASE` | Provider 默认 | 可覆盖 API 地址（**注意别填官网地址**） |
+| `PRD2TC_MODEL` | 随 Provider | 模型名 |
+| `PRD2TC_MAX_TOKENS` | `16384` | 单次输出**上限**。按实际输出计费，调高不增加固定成本。不得超过 Provider 的模型输出上限 |
+| `PRD2TC_TOKENS_PER_REQ` | `1800` | 批次容量估算：每条需求预期输出 token（实测校准） |
+| `PRD2TC_CASE_BATCH_CAP` | `8` | 单批需求数上限，防止批次随预算膨胀 |
+| `PRD2TC_CASE_OUTPUT_BUDGET` | `0.60` | 单批允许占用 `max_tokens` 的比例。**调高它会让 `MAX_TOKENS` 失效**（批次同比例变大，安全余量恒为 `1/该值`） |
+| `PRD2TC_TEMP_S1/S2/S3` | `0.2/0.3/0.3` | 分阶段温度；`PRD2TC_TEMPERATURE` 可统一覆盖 |
+| `PRD2TC_TIMEOUT` | `120` | 请求超时（秒） |
+| `PRD2TC_MAX_RETRIES` | `3` | 网络失败重试次数（指数退避） |
+| `PRD2TC_STREAM` | `1` | 流式输出（实时进度与 Token）；`--repro` 强制关闭 |
+| `PRD2TC_STREAM_PUSH_MS` | `500` | 实时指标推送间隔（毫秒） |
+| `PRD2TC_JOBS` | `1` | 默认并发批次数（工作台默认 4）。实测串行 5 模块约 1013s，并发约 332s；过高会触发 Provider 限流 |
+| `PRD2TC_MARKDOWN_TRANSIT` | `0` | 阶段 3 改输出 Markdown 表格再由程序转 JSON，规避转义类失败（字符约省 50%，落盘仍为 JSON） |
+| `PRD2TC_PROMPT_CACHE` | `0` | Anthropic 请求带 `cache_control` |
+| `PRD2TC_REPRO` | `0` | 可复现模式（三阶段温度归零） |
+| `PRD2TC_SEED` | - | 采样种子（仅 OpenAI 兼容端点生效） |
+| `PRD2TC_CHUNK_SIZE` / `_OVERLAP` | `6000` / `1200` | 长文档切分参数 |
+| `PRD2TC_EXAMPLES` | - | 示例库目录（学习能力，见下） |
+
+**批次容量公式**（当你想调大单批规模时读这一条）：
+
+```
+每批需求数 = min(max_tokens × OUTPUT_BUDGET_RATIO ÷ TOKENS_PER_REQ_EST,
+                 CASE_BATCH_CAP,
+                 模块需求数)
+```
+
+### 学习能力（示例库，RAG-lite）
+
+让模型从**已有的 PRD-用例对**中学习测试设计逻辑，而不是每次从零设计：
+
+```bash
 prd2tc generate --prd <prd> --examples examples/ --examples-k 3
-# 或环境变量
-export PRD2TC_EXAMPLES=examples/
 ```
 
-**工作机制**：
-1. 示例文件（`examples/*.json`，数组）形如：`{module, title, keywords, requirement, design_logic, cases[]}`；
-   `design_logic` 字段即"设计逻辑"——为什么这么设计（P0 必带 @smoke、反向断言、金额边界…），是模型学习的关键。
-2. 相关性检索：模块命中 + 关键词覆盖 + 需求要点重合的轻量打分（零依赖），取 Top-K 且分数>0 的示例。
-3. 注入：示例块进入**阶段 1（需求分析）与阶段 3（用例生成）** 的 prompt，模型按示例的模块划分、优先级口径、字段格式与设计逻辑完成任务。
+示例文件的 `design_logic` 字段（为什么这么设计：P0 必带 `@smoke`、反向断言、金额边界…）
+是模型学习的关键。相关性检索用零依赖的轻量打分（模块命中 + 关键词覆盖 + 需求要点重合）。
 
-预置示例：`examples/youxuan-mall-examples.json`（AUTH/CART/CHECKOUT 三组，从本项目真实产出提炼）。
-新增示例：把你们已有的「需求点 + 测试用例」按格式导入即可，越多覆盖越广。
+---
 
-**设计依据（调研）**：
-- [Reference-Based Retrieval-Augmented Unit Test Generation（ASE 2025）](https://conf.researchr.org/details/ase-2025/ase-2025-journal-first-track/46/Reference-Based-Retrieval-Augmented-Unit-Test-Generation)：历史参考用例做 RAG 是有效路径。
-- [阿里云实践：RAG+大模型实现分钟级测试用例生成](https://developer.aliyun.com/article/1690088)：业界落地案例。
-- [TestBrain](https://github.com/MangoFisher/TestBrain)（DeepSeek + RAG 知识库 + 用例评审）、[spec2case](https://github.com/blackhaiyu-sudo/spec2case)（生产级 agent + 人工确认 + 编排）等开源项目均采用知识库/示例注入路线。
+## 文档索引
 
-## Prompt 体系（基于传统测试原理优化）
+| 文档 | 内容 | 读者 |
+|---|---|---|
+| [architecture.md](docs/architecture.md) | 总体架构、模块地图、数据流、关键设计决策 | 想理解全局的人 |
+| [pipeline.md](docs/pipeline.md) | 三阶段细节、批次与去重、产物契约、分段执行、恢复与可复现 | 要改流水线的人 |
+| [ingestion.md](docs/ingestion.md) | 多格式摄取、文件夹、附件分流、原型契约、图片视觉 | 处理输入问题的人 |
+| [case-spec.md](docs/case-spec.md) | 用例字段与规则契约、动作词表、优先级、冒烟集、追踪矩阵 | 消费/生成用例的人 |
+| [prompts-and-gates.md](docs/prompts-and-gates.md) | Prompt 体系、三层约束、门禁清单、示例库 | 调提示词与门禁的人 |
+| [export.md](docs/export.md) | Excel/XMind/Markdown 导出、筛选导出、自然语言步骤 | 要分发产物的人 |
+| [service-and-ui.md](docs/service-and-ui.md) | 服务 API、会话模型、工作台交互与前端设计取舍 | 用/改工作台的人 |
+| [operations.md](docs/operations.md) | 配置、运行、排障手册（含常见错误与处置） | 运维与排障 |
+| [development.md](docs/development.md) | 开发约定、测试方法论（TDD + 变异测试）、平台注意事项 | 贡献代码的人 |
+| [quality-evaluation.md](docs/quality-evaluation.md) | 用例质量评测：方法、评分、未验证风险 | 想了解产出质量的人 |
 
-### Prompt 工程十原则落地情况
+提示词资产在 `prompts/`，模板在 `templates/`。
+**注意**：`src/prd2tc/assets/prompts/` 是安装包的兜底副本，
+改动提示词后必须运行 `python scripts/sync_prompts.py` 同步（有测试校验一致性）。
 
-| 原则 | 落地实现 |
-| --- | --- |
-| 1 具体且无歧义 | 章节标题固定、数量一致性（REQ 一一对应）、金额精确值格式 |
-| 2 展示而非陈述 | 阶段 1/3 prompt 内嵌少样本示例；阶段 3 另注入示例库（--examples） |
-| 3 显式定义输出格式 | 阶段 1/2 固定六/七章节结构；阶段 3 指定 JSON 数组 + 字段约束（与 validator 同源） |
-| 4 输入数据分隔符 | `build_user_message` 用 `<key>…</key>` 包裹全部输入数据，与指令隔离 |
-| 5 指定角色 | 分阶段 system：测试架构师 / 测试经理 / 测试设计专家 |
-| 6 指明不要做什么 | 每阶段「禁止」清单（不输出思考过程、不臆造、不省略章节、不输出非 JSON） |
-| 7 思维链 | 每阶段「处理步骤」逐步执行；阶段 3 隐藏推理只输出结果 |
-| 8 合理控制温度 | 阶段 1/2/3 默认 0.2/0.3/0.5（`PRD2TC_TEMP_S1/S2/S3` 可覆盖） |
-| 9 基于实证迭代 | prompt 资产带 `> prompt vX.Y.Z` 版本头；`prd2tc prompts` 查看版本与内容哈希；编辑→升版→对比产物即 A/B |
-| 10 近因偏差 | 任务指令→输入数据→**输出要求置末**（`# 输出要求` 拆分，门禁反馈追加在最后） |
+---
 
-### Prompt 资源清单
+## 质量与测试现状
 
-| 资源 | 作用 | 注入阶段 |
-| --- | --- | --- |
-| `prompts/00-testing-principles.md` | 共享测试原理层（**硬约束**）：约束分级（[必须]/[禁止]/[尽量]）、需求可测性条件分支、设计方法选用条件、覆盖维度、用例质量属性、优先级与风险、**逐阶段输出自检门** | 1 / 2 / 3 任务指令区 |
-| `prompts/01~03` | 各阶段任务指令（角色/任务/处理步骤/输出要求），统一按 `# 输出要求` 拆分置末 | 对应阶段 |
-| `prompts/04-case-constraints.md` | 用例生成约束模板：**静态约束** + **学习约束**（`{{learned_patterns}}` 由示例库动态填充） | 3 输出要求区 |
+| 项 | 现状 |
+|---|---|
+| 后端测试 | **671 个用例全绿**（33 个测试文件） |
+| 前端测试 | **81 个用例全绿**（10 个文件，vitest + jsdom） |
+| 用例质量评测 | 五维加权 **88.9 / 100（B+）** —— 达到「可直接用于评审与执行」 |
+| 契约合规率 | **100%**（340 个 target 标注逐条按「种类 + 值」独立复算） |
+| 追溯完整性 | 需求覆盖 100%，未知引用 0，重复映射 0 |
 
-## 机器强制门禁（三层约束的最后一层）
+测试方法论的两条硬要求（详见 [development.md](docs/development.md)）：
 
-prompt 里的"自检门"是**靠模型自觉**；prd2tc 还提供**程序化门禁**（`src/prd2tc/gates.py`），让门禁变成机器强制：
+1. **先写复现测试再修**（TDD）。例如分页定位缺陷修复前新增的测试 6/6 失败，修复后 6/6 通过。
+2. **变异测试**：故意破坏实现，确认测试能捕获。这条做法在本项目反复发现「改了代码但没写测试」
+   与「测试无从区分」两类问题。
 
-| 阶段 | 门禁校验项 | 失败处理 |
-| --- | --- | --- |
-| 1 需求分析 | 必备章节齐全 + REQ 编号与 PRD 覆盖对齐（遗漏/臆造即报错） | 错误清单**反馈给模型修正重出** |
-| 2 测试方案 | 必备章节（范围/策略/优先级/风险/环境/准入准出/用例量） | 同上 |
-| 3 用例生成 | JSON 可解析 + 字段强校验（id 唯一/枚举/非空/P0 必带 @smoke） | 同上 |
+> **未验证项（切勿假定可用）**：真实多模态视觉识别质量、真实 docx/PDF 语料、
+> 用例真实驱动 UI 的可执行性 —— 详见 [quality-evaluation.md](docs/quality-evaluation.md)。
 
-```bash
-# 默认开启：每阶段最多反馈修正 2 次，最终仍不过 → 整条流水线失败（退出码 1）
-prd2tc generate --prd <prd> --examples examples/
-# 调重试次数 / 容忍失败 / 完全关闭
-prd2tc generate --prd <prd> --max-gate-retries 3
-prd2tc generate --prd <prd> --allow-gate-fail     # 仅告警
-prd2tc generate --prd <prd> --no-gate             # 退回纯 prompt 自检
-```
-
-**三层约束体系**：① prompt 内"输出自检门"（引导模型自检）→ ② 机器门禁校验（程序强制）→ ③ 校验失败反馈重出（修正闭环）。阶段 3 的校验与 `prd2tc validate` 共用同一套规则。
-
-遇到门禁错误时，请先按错误类型判断是 PRD 事实缺失、模型输出不完整、数据契约错误还是 Provider/环境问题；不要默认修改 PRD。详细的判断标准、UI/CLI 操作和提交问题所需信息见 [门禁失败处理手册](docs/gate-troubleshooting.md)。
-
-约束模板的"学习约束"部分由 `src/prd2tc/constraints.py` 从检索到的参考示例动态生成（示例库模块/规模、优先级口径、常用标签、推断的设计方法、design_logic 要点），实现「静态原理 + 动态学习」双约束。
-
-**演进方向（规划）**：
-- 闭环学习：02 子项目测试执行结果（通过/失败）回写示例库，自动沉淀"验证过的好用例"；
-- 语义检索：在零依赖打分之上，可选接向量库（如 sqlite-vec/embedding API）提升相关性；
-- 生成后反馈：用例评审意见（Open Items）回流，迭代示例的 design_logic。
-
-## 质量保障
-
-- `prd2tc validate`：用例 JSON 强校验（与 `docs/case-template.md` 一致）。
-- `tests/`：14 个单元/端到端测试（含 stub 模式离线跑通全流程）。
-- 与配套的 Playwright 测试工程对齐：`check_coverage.py`（AiWebTestCenter/02-Playwright-Automation）校验用例 JSON ↔ Python 测试映射（P0 必达）。
-
-### 输出健壮性（针对推理型模型）
-
-实测 MiniMax-M3 在这套流程上有三个坑，均已针对性处理（`PRD2TC_*` 可调）：
-
-1. **`testData` 禁止嵌套**。契约收紧为「键=值」字符串数组（`["phone=13800138000"]`），
-   值只能是标量。嵌套对象/数组需要多层引号转义，实测导致模型在思考里反复自我纠错、
-   整轮输出归零。旧版 object 产物**仍可读取**（自动归一化）。
-2. **思考与产出分离**。M3 会把推理写进 `content` 的 `<think>`（部分端点走独立
-   `reasoning_content`），两者都会被单独统计：实时指标区分「思考中 / 产出中」，
-   `extract_cases` 优先从**剥离思考后的正文**提取，避免把思考里的示例 JSON 当产物。
-3. **预算耗尽自愈**。若输出被截断且正文为空、思考占满预算，系统会给出可行动诊断，
-   并把该批次**对半拆分重试**（最多 2 层）——原地重试同样大的批次几乎必然再次失败。
-
-`--markdown-transit`（或 `PRD2TC_MARKDOWN_TRANSIT=1`）可让阶段 3 改为输出 Markdown 表格、
-再由程序转成 JSON：表格没有引号嵌套，转义类失败从根上消失；实测同一内容字符数约省 50%，
-**落盘产物仍是 JSON，下游契约不变**。
+---
 
 ## 开源
 
-- License：MIT
-- 零第三方运行时依赖；仅需 Python 3.10+ 与一个 OpenAI 兼容 LLM 端点。
-- 目录结构：`src/prd2tc/`（cli/config/llm/loader/stages/validator/io）、`assets/`（内置 prompts/templates）、`tests/`、`skill/`（DSH agent 变体）、`docs/`、`output/`（生成产物）。
+- **License**：MIT
+- **依赖**：零第三方运行时依赖；仅需 Python 3.10+ 与一个 OpenAI 兼容（或 Anthropic / Ollama）端点
+- **目录结构**：
 
-## 生态相关项目（AiWebTestCenter）
+  ```
+  src/prd2tc/           核心包（CLI / 编排 / 摄取 / 门禁 / 导出 / 服务）
+  src/prd2tc/assets/    安装包内置的 prompts 与 templates 副本
+  prompts/  templates/  提示词与模板（仓库内优先）
+  tests/                后端测试（33 个文件）
+  ui/                   React + antd 工作台（含前端测试）
+  examples/             示例 PRD 与示例库
+  docs/                 设计与使用文档
+  ```
 
-本工具是 [AiWebTestCenter](https://github.com/Adam-byxiao) 测试体系的一员，独立可发布、也可嵌入整体方案：
+### 生态相关项目（AiWebTestCenter）
 
-- 生成用例 → 配套 Playwright 测试工程（pytest-playwright）按 `TC-*` 编号实现并执行 → CI/CD 跑回归与门禁。
-- 用例 JSON 的 `steps[].action/target` 与 `expected` 为「JSON → Python 测试骨架生成器」的输入约定。
-- 示例库 `examples/youxuan-mall-examples.json` 由真实项目产出提炼，可作为团队测试设计逻辑的沉淀载体。
+本工具是 AiWebTestCenter 测试体系的一员，**独立可发布**，也可嵌入整体方案：
+
+- 生成用例 → 配套 Playwright 测试工程按 `TC-*` 编号实现并执行 → CI/CD 跑回归与门禁。
+- 用例 JSON 的 `steps[].action/target` 与 `expected` 是「JSON → Python 测试骨架生成器」的输入约定。
+- `examples/youxuan-mall-examples.json` 由真实项目产出提炼，可作为团队测试设计逻辑的沉淀载体。

@@ -187,7 +187,7 @@ def render_cases_md(cases: list[dict], plan_title: str = "") -> str:
     lines = [
         f"# 用例集（评审稿）{'：' + plan_title if plan_title else ''}",
         "",
-        "> 由 prd2tc 自动生成，字段规范见 docs/case-template.md；机读源为 cases/cases/*.json。",
+        "> 由 prd2tc 自动生成，字段规范见 docs/case-spec.md；机读源为 cases/cases/*.json。",
         "",
         "## 1. 统计概览",
         "",

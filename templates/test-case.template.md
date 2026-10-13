@@ -1,6 +1,6 @@
 # 用例模板（Markdown 评审稿中的单条用例摘要）
 
-字段规范见 `docs/case-template.md`（JSON 为机读标准，本模板用于人读评审）。
+字段规范见 `docs/case-spec.md`（JSON 为机读标准，本模板用于人读评审）。
 
 ```markdown
 ### TC-AUTH-LOGIN-001 正确凭据登录成功并跳转首页
