@@ -70,7 +70,23 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
 }){
   const [busy,setBusy]=useState<string>('');
   const [dirty,setDirty]=useState<Record<string,boolean>>({});
+  /** 已展开产物面板的阶段。
+   *
+   *  **必须是受控状态**：Collapse 若不受控，「查看产物」按钮就无法从外部展开它 ——
+   *  按钮只能去改一个无人消费的状态，点击后界面毫无反应（实测的真实缺陷）。
+   *  用数组而非单值：允许多个阶段同时展开，便于对比（如分析 vs 方案）。 */
+  const [expanded,setExpanded]=useState<Stage[]>([]);
   const isCurrent=(s:Stage)=>run.currentStage===s;
+
+  /** 展开某阶段的产物面板，并把视图滚动到该卡片。 */
+  const openArtifact=(s:Stage)=>{
+    setExpanded(current=>current.includes(s)?current:[...current,s]);
+    onStageChange(s);
+    // jsdom 没有 scrollIntoView（用可选调用兜住），真实浏览器里才滚动
+    window.requestAnimationFrame(()=>{
+      document.getElementById(`stage-card-${s}`)?.scrollIntoView?.({block:'nearest'});
+    });
+  };
 
   /** 确认并进入下一步。
    *
@@ -107,7 +123,9 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
       const hasOutput=['awaiting_review','approved','succeeded'].includes(phase);
       const canConfirm=phase==='awaiting_review'&&isCurrent(info.key);
       const canRegenerate=!runningSomewhere&&['approved','succeeded','failed','awaiting_review','rejected'].includes(phase);
-      return <Card key={info.key} size="small"
+      const isOpen=expanded.includes(info.key);
+      return <Card key={info.key} id={`stage-card-${info.key}`} size="small"
+        style={stage===info.key?{borderColor:'#1677ff'}:undefined}
         title={<Space>{iconFor(phase)}<Typography.Text strong>{info.title}</Typography.Text>
           <Tag color={label.color}>{label.text}</Tag>
           {dirty[info.key]&&<Tag color="gold">有未保存修改</Tag>}</Space>}
@@ -115,7 +133,7 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
           {meta?.durationMs?<Tooltip title="该阶段耗时"><span className="metrics-muted">{fmtMs(meta.durationMs)}</span></Tooltip>:null}
           {meta?.model?<Tooltip title="该阶段使用的模型"><span className="metrics-muted">{meta.model}</span></Tooltip>:null}
           {meta?.tokens?<Tooltip title="该阶段消耗 token"><span className="metrics-muted">{fmtTokens(meta.tokens)} tok</span></Tooltip>:null}
-          {hasOutput&&<Button size="small" onClick={()=>onStageChange(info.key)}>查看产物</Button>}
+          {hasOutput&&<Button size="small" onClick={()=>openArtifact(info.key)}>{isOpen?'收起产物':'查看产物'}</Button>}
           {canRegenerate&&<Popconfirm title={`重跑「${info.title}」？`}
             description={index<2?'该阶段及其下游产物会被丢弃并重新生成；上游不受影响。':'用例产物会被丢弃并重新生成；上游分析与方案不受影响。'}
             okText="重跑" cancelText="取消" onConfirm={()=>regenerate(info.key)}>
@@ -139,12 +157,20 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
           </Space>}/>}
         {phase==='pending'&&runningSomewhere&&isCurrent(info.key)&&
           <Typography.Text type="secondary">正在准备…</Typography.Text>}
-        {(hasOutput||phase==='failed')&&<Collapse ghost size="small" style={{marginTop:4}} items={[{
-          key:'artifact',
-          label:phase==='failed'?'查看失败输出':'查看 / 编辑产物',
-          children:<StageEditor runId={run.taskId} stage={info.key}
-            onDirtyChange={(value)=>setDirty(current=>({...current,[info.key]:value}))}/>,
-        }]}/>}
+        {(hasOutput||phase==='failed')&&<Collapse ghost size="small" style={{marginTop:4}}
+          activeKey={isOpen?['artifact']:[]}
+          onChange={(keys)=>{
+            const open=Array.isArray(keys)?keys.includes('artifact'):keys==='artifact';
+            setExpanded(current=>open
+              ?(current.includes(info.key)?current:[...current,info.key])
+              :current.filter(x=>x!==info.key));
+          }}
+          items={[{
+            key:'artifact',
+            label:phase==='failed'?'查看失败输出':'查看 / 编辑产物',
+            children:<StageEditor runId={run.taskId} stage={info.key}
+              onDirtyChange={(value)=>setDirty(current=>({...current,[info.key]:value}))}/>,
+          }]}/>}
       </Card>;
     })}
     <Descriptions size="small" column={1} style={{marginTop:-8}}>

@@ -1,6 +1,34 @@
 import axios from 'axios'; import type {CaseFacets,CaseSelection,Prd,Run,Stage,UploadBundle} from './types';
 import {selectionActive} from './types';
-export const api=axios.create({baseURL:'/api/v1',timeout:120000});
+
+/** 查询参数序列化：数组用**重复键**，不用 axios 默认的 `key[]=`。
+ *
+ *  为什么必须自定义：axios 默认把数组序列化成 `modules[]=KB&modules[]=AGENT`，
+ *  而后端（FastAPI `List[str] = Query(None)`）只认 `modules=KB&modules=AGENT`。
+ *  实测后果：后端**完全收不到** modules/priorities/tags → 视为无筛选
+ *  → 用户明明选了条件，导出却仍是全量。
+ *
+ *  顺带统一两条约定：
+ *    - 空数组**不发参数**（空集合的语义是「什么都不要」，而我们要的是「该维度不限」）；
+ *    - `undefined`/`null`/空串同样不发（避免后端把 `""` 当成有效取值。 */
+const serializeParams=(params:Record<string,any>):string=>{
+  const search=new URLSearchParams();
+  for(const [key,value] of Object.entries(params||{})){
+    if(value===undefined||value===null||value==='')continue;
+    if(Array.isArray(value)){
+      for(const item of value){
+        if(item===undefined||item===null||item==='')continue;
+        search.append(key,String(item));
+      }
+    }else{
+      search.append(key,String(value));
+    }
+  }
+  return search.toString();
+};
+
+export const api=axios.create({baseURL:'/api/v1',timeout:120000,
+  paramsSerializer:{serialize:serializeParams}});
 /** 当前浏览器里保存的 LLM 会话（由「模型配置」写入）。
  *
  *  为什么每个变更操作都要带上它：会话是**服务端内存态**、随重启失效，

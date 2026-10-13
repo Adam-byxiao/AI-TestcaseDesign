@@ -6,10 +6,17 @@ import {runApi} from '../api'; import type {Case,Requirement,Stage} from '../typ
 export default function StageEditor({runId,stage,refreshToken,onDirtyChange}:{runId:string;stage:Stage;refreshToken?:string;onDirtyChange?:(dirty:boolean)=>void}){
   const [markdown,setMarkdown]=useState(''); const [rows,setRows]=useState<any[]>([]);
   const [files,setFiles]=useState<any[]>([]); const [trace,setTrace]=useState<any>(); const [loading,setLoading]=useState(false); const loadedRef=useRef(false);
-  // 保存前的原始快照：用于判断「是否有未保存修改」并驱动父级的提示。
   // 这里刻意不做自动保存 —— 用户可能只是想看看，而非改动。
   const [dirty,setDirty]=useState(false);
-  useEffect(()=>{onDirtyChange?.(dirty)},[dirty,onDirtyChange]);
+  /** 向上通报未保存状态。
+   *
+   *  ⚠ 必须把回调放进 ref 并**只依赖 `dirty`**：父级通常传内联箭头函数，
+   *  每次渲染都是新引用。若直接写进依赖数组，就会
+   *  「effect 触发 → setState → 重渲染 → 新回调 → effect 再触发」**无限循环**
+   *  （实测：面板一展开页面即卡死。此前面板无法展开，所以这个缺陷被隐藏了很久）。 */
+  const dirtyCallbackRef=useRef(onDirtyChange);
+  dirtyCallbackRef.current=onDirtyChange;
+  useEffect(()=>{dirtyCallbackRef.current?.(dirty)},[dirty]);
   const [selectedCase,setSelectedCase]=useState<string>();
   const [selectedRequirement,setSelectedRequirement]=useState<string>();
   /** 行的**稳定标识**。
