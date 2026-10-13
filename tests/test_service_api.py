@@ -26,7 +26,14 @@ def _stub_probe(monkeypatch, *, ok=True, kind="ok", message="连接成功，端�
                                                       endpoint=(cfg.api_base or "") + "/chat/completions"))
 
 
-def wait_for(client, run_id, wanted, timeout=8):
+def wait_for(client, run_id, wanted, timeout=20):
+    """轮询直到运行进入目标状态。
+
+    超时从 8s 放宽到 20s：stub 三阶段要跑线程池、写多个产物并做文件锁，
+    在整文件并发执行（多个 TestClient/线程池同时活动）时可能超过 8s ——
+    实测出现过「单跑通过、整文件失败」的假失败。放宽只为消除该噪声，
+    真实卡死仍会被 pytest 的用例超时兜住。
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         data = client.get(f"/api/v1/runs/{run_id}").json()
@@ -469,6 +476,123 @@ def test_resume_and_retry_accept_fresh_session(client, monkeypatch):
     resp = client.post(f"/api/v1/runs/{run['taskId']}/resume", json={"sessionId": stale})
     assert resp.status_code == 401, resp.text
     assert "过期" in resp.json()["detail"], resp.json()
+
+
+def test_export_filename_is_sanitized(client, tmp_path):
+    """**核心回归**：下载名来自查询参数，必须清洗后才能进 Content-Disposition。
+
+    未清洗时 `"` 或换行可造成**响应头注入**，`../` 可能被客户端当作路径。
+    """
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True, "jobs": 1}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve", json={})
+    wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/plan/approve", json={})
+    wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+
+    resp = client.get(f"/api/v1/exports/{run['taskId']}/excel",
+                      params={"filename": "我的用例集"})
+    assert resp.status_code == 200, resp.text
+    disposition = resp.headers["content-disposition"]
+    assert "我的用例集.xlsx" in disposition or "%E6%88%91" in disposition, disposition
+
+    # 路径穿越/引号/换行都必须被清洗
+    bad = client.get(f"/api/v1/exports/{run['taskId']}/excel",
+                     params={"filename": '../../etc/pa"ss\nwd'})
+    assert bad.status_code == 200
+    header = bad.headers["content-disposition"]
+    assert "\n" not in header and header.count('"') <= 2, header
+    assert "passwd.xlsx" in header or "pa_ss_wd.xlsx" in header, header
+
+
+def test_export_rejects_unknown_options(client):
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True, "jobs": 1}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    assert client.get(f"/api/v1/exports/{run['taskId']}/pdf").status_code == 400
+    assert client.get(f"/api/v1/exports/{run['taskId']}/xmind",
+                      params={"xmind_mode": "bogus"}).status_code == 400
+
+
+def test_run_exposes_stage_meta(client):
+    """三个阶段要**分开呈现**，因此运行详情需暴露逐阶段元数据（耗时/模型/token）。"""
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True, "jobs": 1}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    detail = client.get(f"/api/v1/runs/{run['taskId']}").json()
+    assert "stageMeta" in detail, detail.keys()
+    assert "analysis" in (detail["stageMeta"] or {}), detail.get("stageMeta")
+
+
+def test_regenerate_stage_reruns_only_that_stage(client, tmp_path):
+    """**核心价值**：单独重跑某阶段，保留其它阶段产物（不必整轮重来）。"""
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True, "jobs": 1}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    root = Path(client.get(f"/api/v1/runs/{run['taskId']}").json()["output"])
+    plan = root / "plan" / "测试方案.md"
+
+    # 先把三个阶段都跑完，得到完整产物
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve", json={})
+    wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/plan/approve", json={})
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    assert run.get("currentStage") == "cases", run
+    assert plan.is_file()
+    plan_mtime = plan.stat().st_mtime
+    analysis_before = (root / "analysis" / "requirements.json").read_text(encoding="utf-8")
+
+    # 重跑阶段 3：只应丢弃用例产物
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/stages/cases/regenerate", json={})
+    assert resp.status_code == 200, resp.text
+    assert plan.stat().st_mtime == plan_mtime, "阶段 2 产物不应被动"
+    assert (root / "analysis" / "requirements.json").read_text(encoding="utf-8") == analysis_before
+    after = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    assert after["status"] != "failed", after.get("errors")
+
+
+def test_regenerate_analysis_discards_downstream(client):
+    """重跑上游阶段必须**一并丢弃下游**产物 —— 否则下游与新上游不自洽。"""
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True, "jobs": 1}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    root = Path(client.get(f"/api/v1/runs/{run['taskId']}").json()["output"])
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve", json={})
+    wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/plan/approve", json={})
+    wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    assert (root / "plan" / "测试方案.md").is_file()
+
+    resp = client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/regenerate", json={})
+    assert resp.status_code == 200, resp.text
+    discarded = resp.json().get("discarded") or []
+    assert any("plan" in d for d in discarded), discarded
+    assert not (root / "plan" / "测试方案.md").exists(), "下游产物应被丢弃"
+
+
+def test_regenerate_rejects_bad_stage_and_running_run(client):
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True, "jobs": 1}).json()
+    assert client.post(f"/api/v1/runs/{run['taskId']}/stages/nope/regenerate",
+                       json={}).status_code == 400
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    # 等待审阅时不算「进行中」，可以重跑；构造一个进行中的状态来验证 409
+    _store_of(client).save_task(run["taskId"], status="running")
+    assert client.post(f"/api/v1/runs/{run['taskId']}/stages/cases/regenerate",
+                       json={}).status_code == 409
 
 
 def _workspace_of(client) -> Path:

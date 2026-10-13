@@ -65,6 +65,24 @@ def _decode_prd(value):
     return Path(text)
 
 
+def _download_name(requested: str, fallback: str, fmt: str) -> str:
+    """把用户给的文件名清洗成安全的下载名。
+
+    为什么必须清洗：该值直接进入 `Content-Disposition` 响应头。
+    未清洗时 `"` 或换行可造成**响应头注入**，`../` 可能被部分客户端当作路径。
+    因此：只取基名、剔除控制字符与引号、强制正确扩展名；清洗后为空则回退默认名。
+    """
+    ext = ".xlsx" if fmt == "excel" else ".xmind"
+    name = Path(str(requested or "")).name.strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    if not name:
+        return fallback
+    if name.lower().endswith((".xlsx", ".xmind")):
+        name = name.rsplit(".", 1)[0]
+    name = name.strip(" .")[:120] or Path(fallback).stem
+    return f"{name}{ext}"
+
+
 def _credential_error(*, stub: bool, dry_run: bool, requires_key: bool, has_key: bool,
                       session_id: str | None, session_alive: bool) -> str | None:
     """凭证问题的**可操作**提示；无问题返回 None。
@@ -654,6 +672,15 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         if live is not None:
             snapshot = live.snapshot(force=True)
             if snapshot is not None: data["metrics"] = {**snapshot, "runId": run_id}
+        # 逐阶段元数据（耗时/模型/token/门禁）：前端把三个阶段**分开呈现**时需要，
+        # 否则只能显示一个全局 0-100% 进度条，看不出每个阶段各自发生了什么。
+        # 同时带出 product/version —— 它们只存在于运行清单里，而导出对话框
+        # 需要它们生成有意义的默认文件名。
+        if data.get("output"):
+            manifest = store._json(Path(data["output"]) / "run-manifest.json", {}) or {}
+            data["stageMeta"] = manifest.get("stages") or {}
+            data["product"] = manifest.get("product") or ""
+            data["version"] = manifest.get("version") or ""
         data["events"] = store.event_list(run_id)[-100:]; return data
     @app.get("/api/v1/runs/{run_id}/events")
     def get_events(run_id: str): return store.event_list(run_id)
@@ -740,6 +767,89 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         if runner is not None: runner.cancel()
         store.event(run_id, type="run_cancelled", status="cancelled", percent=0, message="已请求取消")
         return store.save_task(run_id, status="cancelled", currentStage="cancelled")
+    # 阶段序号 ↔ 语义名（与 stage_name / STAGES 对齐）
+    _STAGE_NO = {"analysis": "1", "plan": "2", "cases": "3"}
+    # 重跑某阶段时，需要**一并丢弃**的下游产物（下游依赖它，留着必然不自洽）
+    _STAGE_DOWNSTREAM = {
+        "analysis": ("analysis", "plan", "cases"),
+        "plan": ("plan", "cases"),
+        "cases": ("cases",),
+    }
+
+    @app.post("/api/v1/runs/{run_id}/stages/{stage}/regenerate")
+    def regenerate_stage(run_id: str, stage: str, body: dict | None = None):
+        """**单独重跑一个阶段**（保留其它阶段的产物）。
+
+        为什么需要：此前只能「整轮重跑」或「重试失败模块」。想换一份更好的测试方案，
+        就必须从头再来一次分析 —— 即便分析结果完全没问题。
+
+        语义：
+          - 丢弃该阶段**及其下游**的产物与检查点（下游依赖它，留着会不自洽）；
+          - 上游产物保持不变，因此不重新消耗上游 token；
+          - 重置模块状态与检查点，确保阶段 3 真正重新生成而不是复用旧结果。
+        """
+        task = store.task(run_id)
+        if not task: raise HTTPException(404, "运行不存在")
+        if stage not in STAGES: raise HTTPException(400, "stage 必须为 analysis、plan 或 cases")
+        if task.get("status") in {"pending", "running"}:
+            raise HTTPException(409, "运行进行中，请先取消再重跑该阶段")
+        if not task.get("output"): raise HTTPException(409, "该运行尚无产物，无法重跑阶段")
+        _session, sid = _resolve_session(task, (body or {}).get("sessionId"))
+        output = _safe_output(task)
+
+        discarded: list[str] = []
+        for name in _STAGE_DOWNSTREAM[stage]:
+            if name == "cases":
+                # 用例产物分散在 cases/cases、检查点、失败样本与追踪矩阵
+                for rel in ("cases/cases", "cases/.checkpoints", "cases/.failures",
+                            "cases/traceability.json", "cases/用例集.md",
+                            "cases/用例集.xlsx", "cases/用例集.xmind"):
+                    discarded.extend(_discard(output / rel))
+            else:
+                discarded.extend(_discard(output / name))
+        # 下游阶段状态与模块状态一并清空，避免 UI 显示「已确认」而产物已被丢弃
+        states = {k: v for k, v in (task.get("stageStates") or {}).items()
+                  if k not in _STAGE_DOWNSTREAM[stage]}
+        if stage in states:
+            states.pop(stage, None)
+        states[stage] = "pending"
+        store.save_task(run_id, status="pending", currentStage=stage, failedStage=None,
+                        stageStates=states, errors=[], modules={}, sessionId=sid)
+        # run-state 里的 modules 决定阶段 3 是否会复用检查点，必须重置
+        state_path = output / "run-state.json"
+        if state_path.is_file():
+            current_state = store._json(state_path, {}) or {}
+            current_state.update({"modules": {}, "status": "running", "stage": stage})
+            store.save_json(state_path, current_state)
+        store.event(run_id, stage=stage, type="stage_regenerate",
+                    status="pending", percent=0,
+                    message=f"重跑阶段 {stage}（已丢弃 {len(discarded)} 项下游产物）")
+        # resume=True：复用**上游**产物与检查点；本阶段产物已删除，必然重新生成
+        req = request_from(task["request"], _STAGE_NO[stage], True)
+        executor.submit(run_task, run_id, req, sid, True)
+        return {**store.task(run_id), "discarded": discarded}
+
+    def _safe_output(task: dict) -> Path:
+        output = Path(task["output"]).resolve()
+        if root not in output.parents and output != root:
+            raise HTTPException(400, "非法产物路径")
+        return output
+
+    def _discard(path: Path) -> list[str]:
+        """删除产物文件或目录，返回实际删除的相对路径（供审计与前端提示）。"""
+        if not path.exists(): return []
+        removed: list[str] = []
+        try:
+            if path.is_dir():
+                removed = [str(p.relative_to(root)) for p in sorted(path.rglob("*")) if p.is_file()]
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                removed = [str(path.relative_to(root))]
+                path.unlink(missing_ok=True)
+        except OSError:
+            return []
+        return removed
+
     @app.post("/api/v1/runs/{run_id}/resume")
     def resume_run(run_id: str, body: dict | None = None):
         task = store.task(run_id)
@@ -774,25 +884,36 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         return PlainTextResponse(target.read_text(encoding="utf-8"))
 
     @app.get("/api/v1/exports/{run_id}/{fmt}")
-    def download_export(run_id: str, fmt: str):
+    def download_export(run_id: str, fmt: str, filename: str = "",
+                        xmind_mode: str = "case", sheet_name: str = "用例明细"):
         """按需生成并返回导出文件（fmt: excel | xmind）。
 
         输出目录固定在运行产物内，不接受外部路径参数，因此无需 _safe 校验（无穿越面）。
+
+        `filename` 允许自定义下载名（前端「另存为」用）——
+        但**必须清洗**：它直接进 Content-Disposition，未清洗会形成响应头注入，
+        且 `../` 之类可能被某些客户端当作路径。故只保留基名、剔除控制字符，
+        并强制使用该格式的正确扩展名。
+        `xmind_mode`（case/full/module）与 `sheet_name` 让用户能控制导出的粒度与表名。
         """
         if fmt not in {"excel", "xmind"}: raise HTTPException(400, f"不支持的格式: {fmt}")
+        if xmind_mode not in {"case", "full", "module"}:
+            raise HTTPException(400, f"不支持的 xmind_mode: {xmind_mode}")
         require_id(run_id, "runId")
         task = store.task(run_id)
         if not task: raise HTTPException(404, "运行不存在")
-        output = Path(task.get("output") or "").resolve()
+        output = _safe_output(task)
         cases_dir = output / "cases" / "cases"
         if not cases_dir.is_dir(): raise HTTPException(404, "该运行尚无用例产物")
         from prd2tc.export import export_cases, MEDIA_TYPES
         try:
-            result = export_cases(cases_dir=cases_dir, formats=[fmt], out=None, root=output)
+            result = export_cases(cases_dir=cases_dir, formats=[fmt], out=None, root=output,
+                                  xmind_mode=xmind_mode, sheet_name=sheet_name or "用例明细")
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(400, format_exception(exc)) from exc
         path = Path(result["files"][0])
-        return FileResponse(path, media_type=MEDIA_TYPES[fmt], filename=path.name)
+        return FileResponse(path, media_type=MEDIA_TYPES[fmt],
+                            filename=_download_name(filename, path.name, fmt))
     @app.websocket("/api/v1/runs/{run_id}/events")
     @app.websocket("/api/v1/runs/{run_id}/events/ws")
     async def events_ws(websocket: WebSocket, run_id: str):

@@ -20,5 +20,59 @@ const uploadPrd=(files:File[])=>{
   return api.post<Prd>('/prds',f).then(r=>r.data);
 };
 export const prdApi={list:()=>api.get<Prd[]>('/prds').then(r=>r.data),get:(id:string)=>api.get<Prd&{content:string}>(`/prds/${id}`).then(r=>r.data),upload:(file:File)=>uploadPrd([file]),uploadMany:uploadPrd,update:(id:string,content:string)=>api.put<Prd>(`/prds/${id}`,{content}).then(r=>r.data),reanalyze:(id:string,body:any={})=>api.post(`/prds/${id}/reanalyze`,body).then(r=>r.data)};
-export const runApi={list:()=>api.get<Run[]>('/runs').then(r=>r.data),get:(id:string)=>api.get<Run>(`/runs/${id}`).then(r=>r.data),create:(body:any)=>api.post<Run>('/runs',body).then(r=>r.data),events:(id:string)=>api.get<any[]>(`/runs/${id}/events`).then(r=>r.data),saveDraft:(id:string,stage:Stage,body:any)=>api.put(`/runs/${id}/stages/${stage}`,body).then(r=>r.data),approve:(id:string,stage:Stage)=>api.post(`/runs/${id}/stages/${stage}/approve`,{sessionId:sid()}).then(r=>r.data),reject:(id:string,stage:Stage,reason:string)=>api.post(`/runs/${id}/stages/${stage}/reject`,{reason}).then(r=>r.data),resume:(id:string)=>api.post(`/runs/${id}/resume`,{sessionId:sid()}).then(r=>r.data),cancel:(id:string)=>api.post(`/runs/${id}/cancel`).then(r=>r.data),retryModule:(id:string,module:string)=>api.post(`/runs/${id}/modules/${module}/retry`,{sessionId:sid()}).then(r=>r.data),artifacts:(id:string)=>api.get(`/runs/${id}/artifacts`).then(r=>r.data),artifact:(id:string,path:string)=>api.get(`/runs/${id}/artifacts/${path}`).then(r=>r.data)};
+export const runApi={list:()=>api.get<Run[]>('/runs').then(r=>r.data),get:(id:string)=>api.get<Run>(`/runs/${id}`).then(r=>r.data),create:(body:any)=>api.post<Run>('/runs',body).then(r=>r.data),events:(id:string)=>api.get<any[]>(`/runs/${id}/events`).then(r=>r.data),saveDraft:(id:string,stage:Stage,body:any)=>api.put(`/runs/${id}/stages/${stage}`,body).then(r=>r.data),approve:(id:string,stage:Stage)=>api.post(`/runs/${id}/stages/${stage}/approve`,{sessionId:sid()}).then(r=>r.data),reject:(id:string,stage:Stage,reason:string)=>api.post(`/runs/${id}/stages/${stage}/reject`,{reason}).then(r=>r.data),resume:(id:string)=>api.post(`/runs/${id}/resume`,{sessionId:sid()}).then(r=>r.data),cancel:(id:string)=>api.post(`/runs/${id}/cancel`).then(r=>r.data),retryModule:(id:string,module:string)=>api.post(`/runs/${id}/modules/${module}/retry`,{sessionId:sid()}).then(r=>r.data),regenerateStage:(id:string,stage:Stage)=>api.post(`/runs/${id}/stages/${stage}/regenerate`,{sessionId:sid()}).then(r=>r.data),artifacts:(id:string)=>api.get(`/runs/${id}/artifacts`).then(r=>r.data),artifact:(id:string,path:string)=>api.get(`/runs/${id}/artifacts/${path}`).then(r=>r.data)};
+/** 导出选项：文件名与 XMind 粒度由用户决定（此前是固定文件名 + 强制直接下载）。 */
+export interface ExportOptions { filename?:string; xmindMode?:'case'|'full'|'module'; sheetName?:string; }
+/** 导出文件的默认名（含日期，便于同一天多次导出时不互相覆盖）。 */
+export function defaultExportName(product:string,version:string,fmt:'excel'|'xmind',when=new Date()):string{
+  const stamp=`${when.getFullYear()}${String(when.getMonth()+1).padStart(2,'0')}${String(when.getDate()).padStart(2,'0')}`;
+  const base=[product,version,'用例集'].filter(Boolean).join('-')||'用例集';
+  return `${base}-${stamp}.${fmt==='excel'?'xlsx':'xmind'}`;
+}
+
+/** 拉取导出文件为 Blob。
+ *  不走 `window.open`：那样无法自定义文件名、无法选择保存位置，
+ *  也无法感知成功/失败（浏览器会静默把错误页存成文件）。 */
+export async function fetchExport(id:string,fmt:'excel'|'xmind',options:ExportOptions={}):Promise<Blob>{
+  const response=await api.get(`/exports/${encodeURIComponent(id)}/${fmt}`,{
+    responseType:'blob',
+    params:{filename:options.filename||undefined,xmind_mode:options.xmindMode||undefined,sheet_name:options.sheetName||undefined},
+  });
+  return response.data as Blob;
+}
+
+/** 浏览器是否支持「另存为」对话框（可选择位置与文件名）。Chrome/Edge 支持，Firefox/Safari 不支持。 */
+export const canPickSaveLocation=()=>typeof (window as any).showSaveFilePicker==='function';
+
+export type SaveOutcome='saved'|'downloaded'|'cancelled';
+
+/** 保存 Blob：优先弹出「另存为」（可选位置与名字），否则回退为普通下载。
+ *
+ *  回退路径仍比原先好：用 `<a download>` 明确指定文件名，而不是依赖
+ *  `Content-Disposition` 且无法改名。 */
+export async function saveBlob(blob:Blob,filename:string,fmt:'excel'|'xmind'):Promise<SaveOutcome>{
+  const picker=(window as any).showSaveFilePicker;
+  if(typeof picker==='function'){
+    try{
+      const handle=await picker({
+        suggestedName:filename,
+        types:[fmt==='excel'
+          ?{description:'Excel 工作簿',accept:{'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':['.xlsx']}}
+          :{description:'XMind 思维导图',accept:{'application/vnd.xmind.workbook':['.xmind']}}],
+      });
+      const writable=await handle.createWritable();
+      await writable.write(blob); await writable.close();
+      return 'saved';
+    }catch(error:any){
+      // 用户在系统对话框里点了取消 —— 不是错误，不应弹错误提示
+      if(error?.name==='AbortError')return 'cancelled';
+      // 其它异常（权限/磁盘）回退到下载，保证用户仍能拿到文件
+    }
+  }
+  const url=URL.createObjectURL(blob);
+  const anchor=document.createElement('a');
+  anchor.href=url; anchor.download=filename; document.body.appendChild(anchor); anchor.click();
+  anchor.remove(); window.setTimeout(()=>URL.revokeObjectURL(url),1000);
+  return 'downloaded';
+}
 export const llmApi={session:(body:any)=>api.post('/sessions/llm-config',body).then(r=>r.data),verify:(body:any)=>api.post('/sessions/llm-config/verify',body).then(r=>r.data)};
