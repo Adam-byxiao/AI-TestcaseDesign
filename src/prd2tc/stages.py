@@ -137,7 +137,9 @@ def field_spec(allowed_modules: set[str] | None = None) -> str:
     return (
         "用例 JSON 字段约束（必须遵守）：\n"
         f"{module_line}\n"
-        f"- priority ∈ {PRIORITIES}；P0 必须带 @smoke 标签\n"
+        f"- priority ∈ {PRIORITIES}（P0=业务关键/写操作防护；P1=主要功能；P2=边界与次要）\n"
+        f"- **不要输出 @smoke 标签**：冒烟集由系统按规则统一判定"
+        f"（P0 中每需求 1 条、排除边界与异常），你标的会被覆盖\n"
         f"- id 格式 TC-<MOD>[-<SUB>]-<3位序号>，全局唯一（id 前缀必须与 module 一致）\n"
         f"- requirement 为 REQ-* 编号数组（只能引用本模块真实存在的 REQ）\n"
         f"- steps[].action 只能取自下列动作（**按语义选词**，不要一律用 check）：\n"

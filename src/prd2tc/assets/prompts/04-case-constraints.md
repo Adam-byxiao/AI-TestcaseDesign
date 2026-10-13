@@ -32,7 +32,9 @@
    - 用例互相依赖 / 共享可变状态；
    - 重复用例（同步骤 + 同预期）；
    - 为凑数量生成的同质用例。
-6. **标签口径**：P0 必带 `@smoke`；全量带 `@regression`；按模块带模块标签（@auth/@cart/@checkout…）。
+6. **标签口径**：全量带 `@regression`；按模块带模块标签（@auth/@cart/@checkout…）。
+   **不要输出 `@smoke`** —— 它表示「部署后最先跑的最小集合」，由系统统一判定
+   （P0 中每需求 1 条、排除边界与异常、总量 ≤ 20%），你标的会被覆盖。
 7. **不输出思考过程**：禁止输出 `<think>` 之类的推理标签，直接输出最终 JSON；思考会占用输出预算，导致 JSON 被截断。
 8. **输出前自检**：对照校验规则自查（id 格式 TC-<MOD>-<SEQ>、module/priority 枚举、requirement 为 REQ-*、steps/expected 非空、id 全局唯一、testData 全为「键=值」标量），再输出 JSON。
 

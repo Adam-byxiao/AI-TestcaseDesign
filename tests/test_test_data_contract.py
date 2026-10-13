@@ -75,8 +75,10 @@ def test_step_data_must_be_scalar():
 
 
 def _case(**over):
+    # 注意：**不要**给 P1 用例加 `@smoke` —— 该标签只能标在 P0 上
+    # （@smoke = 冒烟集 = P0 的真子集，见 tests/test_validator.py）
     base = {"id": "TC-A-001", "module": "A", "title": "t", "design_method": "场景法", "priority": "P1",
-            "tags": ["@smoke"], "requirement": ["REQ-A-001"],
+            "tags": ["@regression"], "requirement": ["REQ-A-001"],
             "steps": [{"action": "goto", "target": "/", "data": ""},
                   {"action": "expectVisible", "target": "页面主体", "data": ""}],
             "expected": ["页面成功渲染并显示预期内容"]}

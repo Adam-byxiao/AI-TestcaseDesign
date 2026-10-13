@@ -156,8 +156,14 @@ def validate_case(case: dict, index: int, seen_ids: set[str], allowed_modules: s
     tags = case.get("tags")
     if not isinstance(tags, list) or len(tags) == 0:
         errors.append(f"{at} tags 为空")
-    if case.get("priority") == "P0" and (not isinstance(tags, list) or "@smoke" not in tags):
-        errors.append(f"{at} P0 用例必须含 @smoke 标签")
+    # `@smoke` 的**方向**很关键：不是「P0 必带」，而是「只有 P0 才可带」。
+    # 此前规则写成「P0 必带 @smoke」，使该标签与 P0 1:1 等同、不承载任何信息，
+    # 实测评测 v2 的冒烟集膨胀到全部用例的 74%、v3 达 25%。
+    # 现在 @smoke 是「冒烟集」——P0 的**真子集**（由 priority.select_smoke 判定）。
+    if isinstance(tags, list) and "@smoke" in tags and case.get("priority") != "P0":
+        errors.append(
+            f"{at} @smoke 只能标在 P0 用例上（当前 priority={case.get('priority') or '(空)'}）；"
+            f"@smoke 表示「部署后最先跑的最小集合」，是 P0 的子集而非全部 P0")
 
     reqs = case.get("requirement")
     if not isinstance(reqs, list) or len(reqs) == 0:
@@ -217,6 +223,8 @@ def validate_dir(cases_dir: str | Path, allowed_modules: set[str] | None = None,
     signatures: dict[str, str] = {}   # 签名 -> 首次出现的用例 id
     errors: list[str] = []
     total = 0
+    smoke_ids: list[str] = []
+    p0_ids: list[str] = []
     for f in sorted(d.glob("*.json")):
         try:
             raw = json.loads(f.read_text(encoding="utf-8").lstrip("\ufeff"))
@@ -236,9 +244,44 @@ def validate_dir(cases_dir: str | Path, allowed_modules: set[str] | None = None,
                                         require_design_method=require_design_method))
             if check_duplicates:
                 errors.extend(check_duplicate(case, at, signatures))
+            if case.get("priority") == "P0":
+                p0_ids.append(str(case.get("id") or at))
+            if isinstance(case.get("tags"), list) and "@smoke" in case["tags"]:
+                smoke_ids.append(str(case.get("id") or at))
         # 必须在外层文件循环内、内层用例循环外：放进内层会让 total 按 len(cases) 倍膨胀
         total += len(cases)
+
+    # 冒烟集的**全局**约束（单条用例层面看不出来，必须整体统计）
+    errors.extend(check_smoke_set(smoke_ids, p0_ids, total))
     return total, errors
+
+
+def check_smoke_set(smoke_ids: list[str], p0_ids: list[str], total: int) -> list[str]:
+    """校验冒烟集的整体规模。
+
+    `@smoke` = 部署后最先跑的**最小**集合。它的价值来自「小」——
+    一旦规模逼近全量，就丧失了「快速判断这个版本能不能继续测」的作用。
+    因此除单条用例的「只能标在 P0 上」之外，还要在**整体层面**约束：
+      1. 有 P0 用例时冒烟集不能为空（否则失去快速门禁的意义）；
+      2. 规模不得超过 `min(SMOKE_MAX, SMOKE_RATIO × 总数)`。
+    """
+    from prd2tc.priority import SMOKE_MAX, SMOKE_RATIO
+
+    errors: list[str] = []
+    if not p0_ids:
+        return errors
+    if not smoke_ids:
+        errors.append(f"冒烟集为空：存在 {len(p0_ids)} 条 P0 用例，但没有任何 @smoke —— "
+                      f"@smoke 表示「部署后最先跑的最小集合」，应当从 P0 中选取")
+        return errors
+    limit = max(1, min(SMOKE_MAX, int(total * SMOKE_RATIO)))
+    if len(smoke_ids) > limit:
+        errors.append(
+            f"冒烟集过大：{len(smoke_ids)} 条 @smoke 超过上限 {limit} 条"
+            f"（= min({SMOKE_MAX}, {int(SMOKE_RATIO * 100)}% × {total} 条用例)）；"
+            f"@smoke 是「最小可跑集合」，不是「全部 P0」——"
+            f"请只保留主干用例（每需求最多 1 条，排除边界与异常）")
+    return errors
 
 
 def check_duplicate(case: dict, at: str, signatures: dict[str, str]) -> list[str]:

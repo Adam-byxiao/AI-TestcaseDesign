@@ -15,7 +15,7 @@
 - **输出唯一格式**：单个 JSON 数组（可用 ```json 围栏包裹）；**不要输出 JSON 之外的任何字符**（不要解释、不要表格、不要 markdown 列表、**不要输出 `<think>` 思考过程**）。
 - **数据示例（格式唯一标准，字段与此完全一致，缺一不可）**：
   ```json
-  {"id":"TC-AUTH-LOGIN-001","module":"AUTH","subModule":"LOGIN","title":"正确凭据登录成功","design_method":"等价类划分","priority":"P0","tags":["@smoke","@regression","@auth"],"requirement":["REQ-AUTH-002"],"preconditions":["存在 normal 状态账号"],"testData":["phone=13800138000","password=123456"],"steps":[{"action":"goto","target":"/login","data":""},{"action":"fill","target":"手机号输入框","data":"13800138000"},{"action":"click","target":"登录按钮","data":""},{"action":"expectUrl","target":"/","data":""}],"expected":["登录成功后跳转首页"]}
+  {"id":"TC-AUTH-LOGIN-001","module":"AUTH","subModule":"LOGIN","title":"正确凭据登录成功","design_method":"等价类划分","priority":"P0","tags":["@regression","@auth"],"requirement":["REQ-AUTH-002"],"preconditions":["存在 normal 状态账号"],"testData":["phone=13800138000","password=123456"],"steps":[{"action":"goto","target":"/login","data":""},{"action":"fill","target":"手机号输入框","data":"13800138000"},{"action":"click","target":"登录按钮","data":""},{"action":"expectUrl","target":"/","data":""}],"expected":["登录成功后跳转首页"]}
   ```
 - **JSON 合法性（最易出错，务必遵守）**：
   - `testData` 只能是「键=值」字符串数组，**值必须是标量**（数字/布尔/短文本）；**禁止嵌套对象或数组**（如 `{"tool":{"params":[...]}}` 这类结构会因引号转义把整份 JSON 写坏，导致整轮输出作废）；
@@ -23,4 +23,4 @@
   - 字符串内**不要出现真实换行**，需要分隔用「；」；
   - 复杂/多值的测试数据不要塞进 `testData`，改写进 `preconditions` 的纯文本描述。
 - **禁止**：不要输出非 JSON 内容；不要重复用例；不要臆造需求编号（requirement 必须是 PRD 中真实存在的 REQ-*）。
-- **自检**：id 唯一且格式 `TC-<MOD>-<SEQ>`？P0 是否带 @smoke？requirement 是否全部为 REQ-*？steps/expected 是否非空？testData 是否全部为「键=值」标量？design_method 是否已标注？
+- **自检**：id 唯一且格式 `TC-<MOD>-<SEQ>`？requirement 是否全部为 REQ-*？steps/expected 是否非空？testData 是否全部为「键=值」标量？design_method 是否已标注？是否**没有**输出 `@smoke`（由系统判定）？

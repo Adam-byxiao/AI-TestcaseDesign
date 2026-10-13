@@ -38,10 +38,23 @@ def test_duplicate_id():
     assert any("id 重复" in e for e in errors)
 
 
-def test_p0_requires_smoke():
-    case = {**VALID_CASE, "tags": ["@auth"]}
-    errors = validate_case(case, 0, set())
-    assert any("@smoke" in e for e in errors)
+def test_smoke_only_allowed_on_p0():
+    """**核心回归**：`@smoke` 只能标在 P0 上（方向与旧规则相反）。
+
+    旧规则是「P0 必带 @smoke」，使该标签与 P0 1:1 等同、不承载任何信息 ——
+    实测评测 v2 的冒烟集膨胀到全部用例的 **74%**、v3 达 **25%**，
+    「冒烟」退化成「P0 的同义词」。
+
+    现在 @smoke = 冒烟集 = P0 的**真子集**，因此：
+      - P0 可以**不带** @smoke（它只是不在冒烟集里）；
+      - 非 P0 **不得带** @smoke。
+    """
+    # P0 不带 @smoke：合法（是否进冒烟集由整体规则决定）
+    assert not any("@smoke" in e for e in
+                   validate_case({**VALID_CASE, "tags": ["@auth"]}, 0, set()))
+    # 非 P0 带 @smoke：必须报错
+    errors = validate_case({**VALID_CASE, "priority": "P1", "tags": ["@smoke", "@auth"]}, 0, set())
+    assert any("@smoke" in e and "只能标在 P0" in e for e in errors), errors
 
 
 def test_bad_enum():

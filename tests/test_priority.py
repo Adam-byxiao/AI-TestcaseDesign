@@ -31,6 +31,45 @@ def _case(title, *, method="场景法", tags=None, expected=None, requirement=No
 
 # ---------- 维度推断 ----------
 
+def test_strip_domain_noise_removes_prompt_word_only():
+    """领域名词剥离是**独立契约**：只剥离领域词，不改动其它文本。
+
+    为什么单独测：`_NEGATIVE_RE` 目前用 `提示(?:文案|…)` 限定了裸 `提示`，
+    因此剥离函数对现有词表是冗余的 —— 但那只是「恰好现在不需要」。
+    词表一旦被改回宽松写法（本项目刚经历过一次），
+    这道归一化就是唯一防线；因此必须让它的行为被测试锁定，
+    而不是因为「当前冗余」就无人守护（变异测试曾因此漏报）。
+    """
+    from prd2tc.priority import strip_domain_noise
+    assert strip_domain_noise("主提示词编辑器") == "主编辑器"
+    assert strip_domain_noise("提示词内容校验") == "内容校验"
+    assert strip_domain_noise("无领域名词") == "无领域名词"
+    assert strip_domain_noise("") == ""
+    # 不误伤：单独的「提示」不是领域词，应保留
+    assert strip_domain_noise("提示文案") == "提示文案"
+
+
+def test_domain_noun_prompt_word_does_not_trigger_hint_keyword():
+    """**核心回归**：领域名词「提示词」不得触发「提示」这个校验类关键词。
+
+    `_NEGATIVE_RE` 原先含裸 `提示`，而本项目核心领域词是**提示词**（prompt）——
+    其字面包含「提示」，导致「编辑后点击保存全部草稿」这类**主干正向**用例
+    被判为「反向」，进而污染优先级判定与冒烟集选取。
+    实测 v3 的 P0 中多数因此被错分，「主干正向」只剩 1 条，冒烟集无从选取。
+    """
+    main_flow = _case("编辑后点击保存全部草稿统一落盘",
+                      expected=["保存后 toast 显示草稿已自动保存（模拟）"])
+    assert infer_dimension(main_flow) == DIM_POSITIVE, infer_dimension(main_flow)
+
+    concat = _case("工具调用后回复基于主提示词与场景提示词拼接生成",
+                   expected=["回复遵循业务场景提示词中定义的规则"])
+    assert infer_dimension(concat) == DIM_POSITIVE, infer_dimension(concat)
+
+    # 但真正的「提示文案」仍应判为反向（不能因为剥离过度而漏判）
+    assert infer_dimension(_case("校验提示文案显示错误信息",
+                                 expected=["提示文案为请填写文档名称"])) == DIM_NEGATIVE
+
+
 def test_dimension_from_design_method():
     assert infer_dimension(_case("任意标题", method="边界值分析")) == DIM_BOUNDARY
     assert infer_dimension(_case("任意标题", method="错误推测")) == DIM_NEGATIVE
