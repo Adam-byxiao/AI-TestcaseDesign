@@ -432,7 +432,142 @@ def prd_section_aliases(prd_text: str) -> dict[str, str]:
     return aliases
 
 
-def requirements_from_analysis(analysis_md: str, prd_text: str = "") -> list[dict]:
+def _semantic_tokens(text: str) -> set[str]:
+    """需求标题的语义 token：CJK 2-gram + 英文/数字整词。
+
+    先剥离对语义无贡献、却足以让文本指纹失效的噪声：
+    代码标记（反引号/星号）与括号补充语（「（异步）」「（原编号：无）」）。
+
+    为什么要 token 化：`fingerprint` 是**文本哈希**，标题措辞一变（哪怕同义）
+    哈希就完全不同。实测同一份接口文档被分到 6 个块后，模型为每块起了不同模块码
+    并换了措辞，于是产出 `DOCINGEST` 与 `INGEST` 两个模块、内容几乎逐条对应。
+    """
+    t = str(text or "")
+    t = re.sub(r"[`*_]", "", t)
+    t = re.sub(r"[（(][^）)]{0,60}[）)]", "", t)
+    tokens = set(re.findall(r"[a-z][a-z0-9_\-]{1,}", t.lower()))
+    cjk = re.sub(r"[^\u4e00-\u9fff]", "", t)
+    tokens |= {cjk[i:i + 2] for i in range(len(cjk) - 1)}
+    return tokens
+
+
+def _similarity(a: set[str], b: set[str]) -> tuple[float, float]:
+    """返回 (Jaccard, 包含度)。
+
+    包含度对「一个标题是另一个的子集」更敏感 ——
+    如「远程文件下载解析入库」⊂「远程文件异步下载解析入库」，
+    Jaccard 仅 0.67 但包含度 0.89，后者才抓得住这类改写。
+    """
+    if not a or not b:
+        return 0.0, 0.0
+    inter = len(a & b)
+    return inter / len(a | b), inter / min(len(a), len(b))
+
+
+# 近似重复判定阈值：宁可漏合并，也不要把不同需求错并成一条。
+# 取值来自在**历史真实产物**（该运行产出 319 条需求）上的网格搜索：
+# 已知 3 组真重复（同义改写）与 4 组已知误并作为标注集，
+# J=0.70 / C=0.74 时真重复 3/3 命中、误并 0 例；
+# 再放宽（J=0.65）会多合并 2~5 条、收益不明，故不再下调。
+DUP_JACCARD = 0.70      # 双向相似（措辞接近）
+DUP_CONTAINMENT = 0.74  # 单向包含（一条是另一条的加长版）
+# 包含度路径的**额外护栏**：极短标题（如「场景筛选」「Toast 提示」）的 token
+# 天然被长标题包含，会与语义无关的需求误并。实测这些护栏拦住了 4 类误并。
+MIN_TOKENS = 6          # 双方 token 数下限
+MIN_SHARED = 6          # 共享 token 数下限
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _numbers(text: str) -> set[str]:
+    """标题里的数值。
+
+    数值是**语义事实**：`rerank_score > 0.2` 与 `> 0.39` 是两条不同规则，
+    绝不能被当成重复合并（实测误并过一次）。
+    """
+    return set(_NUMBER_RE.findall(str(text or "")))
+
+
+def _dedupe_semantic(reqs: list[dict], *, warns: list | None = None) -> list[dict]:
+    """合并**语义近似重复**的需求（跨块 / 跨模块）。
+
+    规则：
+      - 显式需求（PRD 里已写明编号）**永不合并** —— 它们是权威事实；
+      - 数值不同则**永不合并**（阈值/上限/条数是事实，不是措辞）；
+      - 包含度路径要求双方 token 数 ≥ MIN_TOKENS 且共享 ≥ MIN_SHARED，
+        避免「短标题 ⊂ 长标题」造成的误并；
+      - 保留信息量更大的那条（title 更长），并累积 `sourceRefs` 与
+        `mergedFrom`（含原标题与相似度）以便人工审计。
+    """
+    kept: list[dict] = []
+    kept_tokens: list[set[str]] = []
+    kept_numbers: list[set[str]] = []
+    merged = 0
+    for item in reqs:
+        title = str(item.get("title") or "")
+        if item.get("explicit"):
+            kept.append(item)
+            kept_tokens.append(_semantic_tokens(title))
+            kept_numbers.append(_numbers(title))
+            continue
+        tokens = _semantic_tokens(title)
+        numbers = _numbers(title)
+        target = None
+        for i, prev_tokens in enumerate(kept_tokens):
+            if kept[i].get("explicit"):
+                continue                      # 不与显式需求合并
+            if numbers and kept_numbers[i] and numbers != kept_numbers[i]:
+                continue                      # 数值冲突 → 不同规则
+            jac, cont = _similarity(tokens, prev_tokens)
+            shared = len(tokens & prev_tokens)
+            by_jaccard = jac >= DUP_JACCARD
+            by_containment = (cont >= DUP_CONTAINMENT
+                              and min(len(tokens), len(prev_tokens)) >= MIN_TOKENS
+                              and shared >= MIN_SHARED)
+            if by_jaccard or by_containment:
+                target = i
+                break
+        if target is None:
+            kept.append(item)
+            kept_tokens.append(tokens)
+            kept_numbers.append(numbers)
+            continue
+        prev = kept[target]
+        merged += 1
+        # 保留更长（信息更全）的标题；累积来源引用
+        if len(title) > len(str(prev.get("title") or "")):
+            prev["title"] = item.get("title")
+            prev["description"] = item.get("description") or item.get("title")
+            prev["acceptanceCriteria"] = (
+                item.get("acceptanceCriteria") or prev.get("acceptanceCriteria") or [])
+            kept_tokens[target] = tokens
+            kept_numbers[target] = numbers
+        refs = prev.setdefault("sourceRefs", [])
+        known = {(r.get("chunkId"), r.get("start"), r.get("end")) for r in refs}
+        refs.extend(r for r in (item.get("sourceRefs") or [])
+                    if (r.get("chunkId"), r.get("start"), r.get("end")) not in known)
+        # 留下**可审计**的合并痕迹（含原标题与相似度），便于人工复核是否误并。
+        # 只记 id 无法事后判断合并对错。
+        prev.setdefault("mergedFrom", []).append({
+            "id": item.get("model_id"),
+            "module": item.get("module"),
+            "title": item.get("title"),
+            "jaccard": round(jac, 3),
+            "containment": round(cont, 3),
+            "shared": shared,
+        })
+    if merged and warns is not None:
+        warns.append(f"语义去重：合并 {merged} 条近似重复需求（跨块/跨模块改写）")
+    return kept
+
+
+def _prune_empty_modules(reqs: list[dict], modules: list[dict]) -> list[dict]:
+    """移除去重后已无任何需求的模块（如整块被并入其它模块的副本）。"""
+    alive = {str(r.get("module")) for r in reqs}
+    return [m for m in (modules or []) if str(m.get("id")) in alive]
+
+
+def requirements_from_analysis(analysis_md: str, prd_text: str = "",
+                               warnings: list | None = None) -> list[dict]:
     """从 Markdown 报告提取结构化需求，并对模型临时编号做确定性顺序化。
 
     编号策略：PRD 中显式存在的 REQ-* 保留原号；否则按模块内出现顺序生成
@@ -511,6 +646,11 @@ def requirements_from_analysis(analysis_md: str, prd_text: str = "") -> list[dic
         previous.setdefault("sourceRefs", []).extend(
             ref for ref in item.get("sourceRefs", [])
             if (ref.get("chunkId"), ref.get("start"), ref.get("end")) not in known_refs)
+
+    # 语义去重：文本指纹抓不住「同义改写」，而分块抽取恰恰大量产生这类重复
+    # （同一份附件被切到多个块，模型为每块换措辞、换模块码）。
+    # 放在指纹去重之后：先做廉价的精确去重，再做代价较高的相似度比对。
+    deduped = _dedupe_semantic(deduped, warns=warnings)
 
     # 顺序化编号：显式保留原号；生成项按模块内顺序 001 起
     counters: dict[str, int] = {}

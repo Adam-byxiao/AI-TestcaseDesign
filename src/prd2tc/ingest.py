@@ -125,11 +125,15 @@ class Asset:
 @dataclass
 class Bundle:
     """归一化后的摄取结果：生成层只面对这一结构。"""
-    text: str = ""                       # PRD 正文（附件已按节内联）
+    text: str = ""                       # PRD 正文（仅需求载体，按节内联）
     sources: list = field(default_factory=list)     # [Source]
     assets: list = field(default_factory=list)      # [Asset]
     warnings: list = field(default_factory=list)
     primary: str = ""                    # 主文件（正文来源）名称
+    # 被排除的参考资料（接口/服务文档）与原型：留痕以便追溯「为什么没被纳入」
+    references: list = field(default_factory=list)  # [Source]
+    prototypes: list = field(default_factory=list)  # [Source]
+    include_references: bool = False     # 是否强制并入参考资料（逃生阀）
 
     def images(self) -> list:
         return [a for a in self.assets if a.mime.startswith("image/")]
@@ -141,6 +145,8 @@ class Bundle:
             "sourceCount": len(self.sources),
             "assetCount": len(self.assets),
             "imageCount": len(self.images()),
+            "referenceCount": len(self.references),
+            "prototypeCount": len(self.prototypes),
             "kinds": sorted({s.kind for s in self.sources}),
             "warnings": len(self.warnings),
         }
@@ -575,6 +581,32 @@ def _looks_garbled(text: str) -> bool:
     return good / len(text) < 0.85
 
 
+_REFERENCE_NAME_RE = re.compile(
+    r"(service|api|interface|sdk|spec|contract|protocol"
+    r"|接口|服务文档|接口文档|协议|字段说明)", re.I)
+_ENDPOINT_RE = re.compile(
+    r"\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b[^\n]{0,20}?(/[A-Za-z0-9_\-/{}.]+)")
+
+
+def _looks_like_reference(name: str, text: str) -> bool:
+    """判断一份文本是否为「参考资料」（接口/服务文档），而非需求载体。
+
+    判据（保守：宁可漏判，也不误伤真实 PRD）：
+      1. 文件名含接口/服务类词（`service`/`api`/`接口`…）—— 主信号；
+      2. 或正文里有大量 HTTP 端点清单（≥8 个 `METHOD /path`）。
+
+    为什么需要它：PRD 常把接口文档作为**附件**引用，并明确其为
+    「原始资料…便于研发查看请求、响应与回调细节」——它是**查阅用细节，不是需求**。
+    实测把 `rag-service.md`（27K）当需求挖，贡献了近百条需求，
+    其中还包含该文档**客户专用开关**（「蔚来RAG优化」），与被测项目毫无关系。
+    """
+    stem = Path(name).stem
+    if _REFERENCE_NAME_RE.search(stem):
+        return True
+    endpoints = _ENDPOINT_RE.findall(text[:200_000])
+    return len({(m[0].upper(), m[1]) for m in endpoints}) >= 8
+
+
 def _image_mime(data: bytes) -> str:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -660,16 +692,23 @@ def _iter_dir(path: Path, base: Path | None = None):
 
 
 def ingest(inputs, *, warnings: list | None = None, preferred_primary: str = "",
-           base_dir=None) -> Bundle:
+           base_dir=None, include_references: bool = False) -> Bundle:
     """摄取多个输入（文件路径 / 目录 / (name, bytes)），返回归一化 Bundle。
 
     主文件判定见 `_pick_primary`；`preferred_primary` 由调用方传入
     （如用户显式给出的第一个 `--prd`），优先级最高。
     `base_dir` 用于计算**磁盘文件**的相对层级（depth），
     这样「根目录的 PRD」才能胜过「子目录里的长附件」。
-    其余文本类来源作为**附件**按节内联，图片全部作为资产交视觉识别。
+
+    **附件按角色分流**（这一步决定生成质量的上限）：
+      - `primary` / `attachment`：需求载体，按节并入正文；
+      - `reference`：接口/服务文档，**默认不并入正文**（见 `_looks_like_reference`）；
+      - `prototype`：HTML 原型，**不进正文**（只解析为 UI 契约）；
+      - `asset`：图片，交视觉识别。
+    `include_references=True` 可强制并入（逃生阀，默认关闭）。
     """
     bundle = Bundle()
+    bundle.include_references = bool(include_references)
     warns = warnings if warnings is not None else bundle.warnings
     pending: list[tuple[str, bytes, str, int]] = []      # name, data, origin, depth
     seen_hash: set[str] = set()
@@ -738,11 +777,13 @@ def ingest(inputs, *, warnings: list | None = None, preferred_primary: str = "",
             continue
         expanded.append((name, data, origin, depth))
 
-    return _assemble(expanded, warns, bundle=bundle, preferred_primary=preferred_primary)
+    return _assemble(expanded, warns, bundle=bundle, preferred_primary=preferred_primary,
+                     include_references=include_references)
 
 
 def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
-              bundle: Bundle | None = None, preferred_primary: str = "") -> Bundle:
+              bundle: Bundle | None = None, preferred_primary: str = "",
+              include_references: bool = False) -> Bundle:
     """把展开后的成员归类为「正文 / 附件 / 资产」。
 
     传入 `bundle` 以复用**同一个**告警列表：若在此处新建 Bundle，
@@ -752,6 +793,12 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
     bundle.warnings = warns
     texts: list[tuple[str, str, str, int, int]] = []     # name, text, origin, order, depth
     assets: list[Asset] = []
+    references: list[Source] = []
+
+    primary_name = Path(preferred_primary).name if preferred_primary else ""
+    # 逃生阀：显式要求并入参考资料时，不做 reference 分流
+    _is_ref = (lambda _n, _t: False) if include_references else _looks_like_reference
+    prototypes: list[Source] = []
 
     for idx, (name, data, origin, depth) in enumerate(items):
         kind = sniff_kind(name, data)
@@ -759,10 +806,31 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
         src = Source(name=name, kind=kind, size=len(data), sha256=digest,
                      origin=origin, depth=depth)
         try:
-            if kind in (KIND_MARKDOWN, KIND_TEXT, KIND_HTML):
+            if kind == KIND_HTML:
+                # **原型不进正文**：它是交互结构说明（"用于展示本次结构与交互"），
+                # 且源码里的 JS 对需求抽取是纯噪声。它会被解析为结构化 UI 契约
+                # （见 pipeline._auto_prototypes → ui-spec.json），那才是可用的形态。
+                # 实测把 42K 原型源码内联进 prompt，占输入的 57.6%，直接导致
+                # 模型从 JS 里"抽需求"。
+                src.role = "prototype"
+                src.note = "原型（仅解析为 UI 契约，不进正文）"
+                prototypes.append(src)
+            elif kind in (KIND_MARKDOWN, KIND_TEXT):
                 text = decode_text(data)
                 src.textChars = len(text)
-                texts.append((name, text, origin, idx, depth))
+                if name != primary_name and _is_ref(name, text):
+                    # **参考资料不进正文**：PRD 对这类文件的定位是
+                    # 「原始资料…便于研发查看请求、响应与回调细节」——是查阅用的细节，
+                    # 不是需求。实测把它当需求挖，一份 27K 的接口文档贡献了
+                    # 近百条需求（含其客户专用开关「蔚来RAG优化」）。
+                    src.role = "reference"
+                    src.note = "参考资料（接口/服务文档，不作需求来源）"
+                    references.append(src)
+                    warns.append(
+                        f"{name} 判定为参考资料（接口/服务文档），未并入需求正文；"
+                        "如需纳入请加 --include-references")
+                else:
+                    texts.append((name, text, origin, idx, depth))
             elif kind == KIND_DOCX:
                 text, embedded, w = extract_docx(data, name=name)
                 src.textChars = len(text)
@@ -771,6 +839,11 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
                     src.role = "skipped"
                     src.note = "DOCX 正文为空"
                     warns.append(f"{name} 正文为空，已跳过")
+                elif name != primary_name and _is_ref(name, text):
+                    src.role = "reference"
+                    src.note = "参考资料（接口/服务文档，不作需求来源）"
+                    references.append(src)
+                    warns.append(f"{name} 判定为参考资料，未并入需求正文")
                 else:
                     texts.append((name, text, origin, idx, depth))
                     assets.extend(embedded)
@@ -781,7 +854,13 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
                 src.textChars = len(text)
                 warns.extend(f"{name}: {x}" for x in w)
                 if text.strip():
-                    texts.append((name, text, origin, idx, depth))
+                    if name != primary_name and _is_ref(name, text):
+                        src.role = "reference"
+                        src.note = "参考资料（接口/服务文档，不作需求来源）"
+                        references.append(src)
+                        warns.append(f"{name} 判定为参考资料，未并入需求正文")
+                    else:
+                        texts.append((name, text, origin, idx, depth))
                 else:
                     src.role = "skipped"
                     src.note = "未能抽取文本"
@@ -810,6 +889,14 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
             # 纯图片 PRD：正文留空，全部靠视觉证据 —— 这是合法的多模态输入
             bundle.primary = assets[0].name
             warns.append("未找到文本正文；按「纯图片 PRD」处理，将完全依赖视觉识别结果")
+        elif references:
+            # 只找到参考资料：绝不能把它当需求正文（那正是「蔚来」污染的形态）。
+            # 明确报错并给出可操作建议，而不是静默产出错误结果。
+            names = "、".join(s.name for s in references[:5])
+            raise ValueError(
+                f"未找到需求正文：{names} 均被判定为参考资料（接口/服务文档），"
+                "不作为需求来源。请提供 PRD 正文（需求文档），"
+                "或用 --include-references 强制纳入。")
         else:
             raise ValueError("输入中没有可解析的文本或图片内容")
         bundle.assets = assets
@@ -838,6 +925,8 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
         body = body[:MAX_TEXT_CHARS]
     bundle.text = body
     bundle.assets = assets
+    bundle.references = references
+    bundle.prototypes = prototypes
     # 主文件角色修正
     for s in bundle.sources:
         if s.name == primary[0]:

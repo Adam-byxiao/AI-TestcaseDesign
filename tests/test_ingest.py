@@ -257,20 +257,110 @@ def test_ingest_picks_longest_markdown_as_primary():
     assert "## 附件：a.md" in b.text
 
 
+def test_reference_documents_excluded_from_body():
+    """**核心回归**：接口/服务类文档必须**不并入需求正文**。
+
+    实测事故：用户的 PRD 把 `rag-service.md`（43KB《Yiwise RAG 服务接口文档》）
+    作为附件引用，并明确其定位为「原始资料…便于研发查看请求、响应与回调细节」。
+    我们却把它当需求挖 → 该次运行产出 **319 条需求 / 43 个模块**
+    （正文仅 4K 字符，实际约 30 条需求），其中还包含该文档里
+    **客户专用开关**「蔚来RAG优化」—— 与被测项目毫无关系。
+    """
+    prd = ("# 需求\n\n## 1 配置\n\n支持保存。\n\n"
+           "## 2 RAG 接口参考\n\n"
+           "原始资料：下方保留完整 rag-service.md 附件，便于研发查看请求、响应与回调细节。\n")
+    api_doc = ("# Yiwise RAG 服务接口文档\n\n## 接口清单\n\n"
+               "| 方法 | 路径 |\n| --- | --- |\n"
+               "| GET | /health |\n| POST | /v1/rag/context |\n| POST | /v1/rag/context/v2 |\n"
+               "| POST | /v1/rag/retrieve |\n| POST | /v1/rag/knowledge-base/upload |\n"
+               "| POST | /v1/rag/documents/upload |\n| POST | /v1/rag/segments/upload |\n"
+               "| POST | /v1/rag/segments/delete |\n\n"
+               "`system` 包含 `# 蔚来RAG优化` 时启用特殊策略。\n")
+    b = ingest.ingest([("PRD.md", prd.encode(), "u"),
+                       ("rag-service.md", api_doc.encode(), "u")])
+    assert "蔚来" not in b.text, "接口文档内容不得进入需求正文"
+    assert "接口清单" not in b.text
+    assert b.text.startswith("# 需求")
+    roles = {s.name: s.role for s in b.sources}
+    assert roles["rag-service.md"] == "reference", roles
+    assert roles["PRD.md"] == "primary", roles
+    assert [r.name for r in b.references] == ["rag-service.md"]
+    assert any("参考资料" in w for w in b.warnings), b.warnings
+    # 摘要里可见（可追溯），但不计入正文
+    assert b.summary()["referenceCount"] == 1
+
+
+def test_reference_detection_by_endpoint_density():
+    """文件名无线索时，按**端点密度**判定（≥8 个 METHOD /path）。"""
+    lines = "\n".join(f"| POST | /v1/api/thing{i} | 说明 |" for i in range(10))
+    doc = f"# 某文档\n\n## 接口\n\n{lines}\n\n字段说明若干。\n"
+    b = ingest.ingest([("PRD.md", "# 需求\n\n要点。\n".encode(), "u"),
+                       ("后端的.md", doc.encode(), "u")])
+    roles = {s.name: s.role for s in b.sources}
+    assert roles["后端的.md"] == "reference", roles
+
+
+def test_include_references_escape_hatch():
+    """`include_references=True` 时参考资料仍可并入（逃生阀）。"""
+    doc = "# 接口文档\n\nGET /a\nPOST /b\nGET /c\nPOST /d\nGET /e\nPOST /f\nGET /g\nPOST /h\n"
+    b = ingest.ingest([("PRD.md", "# 需求\n".encode(), "u"),
+                       ("x-service.md", doc.encode(), "u")],
+                      include_references=True)
+    roles = {s.name: s.role for s in b.sources}
+    assert roles["x-service.md"] == "attachment", roles
+    assert "## 附件：x-service.md" in b.text
+
+
+def test_prototype_html_excluded_from_body():
+    """原型 HTML **不进正文**（只解析为 UI 契约）。
+
+    实测：42K 原型源码内联进 prompt 占输入的 57.6%，模型据其 JS/CSS
+    抽出「字体栈 Menlo/Consolas/PingFang SC」「#toast z-index=99」
+    这类实现细节当需求 —— 那是噪声，不是需求。
+    """
+    prd = "# 需求\n\n要点：新增页签。\n"
+    html = ("<html><head><style>.x{font-family:Menlo}</style></head><body>"
+            "<div id='nav'></div><script>const navs=[['a','b']];</script></body></html>")
+    b = ingest.ingest([("PRD.md", prd.encode(), "u"),
+                       ("prototype.html", html.encode(), "u")])
+    assert "<script" not in b.text and "font-family" not in b.text
+    roles = {s.name: s.role for s in b.sources}
+    assert roles["prototype.html"] == "prototype", roles
+    assert [p.name for p in b.prototypes] == ["prototype.html"]
+    assert b.summary()["prototypeCount"] == 1
+
+
+def test_only_references_raises_actionable_error():
+    """只给参考资料时必须**明确报错**，而不是把它当需求正文静默产出。
+
+    这正是「蔚来」污染的形态：若静默把接口文档当 PRD，结果全错却看不出来。
+    """
+    doc = "# 接口文档\n\nGET /a\nPOST /b\nGET /c\nPOST /d\nGET /e\nPOST /f\nGET /g\nPOST /h\n"
+    with pytest.raises(ValueError) as exc:
+        ingest.ingest([("x-service.md", doc.encode(), "u")])
+    msg = str(exc.value)
+    assert "未找到需求正文" in msg, msg
+    assert "include-references" in msg, msg
+
+
 def test_ingest_prefers_explicitly_given_file_as_primary():
     """**核心回归**：显式给出的文件必须是主文件，不能只按长度选。
 
     实测：把「PRD + 图片和附件」一起摄入时，附件 `rag-service.md`（43KB 接口文档）
     比真正的 PRD（17KB）长得多 —— 只看长度会把附件当正文、PRD 降级为附件。
+
+    注意 `rag-service.md` 现在还会被识别为**参考资料**而不并入正文
+    （见 `test_reference_documents_excluded_from_body`），
+    因此这里用一份**非接口文档**的长附件来验证「主文件判定」本身。
     """
     short_prd = "# 真正的 PRD\n\n需求点：支持上传。\n"
-    long_attachment = "# RAG 服务接口说明\n\n" + "接口细节。" * 3000
+    long_attachment = "# 附录说明\n\n" + "补充说明。" * 3000
     b = ingest.ingest([("probe.md", short_prd.encode(), "u"),
-                       ("rag-service.md", long_attachment.encode(), "u")],
+                       ("附录说明.md", long_attachment.encode(), "u")],
                       preferred_primary="probe.md")
     assert b.primary == "probe.md", b.primary
     assert b.text.startswith("# 真正的 PRD")
-    assert "## 附件：rag-service.md" in b.text
+    assert "## 附件：附录说明.md" in b.text
 
 
 def test_ingest_prefers_prd_named_file_over_longer_others():
@@ -301,11 +391,12 @@ def test_loader_marks_first_explicit_file_as_primary(tmp_path):
     prd.write_text("# PRD\n\n需求。\n", encoding="utf-8")
     d = tmp_path / "图片和附件"
     d.mkdir()
-    (d / "rag-service.md").write_text("# 接口\n\n" + "细节。" * 3000, encoding="utf-8")
+    # 用非接口文档的长附件验证主文件判定（接口文档会被判为参考资料）
+    (d / "附录说明.md").write_text("# 附录\n\n" + "细节。" * 3000, encoding="utf-8")
     (d / "x.png").write_bytes(PNG)
     b = loader.load_bundle([prd, d])
     assert b.primary == "sample-prd.md", b.primary
-    assert "## 附件：rag-service.md" in b.text
+    assert "## 附件：附录说明.md" in b.text
     assert len(b.images()) == 1
 
 
