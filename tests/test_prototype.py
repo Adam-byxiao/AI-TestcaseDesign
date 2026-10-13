@@ -648,7 +648,8 @@ def test_gate_accepts_real_anchors_when_spec_present(spec):
             "preconditions": ["已登录"],
             "testData": ["account=normal"],
             "steps": [{"action": "goto", "target": "知识库配置页", "data": "knowledge"},
-                      {"action": "fill", "target": "文档名称输入框 (id=docName)", "data": "x"}],
+                      {"action": "fill", "target": "文档名称输入框 (id=docName)", "data": "x"},
+                      {"action": "expectVisible", "target": "已选文件区域 (id=selectedFile)", "data": ""}],
             "expected": ["文件大小不能超过 1MB 时给出提示"],
         }]
         return LLMResult(json.dumps(payload, ensure_ascii=False), "fake", 5, 5)

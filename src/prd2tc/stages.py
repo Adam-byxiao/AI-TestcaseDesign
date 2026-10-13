@@ -19,6 +19,7 @@ from prd2tc import metrics as _metrics
 from prd2tc.config import Config
 from prd2tc.examples import Example, render_examples
 from prd2tc.llm import LLMResult, chat_completion
+from prd2tc.actions import render_actions_for_prompt
 from prd2tc.validator import ACTIONS, PRIORITIES, ValidationError, validate_case
 from prd2tc.chunking import locate, split_document
 
@@ -139,7 +140,10 @@ def field_spec(allowed_modules: set[str] | None = None) -> str:
         f"- priority ∈ {PRIORITIES}；P0 必须带 @smoke 标签\n"
         f"- id 格式 TC-<MOD>[-<SUB>]-<3位序号>，全局唯一（id 前缀必须与 module 一致）\n"
         f"- requirement 为 REQ-* 编号数组（只能引用本模块真实存在的 REQ）\n"
-        f"- steps[].action ∈ {ACTIONS}，target 非空，data 必须是字符串\n"
+        f"- steps[].action 只能取自下列动作（**按语义选词**，不要一律用 check）：\n"
+        f"{render_actions_for_prompt()}\n"
+        f"- steps[].target 非空，data 必须是字符串\n"
+        "- 每条用例**至少包含一个断言动作**（expect*），否则无法判定通过/失败\n"
         "- testData 必须是「键=值」字符串数组（如 [\"phone=13800138000\",\"password=123456\"]），"
         "值只能是标量（数字/布尔/短文本）；禁止嵌套对象或数组、禁止值里出现双引号或反斜杠；"
         "复杂数据请写进 preconditions\n"

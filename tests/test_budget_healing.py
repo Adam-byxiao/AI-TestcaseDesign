@@ -33,7 +33,8 @@ def _truncated_salvageable(module: str = "SCENE", complete: int = 2) -> str:
     full = [{"id": f"TC-{module}-{i:03d}", "module": module, "title": f"场景用例{i}",
              "design_method": "场景法", "priority": "P0",
              "tags": ["@smoke", "@scene"], "requirement": [f"REQ-{module}-{i:03d}"],
-             "steps": [{"action": "goto", "target": f"/s/{i}", "data": ""}],
+             "steps": [{"action": "goto", "target": f"/s/{i}", "data": ""},
+                        {"action": "expectVisible", "target": f"场景{i}结果区", "data": ""}],
              "expected": [f"页面{i}成功渲染并显示场景数据"]} for i in range(1, complete + 1)]
     return json.dumps(full, ensure_ascii=False)[:-1] + ',"design_method":"场景法","tags":["@smoke"]'
 
@@ -234,7 +235,8 @@ def test_split_heals_a_module_that_would_otherwise_fail(monkeypatch):
                   "tags": ["@regression"], "requirement": [rid],
                   # 步骤/预期必须真正不同：C-007 按「同模块+同步骤+同预期」判重复，
                   # 只改 id/requirement 的用例会被门禁拦下（那正是「同质用例」的定义）。
-                  "steps": [{"action": "goto", "target": f"/p{i}", "data": ""}],
+                  "steps": [{"action": "goto", "target": f"/p{i}", "data": ""},
+                            {"action": "expectVisible", "target": f"页面{i}主体", "data": ""}],
                   "expected": [f"页面{i}成功渲染"]} for i, rid in enumerate(ids, 1)]
         import json
         return LLMResult(content="```json\n" + json.dumps(cases, ensure_ascii=False) + "\n```",

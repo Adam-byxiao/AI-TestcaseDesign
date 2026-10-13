@@ -77,7 +77,9 @@ def test_step_data_must_be_scalar():
 def _case(**over):
     base = {"id": "TC-A-001", "module": "A", "title": "t", "design_method": "场景法", "priority": "P1",
             "tags": ["@smoke"], "requirement": ["REQ-A-001"],
-            "steps": [{"action": "goto", "target": "/", "data": ""}], "expected": ["页面成功渲染并显示预期内容"]}
+            "steps": [{"action": "goto", "target": "/", "data": ""},
+                  {"action": "expectVisible", "target": "页面主体", "data": ""}],
+            "expected": ["页面成功渲染并显示预期内容"]}
     base.update(over)
     return base
 

@@ -27,7 +27,7 @@
 
 | 字段 | 必填 | 说明 / 枚举 |
 | --- | --- | --- |
-| `action` | ✅ | `goto`/`fill`/`click`/`selectOption`/`check`/`hover`/`press`/`reload`/`expectVisible`/`expectText`/`expectUrl`/`waitFor` |
+| `action` | ✅ | 取自 `prd2tc.actions` 的**单一事实源**（`ACTION_NAMES`，23 个）：操作类 `goto`/`fill`/`click`/`selectOption`/`check`/`uncheck`/`upload`/`hover`/`press`/`reload`/`scrollTo`/`waitFor`；断言类 `expectVisible`/`expectNotVisible`/`expectText`/`expectValue`/`expectEnabled`/`expectDisabled`/`expectChecked`/`expectUnchecked`/`expectState`/`expectCount`/`expectUrl`。**每条用例至少 1 个断言** |
 | `target` | ✅ | 定位描述（页面/元素名，如「登录按钮」「/login」） |
 | `data` | - | 输入数据或期望值（配合 expect 类动作）。**必须是字符串**，不能是嵌套对象/数组 |
 

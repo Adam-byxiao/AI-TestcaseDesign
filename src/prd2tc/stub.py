@@ -68,7 +68,13 @@ def stub_chat(cfg, user_text: str, *, on_delta=None, should_cancel=None, **kwarg
         cases = [{"id":"TC-STUB-001","module":module,"subModule":"STUB","title":"stub 用例",
                   "design_method":"场景法",
                   "priority":"P1","tags":["@regression"],"requirement":[requirement_id],
-                  "steps":[{"action":"goto","target":"/","data":""}],"expected":["页面成功渲染并显示预期内容"]}]
+                  # 必须含**断言**动作：门禁要求每条用例至少一个 expect*
+                  # （stub 原先只有 goto，会让所有端到端测试触发该门禁）
+                  "steps":[{"action":"goto","target":"/","data":""},
+                           {"action":"click","target":"主要操作入口","data":""},
+                           {"action":"expectVisible","target":"操作结果区域","data":""},
+                           {"action":"expectText","target":"操作结果区域","data":"页面成功渲染并显示预期内容"}],
+                  "expected":["页面成功渲染并显示预期内容"]}]
         content = "```json\n" + json.dumps(cases, ensure_ascii=False) + "\n```"
     _emit(content, on_delta, should_cancel)
     cjk = sum(1 for ch in content if ch >= "\u2e80")

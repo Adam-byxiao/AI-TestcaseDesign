@@ -109,7 +109,9 @@ def test_module_generation_and_checkpoint_resume():
         content = json.dumps([{"id": f"TC-{module}-001", "module": module, "title": "场景",
                                "design_method": "场景法", "priority": "P1", "tags": ["@regression"],
                                "requirement": [f"REQ-{module}-001"],
-                               "steps": [{"action": "goto", "target": "/"}], "expected": ["操作成功并跳转首页"]}])
+                               "steps": [{"action": "goto", "target": "/"},
+                                          {"action": "expectVisible", "target": "首页主体"}],
+                                "expected": ["操作成功并跳转首页"]}])
         return LLMResult(content, "fake", 2, 3)
 
     reqs = [{"id": "REQ-A-001", "module": "A", "title": "A"},
@@ -129,7 +131,9 @@ def test_module_generation_and_checkpoint_resume():
 def test_dynamic_module_validation():
     case = {"id": "TC-CRM_2-001", "module": "CRM_2", "title": "客户查询", "design_method": "场景法", "priority": "P1",
             "tags": ["@regression"], "requirement": ["REQ-CRM_2-001"],
-            "steps": [{"action": "goto", "target": "/customers"}], "expected": ["客户列表页成功显示数据"]}
+            "steps": [{"action": "goto", "target": "/customers"},
+                     {"action": "expectVisible", "target": "客户列表"}],
+            "expected": ["客户列表页成功显示数据"]}
     from prd2tc.validator import validate_case
     assert validate_case(case, 0, set(), {"CRM_2"}) == []
 
@@ -174,7 +178,9 @@ def test_import_results_cli_writes_schema_v2(tmp_path):
     output = tmp_path / "output"
     save_cases(source, [{"id": "TC-A-001", "module": "A", "title": "x", "design_method": "场景法", "priority": "P1",
                          "tags": ["@regression"], "requirement": ["REQ-A-001"],
-                         "steps": [{"action": "goto", "target": "/"}], "expected": ["页面成功渲染并显示预期内容"]}])
+                         "steps": [{"action": "goto", "target": "/"},
+                                 {"action": "expectVisible", "target": "页面主体"}],
+                         "expected": ["页面成功渲染并显示预期内容"]}])
     results = tmp_path / "results.json"
     results.write_text(json.dumps(make_execution_result("run-1", [
         {"caseId": "TC-A-001", "status": "passed", "durationMs": 2}
@@ -182,7 +188,7 @@ def test_import_results_cli_writes_schema_v2(tmp_path):
     assert cli.main(["import-results", "--cases", str(source), "--results", str(results), "--out", str(output)]) == 0
     payload = json.loads((output / "A.json").read_text(encoding="utf-8"))
     assert payload["schemaVersion"] == "2.0"
-    assert payload["actionSchemaVersion"] == "1.0"
+    assert payload["actionSchemaVersion"] == "1.1"
     assert payload["cases"][0]["lastExecution"]["runId"] == "run-1"
     examples = tmp_path / "examples.json"
     assert cli.main(["promote-examples", "--cases", str(output), "--out", str(examples),
@@ -247,7 +253,9 @@ def test_merge_cli_preserves_changed_and_removed_history(tmp_path):
     new_root = tmp_path / "new"
     output = tmp_path / "merged"
     base = {"module": "A", "title": "x", "design_method": "场景法", "priority": "P1", "tags": ["@regression"],
-            "steps": [{"action": "goto", "target": "/"}], "expected": ["页面成功渲染并显示预期内容"]}
+            "steps": [{"action": "goto", "target": "/"},
+                    {"action": "expectVisible", "target": "页面主体"}],
+            "expected": ["页面成功渲染并显示预期内容"]}
     save_cases(old_root / "cases" / "cases", [
         {**base, "id": "TC-A-001", "requirement": ["REQ-A-001"]},
         {**base, "id": "TC-A-002", "requirement": ["REQ-A-002"]},
@@ -322,7 +330,8 @@ def _coverage_failing_pipeline(tmp_path):
             "id": "TC-A-001", "module": "A", "title": "需求一验证",
             "design_method": "场景法", "priority": "P0", "tags": ["@smoke"],
             "requirement": ["REQ-A-001"],
-            "steps": [{"action": "goto", "target": "/a", "data": ""}],
+            "steps": [{"action": "goto", "target": "/a", "data": ""},
+                       {"action": "expectVisible", "target": "页面主体", "data": ""}],
             "expected": ["页面成功渲染并显示数据"]}], ensure_ascii=False) + "\n```", "m")
 
     cfg = Config(api_key="", api_base="local", model="m", temperature=0.0,
@@ -404,7 +413,9 @@ def test_generate_module_failure_persists_independent_statuses(tmp_path, monkeyp
             raise RuntimeError("simulated module failure")
         case = {"id": "TC-A-001", "module": "A", "title": "查询", "design_method": "场景法", "priority": "P1",
                 "tags": ["@regression"], "requirement": ["REQ-A-001"],
-                "steps": [{"action": "goto", "target": "/"}], "expected": ["页面成功渲染并显示预期内容"]}
+                "steps": [{"action": "goto", "target": "/"},
+                    {"action": "expectVisible", "target": "页面主体"}],
+            "expected": ["页面成功渲染并显示预期内容"]}
         return LLMResult(json.dumps([case]), "fake")
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-only")

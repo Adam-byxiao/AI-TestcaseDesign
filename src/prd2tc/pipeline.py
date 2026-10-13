@@ -18,6 +18,7 @@ from prd2tc import images
 from prd2tc import ingest
 from prd2tc import prototype
 from prd2tc import priority
+from prd2tc import artifacts
 from prd2tc.profiles import get_profile
 from prd2tc.schema import normalize_cases
 from prd2tc.traceability import build_traceability, validate_traceability
@@ -37,6 +38,12 @@ class GenerateRequest:
     dry_run: bool = False
     jobs: int = 1
     stage: str = "all"
+    # 从该阶段开始**跑到最后**（`--from-stage`）。与 stage 的区别：
+    #   stage="2"      → 只跑阶段 2（复用已有上游产物）
+    #   from_stage="2" → 跑阶段 2 与 3
+    from_stage: str = ""
+    # 允许复用「为另一份 PRD 生成」的上游产物（默认禁止：那是静默错配的来源）
+    allow_stale_artifacts: bool = False
     profile: str = "generic"
     min_cases_per_requirement: int | None = None
     max_gate_retries: int = 2
@@ -227,6 +234,10 @@ class PipelineRunner:
             raise ValueError("PRD 无可用内容（既没有文本，也没有可识别的图片）")
         product = request.product or path.parent.name; version = request.version or extract_version(text, path)
         root = Path(request.out) / product / version
+        # **必须在 init_output 之前采样**：init_output 会重写清单，
+        # 抹掉「已有产物属于哪份 PRD」的记录。若在其后才读，
+        # 陈旧检测拿到的永远是刚写入的新哈希，等于失效（实测踩到）。
+        recorded_prd_hash = artifacts.read_manifest_hash(root)
         if not request.stub and not request.dry_run and self.config.requires_api_key() and not self.config.api_key: raise ValueError("未配置 LLM 凭证")
         if not request.resume or request.force or (not (root / MANIFEST_NAME).exists() and not (root / LEGACY_MANIFEST_NAME).exists()):
             init_output(root, product, version, str(path.resolve()))
@@ -359,7 +370,30 @@ class PipelineRunner:
             update_manifest(root, status="succeeded"); update_run_state(root, status="succeeded", stage="done"); return result
         try:
             analysis_path = root / "analysis" / "需求分析报告.md"; req_path = root / "analysis" / "requirements.json"
-            if request.stage in {"1", "all"} and not (can_resume and request.stage == "all" and analysis_path.exists() and req_path.exists()):
+            # 本次真正要执行的阶段（`--stage N` 只跑 N；`--from-stage N` 跑 N..3；`all` 全跑）
+            running_stages = set(artifacts.stages_to_run(
+                request.stage, getattr(request, "from_stage", "") or ""))
+            # 链路完备性 preflight：对**将要执行**的每个阶段，校验其输入产物完备；
+            # 但若某输入由**同样要执行**的上游阶段产出，则跳过 —— 那是本次会生成的东西。
+            #
+            # 例：`--stage 3`（只跑用例）→ 必须先有 plan 与 requirements；
+            #     `--stage all`      → 阶段 1 的产物稍后自会生成，无需预检。
+            # 替代原先散落的 `.exists()` —— 后者会放过空文件、`requirements: []`、
+            # 以及「用另一份 PRD 生成的旧产物」这三类静默错配（见 artifacts.py）。
+            for stage_key in running_stages:
+                for artifact in artifacts.STAGE_INPUTS.get(stage_key, ()):
+                    if artifact.stage in running_stages:
+                        continue          # 该产物由本次运行的上游阶段产出
+                    problems = artifacts.check_one(
+                        root, artifact, prd_hash=prd_hash,
+                        recorded_hash=recorded_prd_hash,
+                        allow_stale=bool(getattr(request, "allow_stale_artifacts", False)))
+                    if problems:
+                        raise ValueError(artifacts.format_problems(problems, stage_key))
+            # `--resume` 时若三阶段全在计划内且产物齐全，则整段复用（跳过重跑）
+            resume_all = (can_resume and running_stages == set(artifacts.STAGE_ORDER)
+                          and analysis_path.exists() and req_path.exists())
+            if "1" in running_stages and not resume_all:
                 live.set_stage("analysis"); metrics.bind(live, "analysis")
                 emit("stage_started", stage="analysis", percent=0)
                 started = time.perf_counter(); analysis, r1, errors = stages.generate_stage_1(self.config, text, llm=llm, examples=request.examples, jobs=request.jobs, use_gate=not (request.stub or request.no_gate), max_gate_retries=request.max_gate_retries, reporter=lambda *_: None, image_context=images.render_image_spec(image_spec) if image_spec else "")
@@ -373,7 +407,7 @@ class PipelineRunner:
                 if not analysis_path.exists(): raise FileNotFoundError(f"缺少阶段1产物: {analysis_path}")
                 analysis = analysis_path.read_text(encoding="utf-8"); reqs = load_requirements(req_path)
             plan_path = root / "plan" / "测试方案.md"
-            if request.stage in {"2", "all"} and not (can_resume and request.stage == "all" and plan_path.exists()):
+            if "2" in running_stages and not (can_resume and "3" in running_stages and plan_path.exists()):
                 live.set_stage("plan"); metrics.bind(live, "plan")
                 emit("stage_started", stage="plan", percent=33)
                 started = time.perf_counter()
@@ -399,9 +433,12 @@ class PipelineRunner:
                 if errors and not request.allow_gate_fail:
                     return self._fail(result, errors)
             else:
-                if request.stage == "3" and not plan_path.exists(): raise FileNotFoundError(f"缺少阶段2产物: {plan_path}")
+                # 阶段 2 被跳过：若后续还要跑阶段 3，方案文件必须存在
+                # （完备性已在 preflight 校验，这里只需读取）
+                if "3" in running_stages and not plan_path.exists():
+                    raise FileNotFoundError(f"缺少阶段2产物: {plan_path}")
                 plan = plan_path.read_text(encoding="utf-8") if plan_path.exists() else ""
-            if request.stage in {"3", "all"}:
+            if "3" in running_stages:
                 live.set_stage("cases")
                 emit("stage_started", stage="cases", percent=66)
                 if ui_spec is not None:

@@ -16,6 +16,7 @@ VALID_CASE = {
     "steps": [
         {"action": "goto", "target": "/login", "data": ""},
         {"action": "click", "target": "登录按钮", "data": ""},
+        {"action": "expectVisible", "target": "首页导航栏", "data": ""},
     ],
     "expected": ["登录成功后跳转至首页"],
 }

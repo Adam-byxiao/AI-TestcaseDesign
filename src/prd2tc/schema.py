@@ -3,13 +3,21 @@ from __future__ import annotations
 
 import json
 
+from prd2tc.actions import ACTION_NAMES
+
 SCHEMA_VERSION = "2.0"
-ACTION_SCHEMA_VERSION = "1.0"
+
+# 动作词表版本。
+# 1.0 → 1.1：补齐词表缺口（缺口是 `check` 误用率 87%~91% 的根因，见 actions.py）。
+# 新版本是旧版本的**超集**，因此旧产物仍可通过校验（向后兼容）。
+ACTION_SCHEMA_VERSION = "1.1"
 ACTIONS_BY_VERSION = {
-    ACTION_SCHEMA_VERSION: frozenset({
+    "1.0": frozenset({
         "goto", "fill", "click", "selectOption", "check", "hover", "press", "reload",
         "expectVisible", "expectText", "expectUrl", "waitFor",
-    })
+    }),
+    # 单一事实源：由 `prd2tc.actions` 派生，避免与提示词/门禁漂移
+    ACTION_SCHEMA_VERSION: ACTION_NAMES,
 }
 
 # 测试设计方法枚举：与 prompts/00-testing-principles.md §2、04-case-constraints.md §A.1 同源。

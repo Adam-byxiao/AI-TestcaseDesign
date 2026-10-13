@@ -43,7 +43,8 @@ def _case(cid: str, module: str, refs: list[str], *, title: str = "场景") -> d
         "requirement": list(refs),
         "preconditions": ["已登录"],
         "testData": ["account=normal"],
-        "steps": [{"action": "goto", "target": f"/console/{cid.lower()}"}],
+        "steps": [{"action": "goto", "target": f"/console/{cid.lower()}"},
+                  {"action": "expectVisible", "target": "控制台主体"}],
         "expected": [f"{title}后页面成功渲染并显示预期内容"],
     }
 

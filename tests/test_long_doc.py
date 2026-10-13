@@ -259,7 +259,7 @@ def test_module_context_slimmed():
         captured["user"] = user_text
         return LLMResult("```json\n[{\"id\":\"TC-AUTH-001\",\"module\":\"AUTH\",\"title\":\"登录\","
                          "\"design_method\":\"场景法\",\"priority\":\"P1\",\"tags\":[\"@regression\"],\"requirement\":[\"REQ-AUTH-001\"],"
-                         "\"steps\":[{\"action\":\"goto\",\"target\":\"/\"}],\"expected\":[\"页面成功渲染并显示预期内容\"]}]\n```", "fake")
+                         "\"steps\":[{\"action\":\"goto\",\"target\":\"/\"},{\"action\":\"expectVisible\",\"target\":\"页面主体\"}],\"expected\":[\"页面成功渲染并显示预期内容\"]}]\n```", "fake")
 
     reqs = [{"id": "REQ-AUTH-001", "module": "AUTH", "title": "登录"}]
     stages.run_stage_3_modules(
@@ -297,10 +297,10 @@ def test_generate_with_feedback_repair_path():
     responses = [
         LLMResult(content='```json\n[{"id":"TC-AUTH-001","module":"AUTH","title":"t","design_method": "场景法", "priority":"P1",'
                           '"tags":["@regression"],"requirement":["REQ-AUTH-001"],'
-                          '"steps":[{"action":"click"}],"expected":[]}]\n```', model="fake"),
+                          '"steps":[{"action":"click"},{"action":"expectVisible","target":"结果区"}],"expected":["页面成功渲染并显示预期内容"]}]\n```', model="fake"),
         LLMResult(content='```json\n[{"id":"TC-AUTH-001","module":"AUTH","title":"t","design_method": "场景法", "priority":"P1",'
                           '"tags":["@regression"],"requirement":["REQ-AUTH-001"],'
-                          '"steps":[{"action":"click","target":"按钮"}],"expected":["页面成功渲染并显示预期内容"]}]\n```', model="fake"),
+                          '"steps":[{"action":"click","target":"按钮"},{"action":"expectVisible","target":"结果区"}],"expected":["页面成功渲染并显示预期内容"]}]\n```', model="fake"),
     ]
 
     class Fake:
@@ -339,7 +339,7 @@ def test_generate_with_feedback_accumulates_cache_tokens():
                "\"steps\":[{\"action\":\"click\"}],\"expected\":[]}]\n```")
         good = ("```json\n[{\"id\":\"TC-AUTH-001\",\"module\":\"AUTH\",\"title\":\"t\",\"design_method\":\"场景法\",\"priority\":\"P1\","
                 "\"tags\":[\"@regression\"],\"requirement\":[\"REQ-AUTH-001\"],"
-                "\"steps\":[{\"action\":\"click\",\"target\":\"按钮\"}],\"expected\":[\"页面成功渲染并显示预期内容\"]}]\n```")
+                "\"steps\":[{\"action\":\"click\",\"target\":\"按钮\"},{\"action\":\"expectVisible\",\"target\":\"结果区\"}],\"expected\":[\"页面成功渲染并显示预期内容\"]}]\n```")
         cache_read = 0 if calls["n"] == 1 else 500  # 第 2 轮命中缓存
         return LLMResult(good if calls["n"] > 1 else bad, "fake", 100, 50,
                          cache_read_input_tokens=cache_read, cache_creation_input_tokens=200)

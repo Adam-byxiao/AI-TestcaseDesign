@@ -9,7 +9,11 @@
    - **必须与注入的 UI 契约里该取值所属的种类一致** —— 契约会分别列出「可用 id 锚点」「可用 class 锚点」「页签」「导航页」；
      把页签键当元素 id 用（如 `(id=tools)`，而 `tools` 只是页签键）会被门禁拒绝。
    - 无 UI 契约时省略括号，只写中文元素名。
-   - 动作取自动作枚举（goto/fill/click/selectOption/check/hover/press/reload/expectVisible/expectText/expectUrl/waitFor）。
+   - 动作必须取自系统注入的**动作清单**（每次生成时随「用例 JSON 字段约束」下发，
+     按「操作用 / 断言用」分组并带一句话说明）。**按语义选词**，不要一律用 `check`：
+     断言元素不可见用 `expectNotVisible`、按钮置灰用 `expectDisabled`、
+     数量用 `expectCount`、激活/展开态用 `expectState`、上传用 `upload`。
+   - **每条用例至少一个断言动作**（`expect*`）；`waitFor` 是同步等待，不算断言。
 3. **预期可断言**：URL / 文本 / 状态 / 金额；金额给精确值（¥ 千分位、2 位小数，如 ¥4,727.05）。
    - `expected` 每条**必须超过 8 个字符**（不含标点计数），且写明**可观测对象**：
      具体页面/元素/字段/状态/数值。含具体数字的断言不受长度限制（如「数量 1→2」）。

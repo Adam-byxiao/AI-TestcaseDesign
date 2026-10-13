@@ -24,7 +24,9 @@ def _case(**over):
     base = {"id": "TC-A-001", "module": "A", "title": "登录成功跳转首页",
             "design_method": "场景法", "priority": "P1", "tags": ["@regression"],
             "requirement": ["REQ-A-001"],
-            "steps": [{"action": "goto", "target": "/login", "data": ""}],
+            # 含断言动作：门禁要求每条用例至少一个 expect*
+            "steps": [{"action": "goto", "target": "/login", "data": ""},
+                      {"action": "expectVisible", "target": "登录表单", "data": ""}],
             "expected": ["登录成功后跳转首页"]}
     base.update(over)
     return base
@@ -142,7 +144,9 @@ def test_duplicate_detected_within_batch():
 def test_distinct_cases_not_flagged():
     ok = '```json\n' + json.dumps([
         _case(id="TC-A-001", expected=["登录成功后跳转首页"]),
-        _case(id="TC-A-002", steps=[{"action": "goto", "target": "/cart", "data": ""}],
+        _case(id="TC-A-002",
+              steps=[{"action": "goto", "target": "/cart", "data": ""},
+                     {"action": "expectText", "target": "购物车商品数", "data": "1"}],
               expected=["购物车页面展示 1 件商品"]),
     ], ensure_ascii=False) + '\n```'
     assert gates.check_cases_text(ok, {"A"}) == []
@@ -164,9 +168,13 @@ def test_validate_dir_total_is_sum_not_product(tmp_path):
     import json as _json
     for name in ("A.json", "B.json", "C.json"):
         (tmp_path / name).write_text(_json.dumps([
-            _case(id=f"TC-{name[0]}-001", steps=[{"action": "goto", "target": f"/{name}", "data": ""}],
+            _case(id=f"TC-{name[0]}-001",
+                  steps=[{"action": "goto", "target": f"/{name}", "data": ""},
+                         {"action": "expectVisible", "target": f"{name} 页面主体", "data": ""}],
                   expected=[f"{name} 页面成功渲染"]),
-            _case(id=f"TC-{name[0]}-002", steps=[{"action": "goto", "target": f"/{name}/2", "data": ""}],
+            _case(id=f"TC-{name[0]}-002",
+                  steps=[{"action": "goto", "target": f"/{name}/2", "data": ""},
+                         {"action": "expectVisible", "target": f"{name} 第二页主体", "data": ""}],
                   expected=[f"{name} 第二页成功渲染"]),
         ], ensure_ascii=False), encoding="utf-8")
     total, errors = validate_dir(tmp_path, {"A", "B", "C"})
@@ -243,7 +251,8 @@ def test_transit_mode_table_example_passes_gate():
         "tags": ["@smoke", "@auth"], "requirement": ["REQ-AUTH-002"],
         "preconditions": ["存在 normal 状态账号"],
         "testData": ["phone=13800138000"],
-        "steps": [{"action": "goto", "target": "/login", "data": ""}],
+        "steps": [{"action": "goto", "target": "/login", "data": ""},
+                  {"action": "expectVisible", "target": "首页导航栏", "data": ""}],
         "expected": ["登录成功后跳转首页"],
     }]
     assert gates.check_cases_text(render_table(cases), {"AUTH"}, markdown_transit=True) == []

@@ -13,6 +13,7 @@ import json
 import re
 from pathlib import Path
 
+from prd2tc.actions import ASSERTIONS, is_assertion
 from prd2tc.schema import (ACTION_SCHEMA_VERSION, ACTIONS_BY_VERSION, DESIGN_METHODS,
                            validate_step_data, validate_test_data)
 
@@ -173,9 +174,21 @@ def validate_case(case: dict, index: int, seen_ids: set[str], allowed_modules: s
             errors.append(f"{at} step 不是对象")
             continue
         if s.get("action") not in ACTIONS:
-            errors.append(f"{at} step.action 非法: {s.get('action') or '(空)'}")
+            errors.append(
+                f"{at} step.action 非法: {s.get('action') or '(空)'}；"
+                f"可选 {sorted(ACTIONS)}")
         if not s.get("target"):
             errors.append(f"{at} step.target 为空")
+    # 断言存在性：**每条用例至少 1 个断言动作**。
+    # 否则用例只有 goto/fill/click，无法判定通过/失败，却完全合规
+    # （实测评测 v1/v2/v3 分别有 5/4/1 条这样的用例）。
+    # 注：`waitFor` 是**同步动作**（等待就绪），不算断言 —— 这是常见误解。
+    if isinstance(steps, list) and steps:
+        if not any(is_assertion(s.get("action")) for s in steps if isinstance(s, dict)):
+            errors.append(
+                f"{at} 缺少断言步骤：用例必须至少包含一个断言动作"
+                f"（{'/'.join(sorted(ASSERTIONS))}）；"
+                f"仅用 click/fill/goto/waitFor 无法判定通过或失败")
 
     expected = case.get("expected")
     errors.extend(check_expectations(case, at))
