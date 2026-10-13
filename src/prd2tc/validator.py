@@ -1,4 +1,4 @@
-"""用例 JSON 校验（与 docs/case-template.md 字段规范一致）。
+"""用例 JSON 校验（与 docs/case-spec.md 字段规范一致）。
 
 规则与 scripts/orchestrate.mjs 对齐：
   - id 必填且唯一，格式 TC-<MOD>[-<SUB>]-<3位序号>
@@ -29,7 +29,7 @@ ID_RE = re.compile(r"^TC-[A-Z][A-Z0-9_]*(-[A-Z0-9_]+)?-\d{3}$")
 REQ_RE = re.compile(r"^REQ-[A-Z][A-Z0-9_]*-\d{3}$")
 
 # ---- 约束实现（对应 prompts/00-testing-principles.md 的 [必须]/[禁止] 条目）----
-# 每条都在 docs/prompt-gate-optimization.md 的约束登记表中有编号，改门禁时需同步登记。
+# 判据与提示词中的示例必须一致（见 docs/prompts-and-gates.md 的「三层约束体系」）。
 
 # C-006 禁止不可验证预期（00-testing-principles.md §4）
 # 空洞断言词表：命中后仍需长度保护，避免误伤「页面跳转正常，提示"余额不足"」这类含具体内容的表述。
@@ -44,7 +44,7 @@ _VAGUE_MAX_LEN = 12       # 长度保护：超过此长度视为含具体内容
 # 要求预期写成完整可断言的句子。
 # 代价（实测 18 条真实样本）：拦截率 38.9%，含示例库 2 条。
 # 因此示例库 / prompt 示例 / 文档必须同步改为长句——否则模型照抄示例即被拦，
-# 形成「示例→门禁→重试」死循环（即 docs/prompt-gate-optimization.md 的 R-1）。
+# 形成「示例→门禁→重试」死循环（见 docs/prompts-and-gates.md 的事故记录）。
 _MIN_EXPECTED_LEN = 8
 
 # C-007 禁止重复用例（00-testing-principles.md §4）

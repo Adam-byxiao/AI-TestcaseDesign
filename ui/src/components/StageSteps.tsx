@@ -70,6 +70,12 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
 }){
   const [busy,setBusy]=useState<string>('');
   const [dirty,setDirty]=useState<Record<string,boolean>>({});
+  /** 各阶段当前编辑中的草稿体。
+   *
+   *  用户明确要求**不要用「先手动保存草稿」来分离流程** —— 因此「确认并进入下一步」
+   *  必须直接带上这里的内容。只上报 `dirty` 标志是不够的：那样父级拿不到内容，
+   *  未保存的编辑会被静默丢弃（这正是此前的缺陷）。 */
+  const [drafts,setDrafts]=useState<Record<string,any>>({});
   /** 已展开产物面板的阶段。
    *
    *  **必须是受控状态**：Collapse 若不受控，「查看产物」按钮就无法从外部展开它 ——
@@ -93,9 +99,14 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
    *  这道操作**取代了原先「先保存草稿、再批准」的两步心智模型** ——
    *  用户只需表达「这一步的结果我认可」，是否改过内容由系统自行处理：
    *  `approve` 接口本就支持带 body（等价于先存草稿再批准）。 */
+  /** 确认并进入下一步。
+   *
+   *  这道操作**取代了原先「先保存草稿、再批准」的两步心智模型** ——
+   *  用户只需表达「这一步的结果我认可」，是否改过内容由系统自行处理：
+   *  若有未保存编辑，连同内容一起提交（`approve` 接口本就支持带 body）。 */
   const confirm=(s:Stage)=>{
     setBusy(s);onStageChange(s);
-    runApi.approve(run.taskId,s)
+    runApi.approve(run.taskId,s,drafts[s])
       .then(()=>{message.success(s==='cases'?'已确认，运行完成':'已确认，正在进入下一步');return onRefresh()})
       .catch((error:any)=>message.error(error?.response?.data?.detail||'确认失败'))
       .finally(()=>setBusy(''));
@@ -128,7 +139,7 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
         style={stage===info.key?{borderColor:'#1677ff'}:undefined}
         title={<Space>{iconFor(phase)}<Typography.Text strong>{info.title}</Typography.Text>
           <Tag color={label.color}>{label.text}</Tag>
-          {dirty[info.key]&&<Tag color="gold">有未保存修改</Tag>}</Space>}
+          {dirty[info.key]&&<Tag color="gold">有未保存修改（确认时会一并提交）</Tag>}</Space>}
         extra={<Space size={4}>
           {meta?.durationMs?<Tooltip title="该阶段耗时"><span className="metrics-muted">{fmtMs(meta.durationMs)}</span></Tooltip>:null}
           {meta?.model?<Tooltip title="该阶段使用的模型"><span className="metrics-muted">{meta.model}</span></Tooltip>:null}
@@ -169,7 +180,8 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
             key:'artifact',
             label:phase==='failed'?'查看失败输出':'查看 / 编辑产物',
             children:<StageEditor runId={run.taskId} stage={info.key}
-              onDirtyChange={(value)=>setDirty(current=>({...current,[info.key]:value}))}/>,
+              onDirtyChange={(value)=>setDirty(current=>({...current,[info.key]:value}))}
+              onDraftChange={(payload)=>setDrafts(current=>({...current,[info.key]:payload}))}/>,
           }]}/>}
       </Card>;
     })}

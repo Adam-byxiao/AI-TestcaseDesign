@@ -3,20 +3,24 @@ import {Alert,Button,Card,Col,Input,Row,Select,Space,Table,Tabs,Tag,message,Draw
 import ReactMarkdown from 'react-markdown'; import remarkGfm from 'remark-gfm';
 import {runApi} from '../api'; import type {Case,Requirement,Stage} from '../types';
 
-export default function StageEditor({runId,stage,refreshToken,onDirtyChange}:{runId:string;stage:Stage;refreshToken?:string;onDirtyChange?:(dirty:boolean)=>void}){
+export default function StageEditor({runId,stage,refreshToken,onDirtyChange,onDraftChange}:{runId:string;stage:Stage;refreshToken?:string;onDirtyChange?:(dirty:boolean)=>void;onDraftChange?:(payload:any)=>void}){
   const [markdown,setMarkdown]=useState(''); const [rows,setRows]=useState<any[]>([]);
   const [files,setFiles]=useState<any[]>([]); const [trace,setTrace]=useState<any>(); const [loading,setLoading]=useState(false); const loadedRef=useRef(false);
   // 这里刻意不做自动保存 —— 用户可能只是想看看，而非改动。
   const [dirty,setDirty]=useState(false);
-  /** 向上通报未保存状态。
+  /** 向上通报未保存状态**与当前草稿内容**。
    *
-   *  ⚠ 必须把回调放进 ref 并**只依赖 `dirty`**：父级通常传内联箭头函数，
+   *  为什么要连内容一起上报：用户明确要求**不要用「先手动保存草稿」来分离流程** ——
+   *  「确认并进入下一步」应当直接带上当前编辑内容。若只上报 `dirty` 标志，
+   *  父级在确认时无从取得内容，只能依赖「用户此前已点过保存」，
+   *  于是未保存的编辑会被静默丢弃（这正是原先的缺陷）。
+   *
+   *  ⚠ 必须把回调放进 ref 并**只依赖值**：父级通常传内联箭头函数，
    *  每次渲染都是新引用。若直接写进依赖数组，就会
    *  「effect 触发 → setState → 重渲染 → 新回调 → effect 再触发」**无限循环**
    *  （实测：面板一展开页面即卡死。此前面板无法展开，所以这个缺陷被隐藏了很久）。 */
-  const dirtyCallbackRef=useRef(onDirtyChange);
-  dirtyCallbackRef.current=onDirtyChange;
-  useEffect(()=>{dirtyCallbackRef.current?.(dirty)},[dirty]);
+  const callbacksRef=useRef({onDirtyChange,onDraftChange});
+  callbacksRef.current={onDirtyChange,onDraftChange};
   const [selectedCase,setSelectedCase]=useState<string>();
   const [selectedRequirement,setSelectedRequirement]=useState<string>();
   /** 行的**稳定标识**。
@@ -56,7 +60,14 @@ export default function StageEditor({runId,stage,refreshToken,onDirtyChange}:{ru
   },[runId,stage]);
   /** 按**稳定标识**改字段（不是页内序号，见 keyOf 的说明）。 */
   const change=(key:string,field:string,value:any)=>{setRows(current=>current.map((row,i)=>keyOf(row,i)===key?{...row,[field]:value}:row));setDirty(true)};
-  const save=async()=>{const body=stage==='analysis'?{markdown,requirements:rows}:stage==='plan'?{markdown}:{cases:rows};await runApi.saveDraft(runId,stage,body);setDirty(false);message.success('修改已保存')};
+  /** 草稿体：`approve` 可直接把它作为请求体提交（服务端 approve 会先存草稿再应用）。 */
+  const draftBody=()=>stage==='analysis'?{markdown,requirements:rows}:stage==='plan'?{markdown}:{cases:rows};
+  // 同时上报「是否有未保存修改」与「当前内容」——父级确认时据此提交，无需用户先手动保存。
+  useEffect(()=>{
+    callbacksRef.current.onDirtyChange?.(dirty);
+    if(dirty)callbacksRef.current.onDraftChange?.(draftBody());
+  },[dirty,markdown,rows,stage]);
+  const save=async()=>{await runApi.saveDraft(runId,stage,draftBody());setDirty(false);message.success('修改已保存')};
   const reqColumns=[{title:'REQ ID',dataIndex:'id',width:155},{title:'模块',dataIndex:'module',width:100},{title:'标题',dataIndex:'title',render:(v:string,row:any,i:number)=><Input value={v} onChange={e=>change(keyOf(row,i),'title',e.target.value)}/>},{title:'优先级',dataIndex:'priority',width:100,render:(v:string,row:any,i:number)=><Select value={v} onChange={x=>change(keyOf(row,i),'priority',x)} options={['P0','P1','P2','P3'].map(x=>({value:x,label:x}))}/>},{title:'来源',dataIndex:'sourceRefs',width:100,render:(v:any[])=><Tag title={v?.map(x=>`${x.chunkId} [${x.start}-${x.end}]`).join('\n')}>{v?.length||0} 段</Tag>},{title:'编辑',render:(_:any,row:any,i:number)=><Button size="small" onClick={()=>setSelectedRequirement(keyOf(row,i))}>详情</Button>}];
   const caseColumns=[{title:'用例 ID',dataIndex:'id',width:180},{title:'模块',dataIndex:'module',width:100},{title:'标题',dataIndex:'title',render:(v:string,row:any,i:number)=><Input value={v} onChange={e=>change(keyOf(row,i),'title',e.target.value)}/>},{title:'优先级',dataIndex:'priority',width:90},{title:'状态',dataIndex:'status',width:140,render:(v:string,row:any,i:number)=><Select value={v||'active'} onChange={x=>change(keyOf(row,i),'status',x)} options={['active','needs_review','deprecated','superseded'].map(x=>({value:x,label:x}))}/>},{title:'REQ',dataIndex:'requirement',render:(v:string[])=>v?.join(', ')},{title:'编辑',render:(_:any,row:any,i:number)=><Button size="small" onClick={()=>setSelectedCase(keyOf(row,i))}>详情</Button>}];
   const findRow=(key?:string)=>key===undefined?undefined:rows.find((row,i)=>keyOf(row,i)===key);

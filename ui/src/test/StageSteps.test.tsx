@@ -82,7 +82,34 @@ describe('StageSteps 三步式阶段',()=>{
   it('确认动作调用 approve（不再要求先手动保存草稿）',async()=>{
     const {onRefresh}=renderSteps(baseRun());
     fireEvent.click(screen.getByRole('button',{name:/确认并进入下一步/}));
-    await waitFor(()=>expect(runApi.approve).toHaveBeenCalledWith('run-1','analysis'));
+    // 无编辑时第三个参数为 undefined —— 但**调用本身必须发生**
+    await waitFor(()=>expect(runApi.approve).toHaveBeenCalledWith('run-1','analysis',undefined));
+    await waitFor(()=>expect(onRefresh).toHaveBeenCalled());
+  });
+
+  it('**有未保存编辑时，确认会连同内容一起提交**（不再静默丢弃）',async()=>{
+    // **核心回归**：原先「确认」只发 `{sessionId}`，未点「保存修改」的编辑会被静默丢弃；
+    // 而用户明确要求不要用「先手动保存草稿」来分离流程。
+    // 服务端 approve 本就支持带 body（会先存草稿再应用），因此这里断言内容确实被带上。
+    vi.mocked(runApi.artifacts).mockResolvedValue([{path:'analysis/requirements.json'},
+                                                   {path:'analysis/需求分析报告.md'}] as any);
+    vi.mocked(runApi.artifact).mockImplementation(async(_id:string,path:string)=>
+      path.endsWith('.json')
+        ? ({requirements:[{id:'REQ-A-001',module:'A',title:'登录',priority:'P0',
+                           description:'',acceptanceCriteria:[],exceptionFlows:[]}]} as any)
+        : ('# 报告' as any));
+    const {onRefresh}=renderSteps(baseRun());
+    fireEvent.click(await screen.findByRole('button',{name:'查看产物'}));
+    // 「结构化需求」是默认页签，直接改标题输入框即可触发 dirty + onDraftChange
+    const titleInput=await screen.findByDisplayValue('登录');
+    fireEvent.change(titleInput,{target:{value:'我改过的需求标题'}});
+    fireEvent.click(screen.getByRole('button',{name:/确认并进入下一步/}));
+    await waitFor(()=>expect(runApi.approve).toHaveBeenCalled());
+    const call=vi.mocked(runApi.approve).mock.calls[0] as any[];
+    expect(call[0]).toBe('run-1');
+    expect(call[1]).toBe('analysis');
+    expect(call[2]).toBeTruthy();                       // 必须带上草稿体
+    expect(JSON.stringify(call[2])).toContain('我改过的需求标题');
     await waitFor(()=>expect(onRefresh).toHaveBeenCalled());
   });
 

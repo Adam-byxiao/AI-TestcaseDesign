@@ -26,8 +26,11 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-MANIFEST_NAME = "manifest.json"
-LEGACY_MANIFEST_NAME = "run-manifest.json"
+# 清单文件名**只有一处分发**：写入方 `io` 定义主/次，这里直接复用。
+# 原先两处各自定义且**语义相反**（io: run-manifest 主 / artifacts: manifest 主）——
+# 由于读写两侧都会兜底尝试两个名字，当时没有功能影响，
+# 但一旦有人只写其一，两边对「哪个是权威」的理解就会分叉。故统一到写入方。
+from prd2tc.io import LEGACY_MANIFEST_NAME, MANIFEST_NAME
 
 # 阶段序号 → 语义名（与 service.stage_name 保持一致）
 STAGE_NAMES = {"1": "analysis", "2": "plan", "3": "cases"}

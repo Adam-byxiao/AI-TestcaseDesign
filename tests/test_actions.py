@@ -118,7 +118,7 @@ def test_prompt_files_no_longer_hardcode_action_enum():
     """
     stale = "goto/fill/click/selectOption/check/hover/press/reload/expectVisible/expectText/expectUrl/waitFor"
     for name in ("prompts/00-testing-principles.md", "prompts/04-case-constraints.md",
-                 "docs/case-template.md"):
+                 "docs/case-spec.md"):
         text = (REPO / name).read_text(encoding="utf-8")
         assert stale not in text, f"{name} 仍手写旧动作枚举"
 
@@ -143,6 +143,40 @@ def test_packaged_prompts_stay_in_sync_with_repo_prompts():
         if src.read_bytes() != twin.read_bytes():
             mismatched.append(f"{src.name}: 内容不一致")
     assert not mismatched, mismatched
+
+
+def test_packaged_templates_stay_in_sync_with_repo_templates():
+    """**核心回归**：`assets/templates/` 也必须与 `templates/` 一致。
+
+    为什么必须单独测：同步脚本原先**只处理 `prompts/`**，模板侧完全没被覆盖 ——
+    实测 `assets/templates/` 因此缺少 `test-case.template.md`（仓库里有、安装后没有）。
+    上面那个提示词测试也只看 `prompts/`，所以漏了整整一类资产。
+
+    这里做**双向**检查：既查内容不一致，也查「仓库有而 assets 缺」，
+    后者才是本次实际发生的缺陷形态。
+    """
+    repo = REPO / "templates"
+    assets = REPO / "src" / "prd2tc" / "assets" / "templates"
+    if not assets.is_dir():
+        pytest.skip("未打包 assets/templates")
+    problems = []
+    for src in sorted(repo.glob("*.md")):
+        twin = assets / src.name
+        if not twin.is_file():
+            problems.append(f"{src.name}: assets/templates 缺失（安装后不可用）")
+        elif src.read_bytes() != twin.read_bytes():
+            problems.append(f"{src.name}: 内容不一致")
+    for extra in sorted(assets.glob("*.md")):
+        if not (repo / extra.name).is_file():
+            problems.append(f"{extra.name}: assets 中存在但仓库 templates/ 已无")
+    assert not problems, problems
+
+
+def test_sync_script_covers_both_asset_kinds():
+    """同步脚本必须同时覆盖提示词与模板（防止再次漏掉一类资产）。"""
+    script = (REPO / "scripts" / "sync_prompts.py").read_text(encoding="utf-8")
+    assert '"prompts"' in script and '"templates"' in script, \
+        "sync_prompts.py 未覆盖 templates/（模板会再次漂移）"
 
 
 # ---------- 断言存在性门禁 ----------

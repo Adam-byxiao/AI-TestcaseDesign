@@ -43,7 +43,8 @@ def load_prd(path: str | Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
-def load_bundle(prd, *, extra_dirs: list | None = None, warnings: list | None = None):
+def load_bundle(prd, *, extra_dirs: list | None = None, warnings: list | None = None,
+                include_references: bool = False):
     """把 PRD 输入归一化为 `ingest.Bundle`（正文 + 资产 + 来源清单）。
 
     与 `load_prd` 的关系：`load_prd` 只读**单个 UTF-8 文本文件**，
@@ -82,7 +83,8 @@ def load_bundle(prd, *, extra_dirs: list | None = None, warnings: list | None = 
             inputs = inputs + [d for d in _images.candidate_dirs(p) if d != p.parent]
     inputs = inputs + [d for d in (extra_dirs or []) if d is not None]
     return ingest.ingest(inputs, warnings=warnings, preferred_primary=preferred,
-                         base_dir=_common_base(inputs))
+                         base_dir=_common_base(inputs),
+                         include_references=include_references)
 
 
 def _common_base(inputs) -> Path | None:

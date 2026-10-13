@@ -311,6 +311,53 @@ def test_include_references_escape_hatch():
     assert "## 附件：x-service.md" in b.text
 
 
+def test_include_references_reachable_from_cli_and_loader(tmp_path):
+    """**接线回归**：`--include-references` 必须真的能从 CLI 一路传到摄取层。
+
+    为什么单独测：逃生阀原先只存在于库 API（`ingest.ingest(..., include_references=True)`），
+    **CLI 参数没有注册、`load_bundle`/`GenerateRequest` 也未透传** ——
+    而报错与告警文案却明确写着「如需纳入请加 --include-references」，
+    用户照做只会得到 `unrecognized arguments`（实测）。
+
+    因此这里断言**整条链路**：CLI 解析 → loader → ingest 角色判定。
+    """
+    from prd2tc import loader
+    from prd2tc.cli import build_parser
+
+    # ① CLI 参数存在且能解析
+    args = build_parser().parse_args(
+        ["generate", "--prd", "PRD.md", "--include-references", "--dry-run"])
+    assert args.include_references is True
+    # 默认关闭（参考资料不应被静默并入）
+    args_default = build_parser().parse_args(["generate", "--prd", "PRD.md", "--dry-run"])
+    assert args_default.include_references is False
+
+    # ② loader 会把它透传下去（这里用真实文件验证角色判定确实变了）
+    prd = tmp_path / "PRD.md"
+    prd.write_text("# 需求\n\n要点。\n", encoding="utf-8")
+    api = tmp_path / "x-service.md"
+    api.write_text("# 接口文档\n\nGET /a\nPOST /b\nGET /c\nPOST /d\n"
+                   "GET /e\nPOST /f\nGET /g\nPOST /h\n", encoding="utf-8")
+
+    default_bundle = loader.load_bundle([prd, api])
+    assert {s.name: s.role for s in default_bundle.sources}["x-service.md"] == "reference"
+    assert "## 附件：x-service.md" not in default_bundle.text
+
+    forced = loader.load_bundle([prd, api], include_references=True)
+    assert {s.name: s.role for s in forced.sources}["x-service.md"] == "attachment"
+    assert "## 附件：x-service.md" in forced.text
+
+
+def test_generate_request_carries_include_references():
+    """`GenerateRequest` 必须携带该开关（否则 pipeline 重建请求时会丢）。"""
+    import dataclasses
+    from prd2tc.pipeline import GenerateRequest
+    field = next((f for f in dataclasses.fields(GenerateRequest)
+                  if f.name == "include_references"), None)
+    assert field is not None, "GenerateRequest 缺少 include_references 字段"
+    assert field.default is False
+
+
 def test_prototype_html_excluded_from_body():
     """原型 HTML **不进正文**（只解析为 UI 契约）。
 

@@ -44,6 +44,8 @@ class GenerateRequest:
     from_stage: str = ""
     # 允许复用「为另一份 PRD 生成」的上游产物（默认禁止：那是静默错配的来源）
     allow_stale_artifacts: bool = False
+    # 把被判定为「参考资料」的接口/服务文档也并入需求正文（默认不并入，见 ingest）
+    include_references: bool = False
     profile: str = "generic"
     min_cases_per_requirement: int | None = None
     max_gate_retries: int = 2
@@ -227,7 +229,8 @@ class PipelineRunner:
         # PRD 摄取：统一走 ingest（支持 md/txt/docx/pdf/zip/图片/多文件）。
         # 服务层上传后可直接传 bundle，避免重复读盘与重复解析。
         bundle = request.bundle if request.bundle is not None else loader.load_bundle(
-            request.prd, extra_dirs=getattr(request, "image_dirs", None))
+            request.prd, extra_dirs=getattr(request, "image_dirs", None),
+            include_references=getattr(request, "include_references", False))
         text = bundle.text
         path = _prd_path(request, bundle)
         if not text.strip() and not bundle.images():

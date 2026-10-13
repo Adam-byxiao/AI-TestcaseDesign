@@ -346,3 +346,24 @@ def test_resume_flag_also_catches_prd_change(tmp_path):
         runner.generate(GenerateRequest(prd=prd, out=out, product="P", version="v1",
                                         stub=True, jobs=1, stage="2", resume=True))
     assert "PRD 与历史运行不一致" in str(exc.value)
+
+
+def test_manifest_name_constants_have_single_source_of_truth():
+    """**核心回归**：清单文件名常量只能有**一处分发**，`artifacts` 与 `io` 必须一致。
+
+    为什么必须锁：这两处曾**各自定义且语义相反** ——
+    `io` 认为 `run-manifest.json` 是主、`manifest.json` 是兼容副本；
+    `artifacts` 则完全反过来。因为读写两侧都会兜底尝试两个名字，
+    当时没有功能影响，但「哪个是权威」的理解已经分叉：
+    一旦有人只写其一（例如新增一条只写 MANIFEST_NAME 的路径），
+    两侧就会指向不同文件，而这种错配不会有任何报错。
+
+    修法是让 `artifacts` 直接复用 `io` 的常量（写入方为权威）。
+    本测试同时锁住「值一致」与「语义方向」，防止改回去。
+    """
+    from prd2tc import artifacts, io
+    assert artifacts.MANIFEST_NAME == io.MANIFEST_NAME
+    assert artifacts.LEGACY_MANIFEST_NAME == io.LEGACY_MANIFEST_NAME
+    # 语义固定：权威清单是 run-manifest.json（写入方 io 的约定）
+    assert io.MANIFEST_NAME == "run-manifest.json"
+    assert io.LEGACY_MANIFEST_NAME == "manifest.json"
