@@ -17,6 +17,7 @@ from prd2tc import metrics
 from prd2tc import images
 from prd2tc import ingest
 from prd2tc import prototype
+from prd2tc import priority
 from prd2tc.profiles import get_profile
 from prd2tc.schema import normalize_cases
 from prd2tc.traceability import build_traceability, validate_traceability
@@ -437,6 +438,11 @@ class PipelineRunner:
                 try: cases,r3=stages.run_stage_3_modules(self.config,plan,reqs,text,llm=llm,examples=request.examples,jobs=request.jobs,use_gate=not(request.stub or request.no_gate),max_gate_retries=request.max_gate_retries,load_checkpoint=load,save_checkpoint=save,save_failure=fail_save,token_callback=tok_cb,status_callback=status,batch_callback=on_batch,reporter=lambda *_: None,ui_spec=ui_spec,image_context=images.render_image_spec(image_spec) if image_spec else "")
                 except ValidationError as e: cases=[]; r3=LLMResult("",self.config.model); errors=list(e.errors)
                 else: errors=[]
+                # 优先级确定性重判：与 id 重编号、模块码强制同构。
+                # 必须在 build_traceability 与落盘**之前**，且同步维护 @smoke
+                # （门禁要求 P0 必带，而重判会产生新的 P0）。
+                if cases:
+                    priority.regrade(cases, reqs)
                 matrix=build_traceability(reqs,cases,min_cases=min_cases) if not errors else {}; errors += validate_traceability(matrix) if matrix else []
                 if errors and not request.allow_gate_fail:
                     # 门禁失败时**不再丢弃**已生成的用例：实测运行 9d97060e 已产出 43 条，

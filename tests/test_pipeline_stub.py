@@ -43,7 +43,6 @@ def test_generate_stub_end_to_end(tmp_path):
     """generate --stub 全流程：三阶段产物 + 校验通过"""
     code = cli.main(["generate", "--prd", str(SAMPLE_PRD), "--stub", "--out", str(tmp_path)])
     assert code == 0
-
     out = tmp_path / PRODUCT / VERSION
     assert (out / "manifest.json").is_file()
     assert (out / "run-manifest.json").is_file()
@@ -56,6 +55,19 @@ def test_generate_stub_end_to_end(tmp_path):
     total, errors = validate_dir(out / "cases" / "cases")
     assert errors == []
     assert total == 1
+
+    # **接线回归**：流水线必须真的调用优先级重判。
+    # 只测 `priority.regrade` 纯函数不够 —— 「是否被调用」是独立的一行，
+    # 删掉它纯函数测试仍全绿（变异测试漏报过一次）。
+    saved = json.loads(cases_file.read_text(encoding="utf-8"))
+    saved_cases = saved if isinstance(saved, list) else saved.get("cases", [])
+    c0 = saved_cases[0]
+    assert c0.get("prioritySource") == "graded", c0
+    assert c0.get("priorityBasis", {}).get("dimension"), c0
+    # 门禁契约：P0 必带 @smoke —— 重判会产生新 P0，必须同步补标签
+    for c in saved_cases:
+        if c.get("priority") == "P0":
+            assert "@smoke" in (c.get("tags") or []), c
 
     md = (out / "cases" / "用例集.md").read_text(encoding="utf-8")
     assert "Traceability" in md or "需求回溯表" in md
