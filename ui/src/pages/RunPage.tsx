@@ -1,30 +1,34 @@
-import {useEffect,useState} from 'react'; import {useParams} from 'react-router-dom'; import {Card,Timeline,Button,Space,Alert,Tag,message,Table,Typography} from 'antd'; import {runApi} from '../api'; import {useRun} from '../hooks'; import type {Stage} from '../types'; import StageSteps from '../components/StageSteps'; import RunProgress from '../components/RunProgress'; import ExportDialog from '../components/ExportDialog';
+import {useEffect,useState} from 'react'; import {useParams} from 'react-router-dom'; import {Card,Timeline,Button,Space,Alert,Tag,message,Table,Typography} from 'antd'; import {runApi} from '../api'; import {useRun} from '../hooks'; import type {CaseSelection,Stage} from '../types'; import {EMPTY_SELECTION,selectionActive} from '../types'; import StageSteps from '../components/StageSteps'; import RunProgress from '../components/RunProgress'; import ExportDialog from '../components/ExportDialog'; import CaseFilterPanel from '../components/CaseFilterPanel';
 const stages:Stage[]=['analysis','plan','cases'];
 export default function RunPage(){
   const {id}=useParams();
   const {run,events,metrics,refresh}=useRun(id);
   const [stage,setStage]=useState<Stage>('analysis');
   const [exportOpen,setExportOpen]=useState(false);
+  const [selection,setSelection]=useState<CaseSelection>({...EMPTY_SELECTION});
   useEffect(()=>{if(run?.currentStage&&stages.includes(run.currentStage as Stage))setStage(run.currentStage as Stage)},[run]);
   if(!run)return <Card loading/>;
 
   const reject=async()=>{const reason=window.prompt('驳回原因');if(reason){try{await runApi.reject(run.taskId,stage,reason);refresh()}catch(error:any){message.error(error?.response?.data?.detail||'驳回失败')}}};
   const retry=async(module:string)=>{try{await runApi.retryModule(run.taskId,module);message.success(`已重试 ${module}`);refresh()}catch(error:any){message.error(error?.response?.data?.detail||'模块重试失败')}};
-  // 导出：走后端 /api/v1/exports/{id}/{fmt}。文件名与保存位置在对话框里决定
-  // （原先 window.open 直接下载，文件名不可改、位置不可选、失败也看不出来）。
+  // 导出：走后端 /api/v1/exports/{id}/{fmt}。文件名、保存位置与**用例筛选**
+  // 都在对话框/选择器里决定（原先是 window.open 直接下载，一律全量且不可改）。
   const canExport=Boolean(run.modules&&Object.keys(run.modules).length>0);
   const product=run.product||''; const version=run.version||'';
   const modules=Object.entries(run.modules||{}).map(([module,status])=>({module,status}));
   const errors=run.errors||[];
   const isRunning=['pending','running'].includes(run.status);
+  const hasCases=canExport||Object.values(run.modules||{}).some(s=>['succeeded','skipped'].includes(String(s)));
 
   return <div className="page"><Space direction="vertical" size="large" style={{width:'100%'}}>
     <Card title={`运行 ${run.runId||run.taskId}`} extra={<Space wrap>
         {run.mode&&<Tag color={run.mode==='stub'?'gold':'blue'}>模式：{run.mode==='stub'?'Stub 离线验收':'真实模型'}</Tag>}
         {run.llm&&<Tag>{run.llm.provider} / {run.llm.model}</Tag>}
         <Tag color={run.status==='succeeded'?'green':run.status==='failed'?'red':isRunning?'processing':'default'}>整体：{run.status}</Tag>
-        <Button onClick={()=>setExportOpen(true)} disabled={!canExport}
-          title={canExport?'选择格式、文件名与保存位置':'尚无用例产物'}>导出…</Button>
+        <Button type="primary" onClick={()=>setExportOpen(true)} disabled={!canExport}
+          title={canExport?'选择要导出的用例范围、格式与保存位置':'尚无用例产物'}>
+          导出{selectionActive(selection)?'（已筛选）':''}…
+        </Button>
         <Button danger onClick={()=>runApi.cancel(run.taskId).then(refresh)} disabled={['succeeded','cancelled'].includes(run.status)}>取消</Button>
       </Space>}>
       {run.status==='failed'&&<Alert type="error" showIcon style={{marginBottom:12}} message="质量门禁或运行失败"
@@ -34,6 +38,9 @@ export default function RunPage(){
         </Space>}/>}
       <StageSteps run={run} stage={stage} onStageChange={setStage} onRefresh={refresh}/>
     </Card>
+
+    {/* 批量选择放在导出之前：先决定「要哪些」，再决定「怎么导出」。 */}
+    {hasCases&&<CaseFilterPanel runId={run.taskId} value={selection} onChange={setSelection}/>}
 
     <RunProgress metrics={metrics}/>
 
@@ -52,6 +59,7 @@ export default function RunPage(){
       <Timeline items={events.slice().reverse().slice(0,60).map(e=>({children:<><Tag>{e.stage}</Tag>{e.message}<small> {e.createdAt}</small></>}))}/>
     </Card>
   </Space>
-  <ExportDialog open={exportOpen} runId={run.taskId} product={product} version={version} onClose={()=>setExportOpen(false)}/>
+  <ExportDialog open={exportOpen} runId={run.taskId} product={product} version={version}
+    selection={selection} onClose={()=>setExportOpen(false)}/>
   </div>;
 }

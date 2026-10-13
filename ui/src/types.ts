@@ -1,4 +1,19 @@
 export type Stage = 'analysis'|'plan'|'cases';
+/** 分面统计（服务端 `/cases/facets`）：各维度的可选值与其当前数量。 */
+export interface FacetItem { value:string; count:number; }
+export interface CaseFacets {
+  total:number; matched:number;
+  modules:FacetItem[]; priorities:FacetItem[]; tags:FacetItem[];
+  filter?:CaseFilterSummary;
+}
+export interface CaseFilterSummary {
+  filter:string; filtered:boolean; total:number; matched:number; excluded:number;
+}
+/** 用例批量选择条件。维度内取并集、跨维度取交集（与服务端 casefilter 同语义）。 */
+export interface CaseSelection { modules:string[]; priorities:string[]; tags:string[]; keyword:string; }
+export const EMPTY_SELECTION:CaseSelection={modules:[],priorities:[],tags:[],keyword:''};
+export const selectionActive=(s?:CaseSelection)=>
+  Boolean(s&&(s.modules.length||s.priorities.length||s.tags.length||s.keyword.trim()));
 /** 摄取摘要（服务端回显）：正文来自哪个文件、识别出多少资产、有哪些告警。 */
 export interface UploadBundle {
   primary:string; textChars:number; sourceCount:number;

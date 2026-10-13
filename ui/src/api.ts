@@ -1,4 +1,5 @@
-import axios from 'axios'; import type {Prd,Run,Stage,UploadBundle} from './types';
+import axios from 'axios'; import type {CaseFacets,CaseSelection,Prd,Run,Stage,UploadBundle} from './types';
+import {selectionActive} from './types';
 export const api=axios.create({baseURL:'/api/v1',timeout:120000});
 /** 当前浏览器里保存的 LLM 会话（由「模型配置」写入）。
  *
@@ -22,11 +23,63 @@ const uploadPrd=(files:File[])=>{
 export const prdApi={list:()=>api.get<Prd[]>('/prds').then(r=>r.data),get:(id:string)=>api.get<Prd&{content:string}>(`/prds/${id}`).then(r=>r.data),upload:(file:File)=>uploadPrd([file]),uploadMany:uploadPrd,update:(id:string,content:string)=>api.put<Prd>(`/prds/${id}`,{content}).then(r=>r.data),reanalyze:(id:string,body:any={})=>api.post(`/prds/${id}/reanalyze`,body).then(r=>r.data)};
 export const runApi={list:()=>api.get<Run[]>('/runs').then(r=>r.data),get:(id:string)=>api.get<Run>(`/runs/${id}`).then(r=>r.data),create:(body:any)=>api.post<Run>('/runs',body).then(r=>r.data),events:(id:string)=>api.get<any[]>(`/runs/${id}/events`).then(r=>r.data),saveDraft:(id:string,stage:Stage,body:any)=>api.put(`/runs/${id}/stages/${stage}`,body).then(r=>r.data),approve:(id:string,stage:Stage)=>api.post(`/runs/${id}/stages/${stage}/approve`,{sessionId:sid()}).then(r=>r.data),reject:(id:string,stage:Stage,reason:string)=>api.post(`/runs/${id}/stages/${stage}/reject`,{reason}).then(r=>r.data),resume:(id:string)=>api.post(`/runs/${id}/resume`,{sessionId:sid()}).then(r=>r.data),cancel:(id:string)=>api.post(`/runs/${id}/cancel`).then(r=>r.data),retryModule:(id:string,module:string)=>api.post(`/runs/${id}/modules/${module}/retry`,{sessionId:sid()}).then(r=>r.data),regenerateStage:(id:string,stage:Stage)=>api.post(`/runs/${id}/stages/${stage}/regenerate`,{sessionId:sid()}).then(r=>r.data),artifacts:(id:string)=>api.get(`/runs/${id}/artifacts`).then(r=>r.data),artifact:(id:string,path:string)=>api.get(`/runs/${id}/artifacts/${path}`).then(r=>r.data)};
 /** 导出选项：文件名与 XMind 粒度由用户决定（此前是固定文件名 + 强制直接下载）。 */
-export interface ExportOptions { filename?:string; xmindMode?:'case'|'full'|'module'; sheetName?:string; }
-/** 导出文件的默认名（含日期，便于同一天多次导出时不互相覆盖）。 */
-export function defaultExportName(product:string,version:string,fmt:'excel'|'xmind',when=new Date()):string{
+export interface ExportOptions {
+  filename?:string; xmindMode?:'case'|'full'|'module'; sheetName?:string;
+  selection?:CaseSelection;
+}
+/** 把选择条件转成查询参数（数组用重复键，与服务端 `List[str]` 对齐）。
+ *  空维度**不发送** —— 发送空数组会被解析成「空集合」，
+ *  语义上等于「什么都不要」，而不是「该维度不限」。 */
+function selectionParams(selection?:CaseSelection):Record<string,any>{
+  const out:Record<string,any>={};
+  if(!selection)return out;
+  if(selection.modules?.length)out.modules=selection.modules;
+  if(selection.priorities?.length)out.priorities=selection.priorities;
+  if(selection.tags?.length)out.tags=selection.tags;
+  const keyword=selection.keyword?.trim();
+  if(keyword)out.keyword=keyword;
+  return out;
+}
+
+/** 用例分面统计（工作台批量选择用）。
+ *  `ignore` 指定统计哪个维度时忽略它自身的条件 —— 否则选定某维度后，
+ *  该维度的候选会塌缩成已选项，用户无法比较「换个条件会剩多少条」。 */
+export async function fetchFacets(id:string,selection:CaseSelection,ignore?:string):Promise<CaseFacets>{
+  const response=await api.get(`/runs/${encodeURIComponent(id)}/cases/facets`,{
+    params:{...selectionParams(selection),ignore:ignore||undefined},
+  });
+  return response.data as CaseFacets;
+}
+/** 选择条件 → 文件名片段（与服务端 `CaseFilter.name_suffix` 同构）。 */
+export function selectionSuffix(selection?:CaseSelection):string{
+  if(!selection||!selectionActive(selection))return '';
+  const parts:string[]=[];
+  if(selection.modules.length)parts.push(selection.modules.join('-'));
+  if(selection.priorities.length)parts.push(selection.priorities.join('-'));
+  if(selection.tags.length)parts.push(selection.tags.map(t=>t.replace(/^@/,'')).join('-'));
+  const keyword=selection.keyword.trim();
+  if(keyword)parts.push(keyword);
+  return parts.filter(Boolean).join('-').replace(/[<>:"/\\|?*]/g,'_').slice(0,60);
+}
+
+/** 选择条件 → 人类可读描述。 */
+export function selectionLabel(selection?:CaseSelection):string{
+  if(!selection||!selectionActive(selection))return '全部用例';
+  const parts:string[]=[];
+  if(selection.modules.length)parts.push(`模块=${selection.modules.join(',')}`);
+  if(selection.priorities.length)parts.push(`优先级=${selection.priorities.join(',')}`);
+  if(selection.tags.length)parts.push(`标签=${selection.tags.join(',')}`);
+  const keyword=selection.keyword.trim();
+  if(keyword)parts.push(`关键词=${keyword}`);
+  return parts.join('；');
+}
+
+/** 导出文件的默认名（含日期与筛选描述，便于同一天多次导出时不互相覆盖）。 */
+export function defaultExportName(product:string,version:string,fmt:'excel'|'xmind',
+                                  when=new Date(),selection?:CaseSelection):string{
   const stamp=`${when.getFullYear()}${String(when.getMonth()+1).padStart(2,'0')}${String(when.getDate()).padStart(2,'0')}`;
-  const base=[product,version,'用例集'].filter(Boolean).join('-')||'用例集';
+  const scope=selectionSuffix(selection);
+  const base=[product,version,'用例集',scope].filter(Boolean).join('-')||'用例集';
   return `${base}-${stamp}.${fmt==='excel'?'xlsx':'xmind'}`;
 }
 
@@ -36,7 +89,8 @@ export function defaultExportName(product:string,version:string,fmt:'excel'|'xmi
 export async function fetchExport(id:string,fmt:'excel'|'xmind',options:ExportOptions={}):Promise<Blob>{
   const response=await api.get(`/exports/${encodeURIComponent(id)}/${fmt}`,{
     responseType:'blob',
-    params:{filename:options.filename||undefined,xmind_mode:options.xmindMode||undefined,sheet_name:options.sheetName||undefined},
+    params:{filename:options.filename||undefined,xmind_mode:options.xmindMode||undefined,
+            sheet_name:options.sheetName||undefined,...selectionParams(options.selection)},
   });
   return response.data as Blob;
 }

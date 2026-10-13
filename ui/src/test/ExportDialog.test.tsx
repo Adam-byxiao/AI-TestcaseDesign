@@ -30,6 +30,46 @@ describe('导出流程',()=>{
       .toBe('用例集-20261013.xmind');
   });
 
+  it('默认文件名带上筛选片段（避免不同筛选互相覆盖）',()=>{
+    const selection={modules:['KB'],priorities:['P0'],tags:[],keyword:''};
+    const name=defaultExportName('PRD','v0.1','excel',new Date('2026-10-13T00:00:00'),selection);
+    expect(name).toBe('PRD-v0.1-用例集-KB-P0-20261013.xlsx');
+  });
+
+  it('对话框显示导出范围：无筛选时说明为全部用例',async()=>{
+    render(<ExportDialog open runId="run-1" product="P" version="v1" onClose={()=>{}}/>);
+    expect(screen.getByText('全部用例')).toBeInTheDocument();
+    expect(screen.getByText(/导出全部用例/)).toBeInTheDocument();
+  });
+
+  it('有筛选时显示条件与「按子集重算」说明',async()=>{
+    const selection={modules:['KB'],priorities:[],tags:['@smoke'],keyword:''};
+    render(<ExportDialog open runId="run-1" product="P" version="v1" selection={selection}
+      onClose={()=>{}}/>);
+    expect(screen.getByText('模块=KB；标签=@smoke')).toBeInTheDocument();
+    expect(screen.getByText(/统计与需求覆盖会按该子集重算/)).toBeInTheDocument();
+  });
+
+  it('导出请求带上筛选条件（数组以重复键发送）',async()=>{
+    // **核心回归**：筛选必须真的到达后端 —— 否则「只导出 P0」只是 UI 假象。
+    const selection={modules:['KB','AGENT'],priorities:['P0'],tags:['@smoke'],keyword:'上传'};
+    render(<ExportDialog open runId="run-1" product="P" version="v1" selection={selection}
+      onClose={()=>{}}/>);
+    fireEvent.click(screen.getByRole('button',{name:/选择位置并保存/}));
+    await waitFor(()=>expect(fetchExport).toHaveBeenCalledWith('run-1','excel',
+      expect.objectContaining({selection})));
+  });
+
+  it('空筛选不发送空数组（空集合语义 ≠ 该维度不限）',async()=>{
+    const selection={modules:[],priorities:[],tags:[],keyword:''};
+    render(<ExportDialog open runId="run-1" product="P" version="v1" selection={selection}
+      onClose={()=>{}}/>);
+    fireEvent.click(screen.getByRole('button',{name:/选择位置并保存/}));
+    await waitFor(()=>expect(fetchExport).toHaveBeenCalled());
+    const options=vi.mocked(fetchExport).mock.calls[0][2] as any;
+    expect(options.selection.modules).toEqual([]);
+  });
+
   it('对话框可改文件名，并据此命名下载',async()=>{
     render(<ExportDialog open runId="run-1" product="PRD" version="v0.1" onClose={()=>{}}/>);
     const input=screen.getByPlaceholderText(/用例集/) as HTMLInputElement;

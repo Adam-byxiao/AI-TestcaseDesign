@@ -166,10 +166,34 @@ class WorkspaceStore:
         if path != self.root and self.root not in path.parents: raise ValueError("路径超出工作区")
         return path
     def _json(self, path: Path, default=None):
-        # 读取同样要加锁：心跳/进度线程在写 task.json 与事件文件时，
-        # 无锁读会在 Windows 上撞上 os.replace 而抛 PermissionError
-        with self._lock:
-            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else (default if default is not None else {})
+        """读取 JSON，**对 Windows 上的瞬时占用重试**。
+
+        为什么读到一半也会失败：`io.atomic_write_text` 用 `os.replace` 原子替换，
+        而 Windows 在**目标文件正被打开或正被替换**时会让**读方**也拿到
+        `PermissionError`（共享冲突）。写方的重试救不了读方 ——
+        实测 GET /runs/{id} 在运行中偶发 500，帧落在本函数的 `read_text`。
+
+        产物文件（run-manifest.json 等）由 pipeline 直接写入、**不经过本 store 的锁**，
+        因此锁也无法消除该竞态。这里对「文件正在被替换」这一**合法瞬时状态**重试，
+        与 `atomic_write_text` 的重试策略保持一致的时长量级。
+        """
+        last_error: Exception | None = None
+        fallback = default if default is not None else {}
+        for attempt in range(6):
+            try:
+                with self._lock:
+                    if not path.exists():
+                        return fallback
+                    return json.loads(path.read_text(encoding="utf-8"))
+            except PermissionError as exc:      # 文件正被替换：稍后重读
+                last_error = exc
+                time.sleep(0.02 * (attempt + 1))
+            except (OSError, json.JSONDecodeError):
+                # 文件被删/内容损坏不是瞬时问题，直接按默认值处理
+                return fallback
+        # 重试仍失败：**返回默认值而不是抛错** ——
+        # 读不到某个辅助产物不应让整个请求 500（前端只少一块信息）。
+        return fallback
     def save_json(self, path: Path, data: dict):
         atomic_write_text(self._safe(path), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     def save_task(self, task_id: str, **values):
@@ -222,7 +246,7 @@ def _safe_address(value: str) -> str:
 def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc-workspace",
                max_workers: int = 2, ui_dir: str | Path | None = None):
     try:
-        from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
+        from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket
         from typing import List
         from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
     except ImportError as exc: raise RuntimeError("服务模式需要安装: pip install 'prd2tc[service]'") from exc
@@ -883,9 +907,46 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
                                 or "application/octet-stream", filename=target.name)
         return PlainTextResponse(target.read_text(encoding="utf-8"))
 
+    def _cases_for(run_id: str) -> tuple[Path, list[dict]]:
+        """取某运行的用例目录与全部用例（供筛选预览与导出共用）。"""
+        task = store.task(run_id)
+        if not task: raise HTTPException(404, "运行不存在")
+        output = _safe_output(task)
+        cases_dir = output / "cases" / "cases"
+        if not cases_dir.is_dir(): raise HTTPException(404, "该运行尚无用例产物")
+        from prd2tc.io import load_cases
+        return output, load_cases(cases_dir)
+
+    @app.get("/api/v1/runs/{run_id}/cases/facets")
+    def case_facets(run_id: str,
+                    modules: List[str] | None = Query(None),
+                    priorities: List[str] | None = Query(None),
+                    tags: List[str] | None = Query(None),
+                    keyword: str = "", ignore: str = ""):
+        """用例分面统计：各维度的可选值 + 当前条件下的实时数量。
+
+        `ignore` 指定统计哪个维度时忽略它自身的条件；传 `*` 表示
+        **每个维度各自忽略自身**（分面搜索的标准语义），前端一次请求即可取全。
+        否则选了「模块=KB」后，优先级列表只剩 KB 里的项，
+        用户看不到「切到 P0 还剩多少条」，无法做有意义的复合选择。
+        """
+        require_id(run_id, "runId")
+        from prd2tc import casefilter
+        _, cases = _cases_for(run_id)
+        if ignore and ignore not in {"*", "modules", "priorities", "tags"}:
+            raise HTTPException(400, f"ignore 取值非法: {ignore}")
+        spec = casefilter.make_filter(modules, priorities, tags, keyword)
+        result = casefilter.facets(cases, spec, ignore=ignore)
+        result["filter"] = casefilter.summarize(cases, spec)
+        return result
+
     @app.get("/api/v1/exports/{run_id}/{fmt}")
     def download_export(run_id: str, fmt: str, filename: str = "",
-                        xmind_mode: str = "case", sheet_name: str = "用例明细"):
+                        xmind_mode: str = "case", sheet_name: str = "用例明细",
+                        modules: List[str] | None = Query(None),
+                        priorities: List[str] | None = Query(None),
+                        tags: List[str] | None = Query(None),
+                        keyword: str = ""):
         """按需生成并返回导出文件（fmt: excel | xmind）。
 
         输出目录固定在运行产物内，不接受外部路径参数，因此无需 _safe 校验（无穿越面）。
@@ -895,20 +956,21 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         且 `../` 之类可能被某些客户端当作路径。故只保留基名、剔除控制字符，
         并强制使用该格式的正确扩展名。
         `xmind_mode`（case/full/module）与 `sheet_name` 让用户能控制导出的粒度与表名。
+        `modules`/`priorities`/`tags`/`keyword` 为**筛选条件**：维度内取并集、跨维度取交集
+        （见 `casefilter`），使导出可按模块、优先级、标签或其组合进行。
         """
         if fmt not in {"excel", "xmind"}: raise HTTPException(400, f"不支持的格式: {fmt}")
         if xmind_mode not in {"case", "full", "module"}:
             raise HTTPException(400, f"不支持的 xmind_mode: {xmind_mode}")
         require_id(run_id, "runId")
-        task = store.task(run_id)
-        if not task: raise HTTPException(404, "运行不存在")
-        output = _safe_output(task)
-        cases_dir = output / "cases" / "cases"
-        if not cases_dir.is_dir(): raise HTTPException(404, "该运行尚无用例产物")
+        from prd2tc import casefilter
         from prd2tc.export import export_cases, MEDIA_TYPES
+        output, _ = _cases_for(run_id)
+        spec = casefilter.make_filter(modules, priorities, tags, keyword)
         try:
-            result = export_cases(cases_dir=cases_dir, formats=[fmt], out=None, root=output,
-                                  xmind_mode=xmind_mode, sheet_name=sheet_name or "用例明细")
+            result = export_cases(cases_dir=output / "cases" / "cases", formats=[fmt],
+                                  out=None, root=output, xmind_mode=xmind_mode,
+                                  sheet_name=sheet_name or "用例明细", spec=spec)
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(400, format_exception(exc)) from exc
         path = Path(result["files"][0])

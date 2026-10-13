@@ -1,8 +1,10 @@
 import {useEffect,useMemo,useState} from 'react';
 import {Alert,Button,Form,Input,Modal,Radio,Space,Typography,message} from 'antd';
 import {DownloadOutlined,SaveOutlined} from '@ant-design/icons';
-import {canPickSaveLocation,defaultExportName,fetchExport,saveBlob} from '../api';
+import {canPickSaveLocation,defaultExportName,fetchExport,saveBlob,selectionLabel} from '../api';
 import type {ExportOptions} from '../api';
+import type {CaseSelection} from '../types';
+import {selectionActive} from '../types';
 
 /** 从错误响应的 Blob 里取出后端 detail。
  *
@@ -29,8 +31,9 @@ async function detailFromBlob(blob:Blob):Promise<string|undefined>{
  *  且**无法感知失败**（后端报错时浏览器会把错误页当成文件存下来）。
  *  现在改为「拉取 Blob → 另存为」，并在不支持该 API 的浏览器上回退为
  *  指定文件名的普通下载（仍比原先多出「可改名」这一项）。 */
-export default function ExportDialog({open,runId,product,version,onClose}:{
-  open:boolean; runId:string; product:string; version:string; onClose:()=>void;
+export default function ExportDialog({open,runId,product,version,onClose,selection}:{
+  open:boolean; runId:string; product:string; version:string;
+  selection?:CaseSelection; onClose:()=>void;
 }){
   const [fmt,setFmt]=useState<'excel'|'xmind'>('excel');
   const [filename,setFilename]=useState('');
@@ -38,21 +41,22 @@ export default function ExportDialog({open,runId,product,version,onClose}:{
   const [sheetName,setSheetName]=useState('用例明细');
   const [busy,setBusy]=useState(false);
 
-  // 每次打开都按当前格式重置默认名，避免上次的输入串到另一种格式上
-  useEffect(()=>{ if(open) setFilename(defaultExportName(product,version,fmt)); },[open,fmt,product,version]);
+  // 每次打开都按当前格式与筛选重置默认名，避免上次的输入串到这次
+  useEffect(()=>{ if(open) setFilename(defaultExportName(product,version,fmt,new Date(),selection)); },[open,fmt,product,version,selection]);
 
   const canPick=useMemo(()=>canPickSaveLocation(),[]);
   const extension=fmt==='excel'?'.xlsx':'.xmind';
+  const filtered=selectionActive(selection);
   // 用户可能只写主名；提交前补齐扩展名，避免存出无扩展名的文件
   const resolved=useMemo(()=>{
-    const name=filename.trim()||defaultExportName(product,version,fmt);
+    const name=filename.trim()||defaultExportName(product,version,fmt,new Date(),selection);
     return name.toLowerCase().endsWith(extension)?name:`${name}${extension}`;
-  },[filename,extension,fmt,product,version]);
+  },[filename,extension,fmt,product,version,selection]);
 
   const doExport=async()=>{
     setBusy(true);
     try{
-      const options:ExportOptions={filename:resolved,
+      const options:ExportOptions={filename:resolved,selection,
         xmindMode:fmt==='xmind'?xmindMode:undefined,
         sheetName:fmt==='excel'?sheetName:undefined};
       const blob=await fetchExport(runId,fmt,options);
@@ -78,13 +82,20 @@ export default function ExportDialog({open,runId,product,version,onClose}:{
     cancelText="取消" confirmLoading={busy} onOk={doExport}
     okButtonProps={{icon:canPick?<SaveOutlined/>:<DownloadOutlined/>}} width={520}>
     <Form layout="vertical" size="small">
+      <Form.Item label="导出范围" style={{marginBottom:12}}>
+        <Alert type={filtered?'info':'success'} showIcon
+          message={selectionLabel(selection)}
+          description={filtered
+            ? '仅导出命中的用例；统计与需求覆盖会按该子集重算。'
+            : '导出全部用例。可在运行页的「用例批量选择」中按模块/优先级/标签缩小范围。'}/>
+      </Form.Item>
       <Form.Item label="格式">
         <Radio.Group value={fmt} onChange={e=>setFmt(e.target.value)} optionType="button" buttonStyle="solid"
           options={[{value:'excel',label:'Excel 工作簿'},{value:'xmind',label:'XMind 思维导图'}]}/>
       </Form.Item>
       <Form.Item label="文件名" help={<span>将保存为 <Typography.Text code>{resolved}</Typography.Text></span>}>
         <Input value={filename} onChange={e=>setFilename(e.target.value)}
-          placeholder={defaultExportName(product,version,fmt)} allowClear/>
+          placeholder={defaultExportName(product,version,fmt,new Date(),selection)} allowClear/>
       </Form.Item>
       {fmt==='xmind'&&<Form.Item label="导图粒度" help="节点过多时系统会自动降级为「仅模块层」">
         <Radio.Group value={xmindMode} onChange={e=>setXmindMode(e.target.value)}

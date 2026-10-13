@@ -8,6 +8,7 @@ import json
 import warnings
 import zipfile
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 
@@ -461,3 +462,198 @@ def test_excel_sheets_deduplicated_when_name_collides(tmp_path):
         names = _re.findall(r'<sheet name="([^"]+)"', z.read("xl/workbook.xml").decode())
     joined = "|".join(names)
     assert "统计概览" in joined and "用例明细" in joined or len(names) >= 2, names
+
+
+# ---------- 筛选导出（模块 / 优先级 / 标签复合条件） ----------
+
+_FILTER_CASES = [
+    {"id": "TC-KB-001", "module": "KB", "title": "上传文档", "design_method": "场景法",
+     "priority": "P0", "tags": ["@smoke", "@regression", "@kb"],
+     "requirement": ["REQ-KB-001"],
+     "steps": [{"action": "goto", "target": "首页", "data": ""},
+               {"action": "expectVisible", "target": "上传区", "data": ""}],
+     "expected": ["上传成功并可查看"]},
+    {"id": "TC-KB-002", "module": "KB", "title": "按名称搜索", "design_method": "场景法",
+     "priority": "P1", "tags": ["@regression", "@kb"],
+     "requirement": ["REQ-KB-002"],
+     "steps": [{"action": "goto", "target": "首页", "data": ""},
+               {"action": "expectVisible", "target": "搜索框", "data": ""}],
+     "expected": ["搜索过滤生效"]},
+    {"id": "TC-AGENT-001", "module": "AGENT", "title": "页签切换", "design_method": "场景法",
+     "priority": "P0", "tags": ["@regression", "@agent"],
+     "requirement": ["REQ-AGENT-001"],
+     "steps": [{"action": "goto", "target": "首页", "data": ""},
+               {"action": "expectVisible", "target": "页签栏", "data": ""}],
+     "expected": ["三页签依次排列"]},
+]
+
+_FILTER_REQS = [
+    {"id": "REQ-KB-001", "module": "KB", "priority": "P0", "title": "上传"},
+    {"id": "REQ-KB-002", "module": "KB", "priority": "P1", "title": "搜索"},
+    {"id": "REQ-AGENT-001", "module": "AGENT", "priority": "P0", "title": "页签"},
+]
+
+
+def _write_filter_cases(tmp_path):
+    """写一批多模块/多优先级/多标签的用例，供筛选导出测试使用。"""
+    cases_dir = _write_cases(tmp_path, _FILTER_CASES)
+    analysis = cases_dir.parent.parent / "analysis"
+    analysis.mkdir(parents=True, exist_ok=True)
+    (analysis / "requirements.json").write_text(
+        json.dumps({"requirements": _FILTER_REQS}, ensure_ascii=False), encoding="utf-8")
+    return cases_dir
+
+
+def _sheet_xml(path):
+    with zipfile.ZipFile(path) as z:
+        return "".join(z.read(n).decode("utf-8")
+                       for n in z.namelist() if n.startswith("xl/worksheets/sheet"))
+
+
+def test_filtered_export_only_contains_matching_cases(tmp_path):
+    """**核心功能**：按筛选导出 —— 文件里只应有命中的用例。"""
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    result = export_cases(cases_dir, formats=["excel"], root=cases_dir.parent.parent,
+                          product="P", version="v1",
+                          spec=casefilter.make_filter(modules=["KB"], priorities=["P0"]))
+    assert result["case_count"] == 1
+    assert result["total_case_count"] == 3
+    assert result["filter"]["excluded"] == 2
+    assert "KB-P0" in Path(result["files"][0]).name, Path(result["files"][0]).name
+    blob = _sheet_xml(result["files"][0])
+    assert "TC-KB-001" in blob
+    assert "TC-KB-002" not in blob, "未命中的用例不得出现在导出文件里"
+    assert "TC-AGENT-001" not in blob
+
+
+def test_filtered_export_supports_module_plus_tag(tmp_path):
+    """**用户示例**：只导出指定单模块中的回归用例。"""
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    result = export_cases(cases_dir, formats=["excel"], root=cases_dir.parent.parent,
+                          spec=casefilter.make_filter(modules=["KB"], tags=["@regression"]))
+    assert result["case_count"] == 2
+    blob = _sheet_xml(result["files"][0])
+    assert "TC-KB-001" in blob and "TC-KB-002" in blob
+    assert "TC-AGENT-001" not in blob
+
+
+def test_filtered_export_by_smoke_and_by_priority(tmp_path):
+    """只导出 P0 / 只导出 smoke —— 两种都是常见诉求。"""
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    root = cases_dir.parent.parent
+    p0 = export_cases(cases_dir, formats=["excel"], root=root,
+                      spec=casefilter.make_filter(priorities=["P0"]))
+    assert p0["case_count"] == 2
+    smoke = export_cases(cases_dir, formats=["excel"], root=root,
+                         spec=casefilter.make_filter(tags=["@smoke"]))
+    assert smoke["case_count"] == 1
+    assert "TC-KB-001" in _sheet_xml(smoke["files"][0])
+
+
+def test_filtered_export_recomputes_traceability(tmp_path):
+    """**一致性**：筛选导出必须按**子集重算**追踪矩阵。
+
+    若沿用磁盘上的完整矩阵，Excel 的「需求覆盖」页会声称覆盖了
+    根本不在此文件里的用例 —— 两个 sheet 自相矛盾，且不会被任何人发现。
+
+    断言必须能**区分重算与沿用**：仅断言「需求行存在」不够（全量矩阵里也有）。
+    这里用覆盖状态判定 —— 磁盘矩阵谎称 KB 需求「已覆盖」，
+    而子集里根本没有 KB 用例，重算后应为「未覆盖」。
+    """
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    run_root = cases_dir.parent.parent
+    # 磁盘上放一份「全量」矩阵：所有需求都谎称已覆盖
+    (run_root / "cases" / "traceability.json").write_text(json.dumps({
+        "requirements": [{"id": r["id"], "module": r["module"], "priority": r["priority"],
+                          "status": "covered", "caseIds": []} for r in _FILTER_REQS],
+        "summary": {"covered": 3}}, ensure_ascii=False), encoding="utf-8")
+
+    result = export_cases(cases_dir, formats=["excel"], root=run_root,
+                          spec=casefilter.make_filter(modules=["AGENT"]))
+    assert result["case_count"] == 1
+    blob = _sheet_xml(result["files"][0])
+    assert "TC-AGENT-001" in blob
+    assert "TC-KB-001" not in blob
+    # 关键区分：KB 需求在子集里没有用例 → 必须显示为「未覆盖」，
+    # 而不是沿用磁盘矩阵谎称的「已覆盖」
+    assert "未覆盖" in blob, "筛掉的模块需求应显示为未覆盖（否则是沿用了全量矩阵）"
+    assert "REQ-KB-001" in blob
+
+
+def test_filtered_export_marks_scope_in_stats_sheet(tmp_path):
+    """统计页必须标注「这是子集」——否则读者会把局部数字当全量结论。"""
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    result = export_cases(cases_dir, formats=["excel"], root=cases_dir.parent.parent,
+                          spec=casefilter.make_filter(modules=["KB"]))
+    blob = _sheet_xml(result["files"][0])
+    assert "导出范围" in blob, "统计页应含导出范围标注"
+    assert "模块=KB" in blob
+
+
+def test_empty_filter_result_fails_loudly(tmp_path):
+    """**核心回归**：筛选后为空必须显式失败。
+
+    静默产出空文件会让用户以为「导出成功」，直到打开才发现没有内容
+    （而且筛选条件早已忘记）。
+    """
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    with pytest.raises(ValueError) as exc:
+        export_cases(cases_dir, formats=["excel"], root=cases_dir.parent.parent,
+                     spec=casefilter.make_filter(modules=["NOT_EXIST"]))
+    msg = str(exc.value)
+    assert "没有匹配的用例" in msg and "NOT_EXIST" in msg, msg
+
+
+def test_unfiltered_export_behavior_unchanged(tmp_path):
+    """不带筛选时行为不变（文件名、用例数、filtered 标记）。"""
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    result = export_cases(cases_dir, formats=["excel"], root=cases_dir.parent.parent,
+                          product="P", version="v1")
+    assert result["case_count"] == 3
+    assert result["filter"]["filtered"] is False
+    assert Path(result["files"][0]).name == "P-v1-用例集.xlsx"
+    # 无筛选时不应出现「导出范围」标注（避免噪声）
+    assert "导出范围" not in _sheet_xml(result["files"][0])
+
+
+def test_filtered_xmind_title_and_filename_reflect_filter(tmp_path):
+    """XMind 的标题与文件名也要反映筛选 —— 否则导图会被误认为全量。"""
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    result = export_cases(cases_dir, formats=["xmind"], root=cases_dir.parent.parent,
+                          product="P", version="v1",
+                          spec=casefilter.make_filter(tags=["@smoke"]))
+    name = Path(result["files"][0]).name
+    assert "smoke" in name, name
+    with zipfile.ZipFile(result["files"][0]) as z:
+        content = z.read("content.json").decode("utf-8")
+    assert "标签=@smoke" in content, "导图标题应标注筛选条件"
+    assert "TC-KB-002" not in content
+
+
+def test_filtered_export_is_deterministic(tmp_path):
+    """同筛选条件两次导出字节一致（可复现性契约）。"""
+    from prd2tc import casefilter
+    from prd2tc.export import export_cases
+    cases_dir = _write_filter_cases(tmp_path)
+    root = cases_dir.parent.parent
+    spec = casefilter.make_filter(modules=["KB"], priorities=["P0", "P1"])
+    first = export_cases(cases_dir, formats=["excel"], out=tmp_path / "a.xlsx",
+                         root=root, spec=spec)["files"][0].read_bytes()
+    second = export_cases(cases_dir, formats=["excel"], out=tmp_path / "b.xlsx",
+                          root=root, spec=spec)["files"][0].read_bytes()
+    assert first == second

@@ -595,6 +595,240 @@ def test_regenerate_rejects_bad_stage_and_running_run(client):
                        json={}).status_code == 409
 
 
+def _finished_run_with_cases(client, tmp_path):
+    """跑完三阶段、得到含用例的运行的辅助函数（供筛选/导出测试复用）。"""
+    sample = Path(__file__).parents[1] / "examples" / "sample-prd.md"
+    prd = client.post("/api/v1/prds", files={"file": ("sample-prd.md", sample.read_bytes(),
+                                                      "text/markdown")}).json()
+    run = client.post("/api/v1/runs", json={"prdId": prd["prdId"], "stub": True, "jobs": 1}).json()
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/analysis/approve", json={})
+    wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    client.post(f"/api/v1/runs/{run['taskId']}/stages/plan/approve", json={})
+    run = wait_for(client, run["taskId"], {"awaiting_review", "succeeded", "failed"})
+    return run["taskId"]
+
+
+def _seed_multi_module_cases(client, task_id: str):
+    """把多模块/多优先级/多标签的用例写入该运行的产物目录。
+
+    为什么不能只用 stub 产物：stub 的示例 PRD 只产出**一个模块**，
+    于是「按模块筛选」与「不筛选」无从区分 —— 变异测试曾因此漏报
+    （把端点里的筛选条件删掉，测试照样通过）。
+    """
+    root = Path(client.get(f"/api/v1/runs/{task_id}").json()["output"])
+    cases_dir = root / "cases" / "cases"
+    cases_dir.mkdir(parents=True, exist_ok=True)
+    for old in cases_dir.glob("*.json"):
+        old.unlink()
+    seeded = [
+        {"id": "TC-KB-001", "module": "KB", "title": "上传文档", "design_method": "场景法",
+         "priority": "P0", "tags": ["@smoke", "@regression", "@kb"],
+         "requirement": ["REQ-KB-001"], "preconditions": ["已登录"], "testData": [],
+         "steps": [{"action": "goto", "target": "首页", "data": ""},
+                   {"action": "expectVisible", "target": "上传区", "data": ""}],
+         "expected": ["上传成功并可查看"]},
+        {"id": "TC-KB-002", "module": "KB", "title": "按名称搜索", "design_method": "场景法",
+         "priority": "P1", "tags": ["@regression", "@kb"],
+         "requirement": ["REQ-KB-002"], "preconditions": ["已登录"], "testData": [],
+         "steps": [{"action": "goto", "target": "首页", "data": ""},
+                   {"action": "expectVisible", "target": "搜索框", "data": ""}],
+         "expected": ["搜索过滤生效"]},
+        {"id": "TC-AGENT-001", "module": "AGENT", "title": "页签切换", "design_method": "场景法",
+         "priority": "P0", "tags": ["@regression", "@agent"],
+         "requirement": ["REQ-AGENT-001"], "preconditions": ["已登录"], "testData": [],
+         "steps": [{"action": "goto", "target": "首页", "data": ""},
+                   {"action": "expectVisible", "target": "页签栏", "data": ""}],
+         "expected": ["三页签依次排列"]},
+    ]
+    (cases_dir / "SEED.json").write_text(
+        json.dumps({"schemaVersion": "2.0", "cases": seeded}, ensure_ascii=False),
+        encoding="utf-8")
+    return root
+
+
+def test_case_facets_reports_dimensions_and_counts(client, tmp_path):
+    """工作台批量选择需要分面统计：各维度有哪些取值、各多少条。"""
+    task_id = _finished_run_with_cases(client, tmp_path)
+    resp = client.get(f"/api/v1/runs/{task_id}/cases/facets")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total"] >= 1 and data["matched"] == data["total"]
+    assert data["modules"] and data["priorities"] and data["tags"]
+    # 分面计数之和应等于总数（每个用例恰属一个模块）
+    assert sum(m["count"] for m in data["modules"]) == data["total"]
+    assert data["filter"]["filtered"] is False
+
+
+def test_case_facets_applies_filter(client, tmp_path):
+    """**核心功能**：分面统计必须**应用**给定的筛选条件。
+
+    用多模块数据才能区分「筛选生效」与「忽略筛选」——
+    单模块时 `matched` 与各维度计数恰好相等，无从判断。
+    """
+    task_id = _finished_run_with_cases(client, tmp_path)
+    _seed_multi_module_cases(client, task_id)
+
+    all_facets = client.get(f"/api/v1/runs/{task_id}/cases/facets").json()
+    assert all_facets["total"] == 3 and all_facets["matched"] == 3
+    assert {m["value"] for m in all_facets["modules"]} == {"KB", "AGENT"}
+
+    filtered = client.get(f"/api/v1/runs/{task_id}/cases/facets",
+                          params={"modules": "KB"}).json()
+    # 命中数必须是子集（而不是仍等于全量）
+    assert filtered["matched"] == 2, filtered
+    assert filtered["total"] == 3
+    # 模块维度在**普通调用**下会被自身条件收窄为只剩 KB
+    assert {m["value"] for m in filtered["modules"]} == {"KB"}, filtered["modules"]
+    # 优先级被模块条件约束（KB 里是 P0 与 P1）
+    assert {p["value"] for p in filtered["priorities"]} == {"P0", "P1"}, filtered["priorities"]
+    assert filtered["filter"]["filtered"] is True
+
+
+def test_case_facets_wildcard_ignore_keeps_other_dimensions(client, tmp_path):
+    """**核心行为**：`ignore="*"` 让每个维度各自忽略自身，但其它维度仍生效。
+
+    这是 UI 实际使用的模式 —— 一次请求即可得到全部维度的可用候选。
+    """
+    task_id = _finished_run_with_cases(client, tmp_path)
+    _seed_multi_module_cases(client, task_id)
+
+    data = client.get(f"/api/v1/runs/{task_id}/cases/facets",
+                      params={"modules": "KB", "ignore": "*"}).json()
+    # 模块忽略自身 → AGENT 仍可见（否则候选塌缩成 KB，用户无法切换模块）
+    assert {m["value"] for m in data["modules"]} == {"KB", "AGENT"}, data["modules"]
+    # 优先级受 KB 约束（P0/P1 各 1）
+    assert {p["value"]: p["count"] for p in data["priorities"]} == {"P0": 1, "P1": 1}
+    # matched 仍是全条件结果
+    assert data["matched"] == 2
+
+
+def test_case_facets_rejects_invalid_ignore(client, tmp_path):
+    task_id = _finished_run_with_cases(client, tmp_path)
+    resp = client.get(f"/api/v1/runs/{task_id}/cases/facets", params={"ignore": "bogus"})
+    assert resp.status_code == 400, resp.text
+
+
+def test_case_facets_unknown_run_is_404(client):
+    assert client.get("/api/v1/runs/nonexistent-id/cases/facets").status_code == 404
+
+
+def test_export_respects_filter(client, tmp_path):
+    """**核心功能**：导出按筛选条件只输出命中的用例（多模块数据下验证）。"""
+    task_id = _finished_run_with_cases(client, tmp_path)
+    _seed_multi_module_cases(client, task_id)
+
+    resp = client.get(f"/api/v1/exports/{task_id}/excel", params={"modules": "KB"})
+    assert resp.status_code == 200, resp.text
+    import zipfile
+    from io import BytesIO
+    with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+        blob = "".join(zf.read(n).decode("utf-8")
+                       for n in zf.namelist() if n.startswith("xl/worksheets/sheet"))
+    assert "TC-KB-001" in blob and "TC-KB-002" in blob
+    assert "TC-AGENT-001" not in blob, "被筛掉的模块用例不得出现在导出文件里"
+    assert "导出范围" in blob, "筛选导出应在统计页标注范围"
+
+    # 复合条件：单模块中的回归用例
+    combo = client.get(f"/api/v1/exports/{task_id}/excel",
+                       params={"modules": "KB", "tags": "@smoke"})
+    assert combo.status_code == 200, combo.text
+    with zipfile.ZipFile(BytesIO(combo.content)) as zf:
+        combo_blob = "".join(zf.read(n).decode("utf-8")
+                            for n in zf.namelist() if n.startswith("xl/worksheets/sheet"))
+    assert "TC-KB-001" in combo_blob
+    assert "TC-KB-002" not in combo_blob    # P1 非 smoke
+    assert "TC-AGENT-001" not in combo_blob
+
+
+def test_export_with_empty_filter_result_is_400(client, tmp_path):
+    """筛选后为空必须给出可读的 400，而不是产出空文件。"""
+    task_id = _finished_run_with_cases(client, tmp_path)
+    resp = client.get(f"/api/v1/exports/{task_id}/excel",
+                      params={"modules": "NOT_EXIST_MODULE"})
+    assert resp.status_code == 400, resp.text
+    assert "没有匹配的用例" in resp.json()["detail"], resp.json()
+
+
+def test_export_filter_filename_reflects_selection(client, tmp_path):
+    """下载名应反映筛选 —— 否则不同筛选会互相覆盖同名文件。
+
+    筛选值从 facets 推导而非硬编码：stub 产出的优先级取决于优先级重判规则，
+    写死 P0 会让测试因「实际没有 P0」而失败（那是在测假设，不是测功能）。
+    """
+    task_id = _finished_run_with_cases(client, tmp_path)
+    facets = client.get(f"/api/v1/runs/{task_id}/cases/facets").json()
+    priority = facets["priorities"][0]["value"]
+    resp = client.get(f"/api/v1/exports/{task_id}/excel",
+                      params={"priorities": priority, "filename": "我的用例"})
+    assert resp.status_code == 200, resp.text
+    disposition = resp.headers["content-disposition"]
+    assert "我的用例.xlsx" in disposition or "%E6%88%91" in disposition, disposition
+
+
+def test_json_read_survives_concurrent_replace(client):
+    """**核心回归**：读取方必须在「文件正被原子替换」时重试，而不是抛错。
+
+    Windows 在目标文件正被替换时会让**读方**也拿到 `PermissionError`
+    （共享冲突）—— 写方（`io.atomic_write_text`）的重试救不了读方。
+    实测 GET /runs/{id} 在运行中偶发 500，帧落在 `WorkspaceStore._json` 的
+    `read_text`：产物文件由 pipeline 直接写、不经过 store 的锁，锁也挡不住。
+
+    这里用「前两次读抛 PermissionError、第三次成功」的替身精确复现该瞬时状态。
+    """
+    store = _store_of(client)
+    target = store.tasks / "probe.json"
+    store.save_json(target, {"ok": True, "value": 42})
+
+    calls = {"n": 0}
+    real_read = Path.read_text
+
+    def flaky_read(self, *args, **kwargs):
+        if self.name == "probe.json":
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "The process cannot access the file")
+        return real_read(self, *args, **kwargs)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(Path, "read_text", flaky_read)
+        data = store._json(target, None)
+    finally:
+        monkey.undo()
+
+    assert calls["n"] >= 3, "应发生重试"
+    assert data == {"ok": True, "value": 42}, data
+
+
+def test_json_read_returns_default_when_persistently_locked(client):
+    """重试仍失败时返回默认值 —— 读不到辅助产物不应让整个请求 500。"""
+    store = _store_of(client)
+    target = store.tasks / "locked.json"
+    store.save_json(target, {"ok": True})
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(Path, "read_text",
+                       lambda self, *a, **k: (_ for _ in ()).throw(
+                           PermissionError(13, "persistently locked")))
+        # 与原契约一致：default 为 None（未给出）时回退为 `{}`，
+        # 调用方靠 falsy 判断「不存在」（见 `store.task()`）。
+        assert store._json(target, None) == {}
+        assert store._json(target, {"fallback": True}) == {"fallback": True}
+    finally:
+        monkey.undo()
+
+
+def test_json_read_treats_missing_file_as_default(client):
+    """文件不存在时返回默认值（不重试、不抛错）—— 这是正常情况而非瞬时占用。"""
+    store = _store_of(client)
+    missing = store.tasks / "definitely-missing.json"
+    assert store._json(missing, None) == {}
+    assert store._json(missing, {}) == {}
+    assert store.task("definitely-missing") is None or store.task("definitely-missing") == {}
+
+
 def _workspace_of(client) -> Path:
     return _store_of(client).root
 

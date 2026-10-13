@@ -245,8 +245,15 @@ def build_traceability_rows(matrix: dict) -> list[list[str]]:
 
 
 def build_stats_rows(stats: dict) -> list[list[str]]:
-    """统计概览 → 表格行（对应 docs/export-excel-xmind.md §9.3）。"""
+    """统计概览 → 表格行（对应 docs/export-excel-xmind.md §9.3）。
+
+    `stats["scope"]` 存在时（筛选导出）置于**首行**：读者必须先知道
+    「这是子集」，否则会把局部数字误当全量结论。
+    """
     rows = [["统计维度", "分类", "数量"]]
+    scope = stats.get("scope")
+    if scope:
+        rows.append(["导出范围", str(scope), str(stats.get("total", 0))])
     rows.append(["总计", "全部用例", str(stats.get("total", 0))])
     labels = {"by_module": "按模块", "by_priority": "按优先级", "by_tag": "按标签"}
     for key, label in labels.items():
