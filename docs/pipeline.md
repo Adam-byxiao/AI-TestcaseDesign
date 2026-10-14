@@ -1,7 +1,7 @@
 # prd2tc 三阶段流水线详细设计
 
 > 基准：`prd2tc` 0.5.0。引用格式 `路径:行号`，行号以当前工作区源码为准。
-> 本文只讲**流水线行为**：阶段怎么做、产物怎么算数、失败怎么处置。字段级枚举与门禁条目清单另见 `docs/case-template.md`、`docs/prompt-gate-optimization.md`。
+> 本文只讲**流水线行为**：阶段怎么做、产物怎么算数、失败怎么处置。字段级规范见 `docs/case-spec.md`，门禁条目与提示词约束见 `docs/prompts-and-gates.md`。
 > 上帝视角的模块地图与设计决策见 `docs/architecture.md`。
 
 ---
@@ -645,7 +645,7 @@ prd2tc compare-runs output/p/v1 output/p/v2 [--out report.json] [--fail-on-drift
 | ② 机器门禁 | 程序化校验，返回错误清单 | `gates.py`、`validator.py`、`prototype.validate_targets` | 触发 ③ |
 | ③ 反馈重出 | 把错误清单回灌给模型修正，最多 `max_gate_retries` 次 | `stages.generate_with_feedback:1317-1405` | 仍不过 → 阶段/整轮失败（除非 `--allow-gate-fail`） |
 
-阶段 3 的门禁是「通用校验 + 契约校验」的组合闭包（`stages.py:912-945`）；阶段 1/2 直接传 `gates.check_*`（`stages.py:1188-1194`、`pipeline.py:421-425`）。逐条门禁清单、三层约束的分工与「示例必须过门禁」的一致性要求，见 `docs/prompts-and-gates.md`；约束登记表见 `docs/prompt-gate-optimization.md`（`validator.py:32` 要求改门禁时同步登记）。
+阶段 3 的门禁是「通用校验 + 契约校验」的组合闭包（`stages.py:912-945`）；阶段 1/2 直接传 `gates.check_*`（`stages.py:1188-1194`、`pipeline.py:421-425`）。逐条门禁清单、三层约束的分工与「示例必须过门禁」的一致性要求，见 `docs/prompts-and-gates.md`。
 
 ### 8.2 截断为什么无条件报错
 
@@ -782,4 +782,4 @@ if errors and not request.allow_gate_fail:
 3. **`task.json` 里 `request.stage` 与 `from_stage` 的关系**：服务层只用 `stage`（`service.py:306-309` 的 `require_stage` 只接受 `1/2/3/all`），因此 `--from-stage` 语义在服务路径上不可用；「重跑单阶段」是通过 `regenerate_stage` 丢弃下游产物来实现的（`service.py:803-854`）。这条我是从代码结构推断的，没有跑过服务端到端。
 4. **`manifest.json` 与 `run-manifest.json` 的主次定义在两个模块里相反**（`io.py:18-19` vs `artifacts.py:29-30`）。当前两者字节相同、读侧都有兜底，所以无功能影响；我没有构造「只写其一」的场景去验证。
 5. **阶段 2 与阶段 3 之间的复用边界**：`pipeline.py:410` 只在「阶段 3 也要跑且方案存在」时跳过阶段 2，但 `configHash` 并不包含 `plan_md` 的哈希，因此「方案文件被手工替换」这一情形不会被检测到（阶段 3 的检查点校验只查需求引用，不查方案一致性）。我未编写实验验证这一路径。
-6. **`tests/` 用例总数**：静态可数的 `def test_` 为 637 个（参数化会展开更多）；任务说明中的 663 个未在仓库内找到可直接核对的记录。前端 74 个用例与 `ui/src/test/` 中的 `it(`/`test(` 计数一致。
+6. **`tests/` 用例总数**：测试数量随回归用例变化，不能把历史计数写成固定基线；以当前执行 `pytest` 与 `npm test` 的输出为准。

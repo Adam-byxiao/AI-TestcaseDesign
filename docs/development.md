@@ -30,7 +30,7 @@ python -m pytest tests/test_gates.py::test_missing_section_is_reported -q
 - `[tool.pytest.ini_options] testpaths = ["tests"]`。需要 fastapi 的用例统一用 `pytest.importorskip("fastapi")` 自我保护（`tests/test_service_api.py:7`、`tests/test_realtime.py:8`），因此**未装 service extra 时后端测试仍能整体跑通**（跳过相关文件）。
 - 测试不读仓库外的 PRD：`tests/test_examples.py:12-13` 记录过"旧版指向仓库外 `PRD_File/`，导致新克隆者必失败"，现在端到端 fixture 全部用仓库内 `examples/sample-prd.md`。
 
-> 实测基线（在本仓库根目录）：`python -m pytest tests -q --collect-only` → **663 tests collected**，33 个测试文件。
+> 测试数量会随回归用例变化；不要把旧执行记录当作当前基线。以当前分支执行 `python -m pytest tests -q -p no:cacheprovider` 的结果为准。
 
 ### 1.2 前端
 
@@ -56,7 +56,7 @@ npm run build     # tsc -b && vite build → ui/dist
 - `environment: 'jsdom'` + `setupFiles: ['./src/test/setup.ts']`（提供 jest-dom 匹配器与 ResizeObserver 兜底）。
 - `testTimeout: 20000` / `hookTimeout: 20000`（默认 5s 的坑见 §4.5）。
 
-前端测试共 8 个文件 **74 个用例**（按各文件 `it(`/`test(` 计数）：`StageEditorPaging.test.tsx`(6) 分页后「详情/编辑」必须定位到被点的那一条（数据损坏级 bug，见 §3.1）；
+前端测试文件与用例数会随改动变化；运行 `npm test` 获取当前结果。现有覆盖包括：`StageEditorPaging.test.tsx`(6) 分页后「详情/编辑」必须定位到被点的那一条（数据损坏级 bug，见 §3.1）；
 `StageEditor.test.tsx`(4) 后台轮询不得覆盖正在编辑的内容；`StageSteps.test.tsx`(13) 三阶段独立步骤的状态流转；
 `StageStepsArtifact.test.tsx`(8) 「查看产物」的受控展开与滚动定位；`CaseFilterPanel.test.tsx`(13) 三维度筛选、实时数量、禁用但仍展示可选项；
 `ExportDialog.test.tsx`(20) 导出范围提示、文件名片段、按筛选导出；`PrdPage.test.tsx`(8) PRD 上传（含 antd 逐文件回调去重）与重新分析；
@@ -122,7 +122,7 @@ npm run build     # tsc -b && vite build → ui/dist
 
 `test_concurrency_defaults.py` —— `PRD2TC_JOBS` 生效且非法值回落 1；CLI `--jobs` 默认留空交由 Config 决定；服务体缺省时取 Config；显式值覆盖环境变量。
 `test_casefilter.py` —— 筛选语义「维度内 OR、跨维度 AND」、分面统计 `ignore`、确定性。
-`test_export.py` —— Excel/XMind 导出的可执行版规范（每条「回归 R-*」对应 `docs/export-excel-xmind.md` 修订记录中的一项修正）。
+`test_export.py` —— Excel/XMind 导出的可执行版规范（对应 `docs/export.md` 中的导出契约）。
 `test_nl_steps.py` —— 自然语言步骤渲染：**JSON 保留结构化**（门禁与自动化驱动用），**导出物用自然语言**（给人评审）。
 `test_llm_probe.py` —— 配置自检与错误透传：apiBase 填成官网地址 → 404 返回 HTML；`ValidationError` 只暴露「N 个校验问题」会丢失真实原因。
 `test_llm_providers.py` —— 三家 Provider 的**非流式**请求体与响应形状（即 `--repro` 走的路径）。
@@ -386,20 +386,13 @@ git status                                      # 确认没有把 .prd2tc-worksp
   `.gitignore:48-54` 用忽略清单落实这一点：
 
   ```
-  docs/developer-handoff.md        # 开发交接说明
-  docs/development-evolution.md    # 演进记录
-  docs/gate-troubleshooting.md     # 门禁排障手册（在 README 里被引用，但被忽略 → 见下方注意）
-  docs/reproducibility.md          # 可复现性
-  docs/token-optimization.md       # token 优化
+  （历史过程文档与临时排障记录不作为公开文档链接）
   ```
 
-- 公开、长期有效的文档正常上传：`docs/pipeline.md`、`docs/case-template.md`、
-  `docs/export-excel-xmind.md`、`docs/prototype-truth-gap.md`、`docs/prd-image-analysis.md`、
-  `docs/prompt-gate-optimization.md`，以及本文与 `docs/operations.md`。
+- 当前公开、长期有效的开发文档包括 `docs/pipeline.md`、`docs/case-spec.md`、
+  `docs/export.md`、`docs/ingestion.md`、`docs/prompts-and-gates.md`、本文与 `docs/operations.md`。
 
-> ⚠ 注意：`README.md:255` 与 `.gitignore:52` 之间存在冲突 —— README 引用
-> `docs/gate-troubleshooting.md` 作为"门禁失败处理手册"，但该文件在忽略清单里（本地有、不开源上传）。
-> 发开源版本前需要决定：把它移出忽略清单，还是改掉 README 的引用。
+> 被忽略或不存在的历史文档不得继续出现在公开文档索引；门禁说明以 `docs/prompts-and-gates.md` 和 `docs/operations.md` 为准。
 
 ### 6.2 提示词改动后必须同步 assets 副本
 
@@ -427,11 +420,8 @@ python scripts/sync_prompts.py --check   # 只检查（CI 用），不一致则�
 
 文档里出现的枚举（动作词表、优先级、模块码、配置默认值）**必须与代码同源**：
 
-- 动作词表：唯一权威是 `actions.ACTION_SPECS`，提示词文本由 `render_actions_for_prompt()` **生成**，不再手写
-  （`actions.py:19-23`）。`docs/case-template.md` 与 `prompts/04-case-constraints.md` 里手写的旧枚举已在
-  `6799acf` 中清理。**新文档不要手抄枚举**，用"见 `actions.py`"或让代码生成。
-- 配置默认值：以 `config.py` / `stages.py` 为准。已知历史文档不一致：`README.md:222` 与
-  `docs/prompt-gate-optimization.md:248` 写阶段 3 温度为 `0.5`，而代码是 `0.3`（`stages.py:56`）。
+- 动作词表：唯一权威是 `actions.ACTION_SPECS`，提示词文本由 `render_actions_for_prompt()` **生成**。**新文档不要手抄枚举**，用"见 `actions.py`"或让代码生成。
+- 配置默认值：以 `config.py` / `stages.py` 为准；会话级配置还需检查服务层如何覆盖分阶段配置。
 
 ## 7. 新增能力的检查清单
 
@@ -457,7 +447,7 @@ python scripts/sync_prompts.py --check   # 只检查（CI 用），不一致则�
 3. 提示词 → **不需要手改**（`render_actions_for_prompt()` 自动生成），但要跑 `sync_prompts.py --check` 确认副本一致。
 4. 断言类额外确认 → 「每条用例至少一个断言」门禁会把它算进去（`actions.is_assertion`）。
 5. 单测 → `tests/test_actions.py`：存在性、分组、是否出现在注入文本里、`needs_data` 语义。
-6. 文档 → `docs/case-template.md`（若其中列了动作，改为引用而非手抄）。
+6. 文档 → `docs/case-spec.md`（若其中列了动作，改为引用而非手抄）。
 7. **变异** → 退回旧词表，必须被捕获。
 
 ### 7.3 加一个**导出格式**
@@ -467,11 +457,11 @@ python scripts/sync_prompts.py --check   # 只检查（CI 用），不一致则�
 2. 接线 → `src/prd2tc/export/__init__.py`：加进 `MEDIA_TYPES`、`__all__`、`export_cases` 的 `formats` 分支（含 `--out` 后缀判定）。
 3. CLI → `src/prd2tc/cli.py` 的 `export` 子命令加进 `--format` choices。
 4. 服务下载 → `src/prd2tc/service.py`：`GET /api/v1/exports/{run_id}/{fmt}` 与 `_download_name` 的扩展名映射（`service.py:68-83`）。
-5. 确定性 → ZIP 时间戳与节点 id **必须确定性生成**，否则 `compare-runs` 会误报漂移（`docs/export-excel-xmind.md`）。
+5. 确定性 → ZIP 时间戳与节点 id **必须确定性生成**，否则 `compare-runs` 会误报漂移（`docs/export.md`）。
 6. 失败不阻断 → pipeline 里的导出必须包在**局部** `try/except` 里，降级为告警（`pipeline.py:504-514`）。
 7. 单测 → `tests/test_export.py`：按"回归 R-*"风格为每个已知缺陷留一条用例；并验证可被严格解析器读取。
 8. 筛选兼容 → 若支持筛选导出，必须**按子集重算**追踪矩阵并在统计页标注"这是子集"（`export/__init__.py:104-127`）。
-9. 文档 → `docs/export-excel-xmind.md` 与 `README.md` 的导出表。
+9. 文档 → `docs/export.md` 与 `README.md` 的导出表。
 
 ### 7.4 加一个**配置项**
 
@@ -488,8 +478,8 @@ python scripts/sync_prompts.py --check   # 只检查（CI 用），不一致则�
 
 ### 7.5 通用收尾
 
-1. `python -m pytest tests -q` 全绿（当前基线 **663**）。
-2. `cd ui && npm test` 全绿（当前基线 **74**）、`npm run build` 通过（动过前端时）。
+1. `python -m pytest tests -q` 全绿，数量以当前执行输出为准。
+2. `cd ui && npm test` 全绿、`npm run build` 通过（动过前端时）。
 3. `python scripts/sync_prompts.py --check`（动过 `prompts/` 时）。
 4. 变异测试：至少 2 项**已确认真实改变行为**的变异被捕获（§3.4）。
 5. 接线测试：新机制必须有"调用点/产物痕迹"断言，而不只有纯函数测试（§3.3）。

@@ -1,7 +1,7 @@
 # 用例字段与规则契约（case-spec.md）
 
 > 本文是 prd2tc **输出侧的唯一规范**：用例 JSON 字段、动作词表、`target` 写法、优先级与冒烟集判定、
-> 重复判定、追踪矩阵与导出渲染，均以本文为准。本文取代原 `case-template.md`（其有效内容已并入并按代码复核）。
+> 重复判定、追踪矩阵与导出渲染，均以本文为准。本文整合了历史用例字段说明，并按当前代码复核。
 > 文中 `路径:行号` 为核验过的当前行号，常量取值以代码为准；未能验证的结论在正文或附录 A 标注。
 
 | 契约面 | 单一事实源 | 消费者 |
@@ -160,7 +160,7 @@
 | **复选框勾选（唯一正确语义）** | **0** | — | — |
 
 > **41/47 = 87% 源于词表缺口**，仅 6 条是选错已有动作；评测 v2 的 23 次 `check` 中误用 21 次 = **91%**。
-> 来源：逐条枚举，见 [case-quality-fix-strategy.md](case-quality-fix-strategy.md) §2.1。
+> 来源：逐条枚举；评测方法与复核原则见 [quality-evaluation.md](quality-evaluation.md) §5.2–§5.3。
 
 **本次核验（统计真实产物的 `action` 频次）**：
 
@@ -223,7 +223,7 @@ v1 的 5 条无断言用例中 `TC-AGENT-013`、`TC-KHTEST-008` 靠「超时即�
 （`nlsteps.split_target` `nlsteps.py:80-85`；门禁侧同一识别在 `prototype.py:748-754`）——
 否则模型换个写法即可绕过校验。**无 UI 契约时只写中文元素名**，门禁不做契约校验；这是降级路径而非推荐路径：
 v1 在无契约条件下产出的 143 个标识符 **0 个真实**、7 种 URL 路径 **0 个存在**
-（[prototype-truth-gap.md](prototype-truth-gap.md)），target 全部不可执行。
+（相关背景见 [ingestion.md](ingestion.md)），target 全部不可执行。
 
 单页原型（`spec.has_url_routing` 为假）另有两条拦截（`prototype.py:755-771`）：`target` 里出现 `/xxx` 路径时报
 「原型是单页应用、不存在 URL 路由；`goto` 应使用页面键 [...]」；`goto` 的 `data` 以 `/` 开头或落在未知页面时报错。
@@ -289,7 +289,7 @@ v1 **5 条**（`TC-AGENT-011/013/017`、`TC-KHTEST-008`、`TC-SCENE-006`）、v2
 （实测 `['共3条']` 不报错）。**门槛取 8 是有意从严**：把「页面渲染」「合计归零」「跳转首页」这类 4~6 字短语挡在门外，
 要求预期写成完整可断言的句子并写明**可观测对象**（具体页面/元素/字段/状态/数值）；代价是实测 18 条真实样本
 **拦截率 38.9%**（含示例库 2 条），因此示例库、prompt 示例与文档必须同步改写，否则模型照抄示例即被拦，
-形成「示例 → 门禁 → 重试」死循环（[prompt-gate-optimization.md](prompt-gate-optimization.md) §4.3）。
+形成「示例 → 门禁 → 重试」死循环（见 [prompts-and-gates.md](prompts-and-gates.md) §6）。
 
 | 不合格（会被拒） | 合格 |
 | --- | --- |
@@ -623,6 +623,6 @@ excluded=0, coverageRate=100.0`，`unknownReferences=0`、`duplicateMappings=0`�
 - [prompts-and-gates.md](prompts-and-gates.md)：约束如何下发与回灌
 - [quality-evaluation.md](quality-evaluation.md)：评测方法与最近一次真实产物评分
 - [pipeline.md](pipeline.md)：三阶段流水线与产物目录
-- [export-excel-xmind.md](export-excel-xmind.md)：Excel / XMind 导出的字段映射与 OOXML 细节
-- [prototype-truth-gap.md](prototype-truth-gap.md)：无 UI 契约时的编造代价（143/143、501 处错误）
-- [prompt-gate-optimization.md](prompt-gate-optimization.md)：门禁常量（`_MIN_EXPECTED_LEN` 等）的取值推导
+- [export.md](export.md)：Excel / XMind 导出的字段映射与 OOXML 细节
+- [ingestion.md](ingestion.md)：输入分流、原型与图片处理
+- [prompts-and-gates.md](prompts-and-gates.md)：门禁常量与提示词约束

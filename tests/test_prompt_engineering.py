@@ -23,7 +23,7 @@ class _CaptureLLM:
 
 
 def _cfg() -> Config:
-    return Config(api_key="k", api_base="https://x", model="m", temperature=0.4, timeout=10, max_retries=1)
+    return Config(api_key="k", api_base="https://x", model="m", temperature=0.4, timeout=10, max_retries=1, stage_temperatures=(0.2, 0.3, 0.3))
 
 
 def test_inputs_wrapped_in_delimiters():

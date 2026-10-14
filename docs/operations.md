@@ -81,7 +81,6 @@ batch  = max(1, min(budget ÷ TOKENS_PER_REQ_EST, CASE_BATCH_CAP, 模块需求�
 | 2 测试方案 | `0.3` | `PRD2TC_TEMP_S2` → `PRD2TC_TEMPERATURE` → `0.3` |
 | 3 用例生成 | `0.3` | `PRD2TC_TEMP_S3` → `PRD2TC_TEMPERATURE` → `0.3` |
 
-> ⚠ 未验证/已知不一致：`README.md:222` 与 `docs/prompt-gate-optimization.md:248` 仍写着阶段 3 为 `0.5`。
 > 源码与提交 `6799acf` 的说明是「阶段 3 与阶段 2 同为 0.3，不再用 0.5」（`stages.py:54-56`）。**以代码为准**。
 
 ### 1.4 长文档、缓存与中转

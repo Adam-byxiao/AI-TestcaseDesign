@@ -42,6 +42,7 @@ class Config:
     jobs: int = 1  # 默认并发批次数；CLI/服务未显式指定时生效（PRD2TC_JOBS）
     # Markdown 中转：让模型输出 Markdown 表格再由程序转 JSON，彻底规避嵌套转义崩坏
     markdown_transit: bool = False
+    stage_temperatures: tuple[float, float, float] | None = None
 
     def requires_api_key(self) -> bool:
         return self.provider in {"openai", "anthropic"}
@@ -64,11 +65,15 @@ class Config:
         configured_base = os.environ.get("PRD2TC_API_BASE")
         if provider == "openai":
             configured_base = configured_base or os.environ.get("OPENAI_BASE_URL")
+        scalar = float(os.environ.get("PRD2TC_TEMPERATURE", "0.4"))
+        stage_values = tuple(float(os.environ.get(f"PRD2TC_TEMP_S{i}", str(
+            scalar if "PRD2TC_TEMPERATURE" in os.environ else (0.2, 0.3, 0.3)[i - 1])))
+            for i in (1, 2, 3))
         return cls(
             api_key=api_key,
             api_base=(configured_base or default_base).rstrip("/"),
             model=os.environ.get("PRD2TC_MODEL", default_model),
-            temperature=float(os.environ.get("PRD2TC_TEMPERATURE", "0.4")),
+            temperature=scalar,
             timeout=int(os.environ.get("PRD2TC_TIMEOUT", "120")),
             max_retries=int(os.environ.get("PRD2TC_MAX_RETRIES", "3")),
             chunk_size=int(os.environ.get("PRD2TC_CHUNK_SIZE", "6000")),
@@ -84,4 +89,5 @@ class Config:
             jobs=max(1, int(os.environ.get("PRD2TC_JOBS", "1") or 1)),
             markdown_transit=os.environ.get("PRD2TC_MARKDOWN_TRANSIT", "0").strip().lower()
             in {"1", "true", "yes", "on"},
+            stage_temperatures=stage_values,
         )

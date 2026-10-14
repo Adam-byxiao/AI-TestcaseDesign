@@ -103,10 +103,11 @@ def _prd_path(request, bundle) -> Path:
 
 
 class PipelineRunner:
-    def __init__(self, config: Config, *, llm=None):
+    def __init__(self, config: Config, *, llm=None, vision_llm=None):
         self.config = config
         self._custom_llm = llm is not None
         self.llm = llm or stages.chat_completion
+        self.vision_llm = vision_llm
         # 实时指标在构造期创建，服务层可在 generate() 进行中读取快照（用于 WS 推送）
         self.live = LiveMetrics(push_interval_ms=getattr(config, "stream_push_ms", 500))
         self.cancel_flag = CancelFlag()
@@ -159,6 +160,26 @@ class PipelineRunner:
         """
         if bundle is None:
             return None, []
+        retained = getattr(bundle, "prototype_assets", [])
+        if retained:
+            specs, metas = [], []
+            for asset in retained:
+                try:
+                    html = ingest.decode_text(asset.data)
+                    if not re.search(r"<(?:html|body|div|script)\b", html, re.I):
+                        raise ValueError(f"不是可识别的 HTML 原型: {asset.name}")
+                    spec = prototype.extract_ui_spec(html, source=asset.origin or asset.name)
+                except (ValueError, OSError) as exc:
+                    warnings.warn(f"原型无法解析，已跳过 {asset.name}: {exc}")
+                    continue
+                specs.append(spec)
+                metas.append({"name": asset.name, "path": asset.origin, "sha256": asset.sha256,
+                              "autoDetected": True, **spec.summary()})
+            if specs:
+                merged = prototype.merge_specs(specs)
+                atomic_write_text(root / "analysis/ui-spec.json", json.dumps(prototype.to_json(merged), ensure_ascii=False, indent=2) + "\n")
+                return merged, metas
+            return None, []
         paths: list[Path] = []
         seen: set[str] = set()
         for src in bundle.sources:
@@ -196,9 +217,9 @@ class PipelineRunner:
             spec = images.prepare_from_assets(
                 images_in, text=bundle.text,
                 allow_remote=bool(getattr(request, "fetch_images", False)),
-                cfg=self.config, vision_llm=llm,
+                cfg=self.config, vision_llm=self.vision_llm,
                 cache_dir=root / "analysis" / ".image-cache",
-                reporter=reporter,
+                reporter=reporter or (lambda message: warnings.warn(str(message))),
                 # stub 模式不做视觉调用（会打网络且无意义），但仍产出图片清单产物
                 analyze=not getattr(request, "stub", False),
             )
@@ -242,8 +263,6 @@ class PipelineRunner:
         # 陈旧检测拿到的永远是刚写入的新哈希，等于失效（实测踩到）。
         recorded_prd_hash = artifacts.read_manifest_hash(root)
         if not request.stub and not request.dry_run and self.config.requires_api_key() and not self.config.api_key: raise ValueError("未配置 LLM 凭证")
-        if not request.resume or request.force or (not (root / MANIFEST_NAME).exists() and not (root / LEGACY_MANIFEST_NAME).exists()):
-            init_output(root, product, version, str(path.resolve()))
         # 两个哈希各司其职（不可混用）：
         #   prdHash    = 正文文本哈希。**已发布契约** —— `cmd_diff` 用它判断
         #                「新 PRD 是否与历史运行同一份」，掺入资产指纹会让它永不匹配，
@@ -253,6 +272,22 @@ class PipelineRunner:
         prd_hash = hashlib.sha256(text.encode()).hexdigest()
         bundle_hash = bundle.fingerprint()
         input_hash = hashlib.sha256(f"{prd_hash}\x00{bundle_hash}".encode()).hexdigest()
+        if request.resume and not request.force and recorded_prd_hash and recorded_prd_hash != prd_hash:
+            raise ValueError("--resume 输入 PRD 与历史运行不一致；如确认覆盖请使用 --force")
+        # 在任何落盘动作前拒绝把当前 PRD 与既有上游产物混用；尤其不能先重写
+        # manifest 再报错，否则第二次尝试会因新哈希而绕过 stale 检查。
+        early_running = set(artifacts.stages_to_run(request.stage, getattr(request, "from_stage", "") or ""))
+        if root.exists() and not request.force:
+            for stage_key in early_running:
+                for artifact in artifacts.STAGE_INPUTS.get(stage_key, ()):
+                    if artifact.stage not in early_running:
+                        problems = artifacts.check_one(root, artifact, prd_hash=prd_hash,
+                                                      recorded_hash=recorded_prd_hash,
+                                                      allow_stale=bool(request.allow_stale_artifacts))
+                        if problems:
+                            raise ValueError(artifacts.format_problems(problems, stage_key))
+        if not (root / MANIFEST_NAME).exists() and not (root / LEGACY_MANIFEST_NAME).exists():
+            init_output(root, product, version, str(path.resolve()))
         # llm 提前确定：图片视觉分析需要它，而图片结论要参与随后的 configHash
         # （它只依赖 self.llm / self._custom_llm / request.stub，无副作用，可安全前移）
         llm = self.llm if self._custom_llm or not request.stub else stub_chat
@@ -267,7 +302,7 @@ class PipelineRunner:
         image_spec = None
         if request.analyze_images:
             image_spec = self._load_images(
-                bundle, root, request=request, llm=llm, reporter=lambda *_: None)
+                bundle, root, request=request, llm=llm)
         # 摄取留痕：让「正文与资产是从哪些文件来的」可追溯（含告警与内容指纹）
         if bundle.sources:
             try:
@@ -289,7 +324,8 @@ class PipelineRunner:
         prompt_meta = {}
         prompt_hashes = []
         for name in (stages.PROMPT_1, stages.PROMPT_2, stages.PROMPT_3,
-                     "prompts/00-testing-principles.md", "prompts/04-case-constraints.md"):
+                     "prompts/00-testing-principles.md", "prompts/04-case-constraints.md",
+                     "templates/test-plan.template.md", "templates/test-case.template.md"):
             value = loader.load_asset(name)
             digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
             match = re.search(r"prompt v[\d.]+", value)
@@ -312,7 +348,18 @@ class PipelineRunner:
             ).hexdigest() if image_spec is not None else None,
             # maxTokens 决定单次输出是否会被截断，会实质影响产物完整性：
             # 纳入 configHash，确保改变输出上限后不会复用「在上限更小时生成的」检查点。
-            "maxTokens": self.config.max_tokens},
+            "maxTokens": self.config.max_tokens,
+            "markdownTransit": getattr(self.config, "markdown_transit", False),
+            "apiBase": self.config.api_base,
+            "chunkSize": self.config.chunk_size,
+            "chunkOverlap": self.config.chunk_overlap,
+            "stageTemperatures": [stages.stage_temperature(i, self.config) for i in (1, 2, 3)],
+            "stub": request.stub, "noGate": request.no_gate,
+            "allowGateFail": request.allow_gate_fail,
+            "contextTopK": stages.CTX_TOP_K, "tokensPerReq": stages.TOKENS_PER_REQ_EST,
+            "batchCap": stages.CASE_BATCH_CAP, "outputBudget": stages.OUTPUT_BUDGET_RATIO,
+            "batchSize": stages._module_batch_size(self.config, 1000000),
+            "rulesRevision": "consistency-1"},
             sort_keys=True).encode("utf-8")).hexdigest()
         state_path = root / "run-state.json"
         old_state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
@@ -394,15 +441,18 @@ class PipelineRunner:
                     if problems:
                         raise ValueError(artifacts.format_problems(problems, stage_key))
             # `--resume` 时若三阶段全在计划内且产物齐全，则整段复用（跳过重跑）
-            resume_all = (can_resume and running_stages == set(artifacts.STAGE_ORDER)
-                          and analysis_path.exists() and req_path.exists())
-            if "1" in running_stages and not resume_all:
+            reuse_analysis = (can_resume and running_stages == set(artifacts.STAGE_ORDER)
+                          and artifacts.check_one(root, artifacts.ANALYSIS_MD) == []
+                          and artifacts.check_one(root, artifacts.REQUIREMENTS_JSON) == [])
+            reuse_plan = (can_resume and ("1" not in running_stages or reuse_analysis)
+                          and "3" in running_stages and artifacts.check_one(root, artifacts.PLAN_MD) == [])
+            if "1" in running_stages and not reuse_analysis:
                 live.set_stage("analysis"); metrics.bind(live, "analysis")
                 emit("stage_started", stage="analysis", percent=0)
                 started = time.perf_counter(); analysis, r1, errors = stages.generate_stage_1(self.config, text, llm=llm, examples=request.examples, jobs=request.jobs, use_gate=not (request.stub or request.no_gate), max_gate_retries=request.max_gate_retries, reporter=lambda *_: None, image_context=images.render_image_spec(image_spec) if image_spec else "")
                 reqs = stages.requirements_from_analysis(analysis, text); analysis = stages.align_analysis_ids(analysis, reqs)
                 write_stage(root, "analysis", analysis); save_requirements(req_path, reqs, stages.modules_from_analysis(analysis, reqs))
-                manifest_stage(root, "analysis", model=r1.model, tokens=r1.total_tokens, durationMs=round((time.perf_counter()-started)*1000,1), retries=r1.gate_retries, status="failed" if errors else "succeeded", gate={"errors": errors})
+                manifest_stage(root, "analysis", prdHash=prd_hash, model=r1.model, tokens=r1.total_tokens, durationMs=round((time.perf_counter()-started)*1000,1), retries=r1.gate_retries, status="failed" if errors else "succeeded", gate={"errors": errors})
                 live.finish_module("analysis", "failed" if errors else "done")
                 notify("analysis", 33)
                 if errors and not request.allow_gate_fail: return self._fail(result, errors)
@@ -410,7 +460,10 @@ class PipelineRunner:
                 if not analysis_path.exists(): raise FileNotFoundError(f"缺少阶段1产物: {analysis_path}")
                 analysis = analysis_path.read_text(encoding="utf-8"); reqs = load_requirements(req_path)
             plan_path = root / "plan" / "测试方案.md"
-            if "2" in running_stages and not (can_resume and "3" in running_stages and plan_path.exists()):
+            plan_input_hash = hashlib.sha256(json.dumps({"analysis": analysis, "requirements": reqs},
+                ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            reuse_plan = reuse_plan and old_state.get("planInputHash") == plan_input_hash
+            if "2" in running_stages and not reuse_plan:
                 live.set_stage("plan"); metrics.bind(live, "plan")
                 emit("stage_started", stage="plan", percent=33)
                 started = time.perf_counter()
@@ -427,7 +480,8 @@ class PipelineRunner:
                         label="阶段2 测试方案", system=stages.SYSTEM_ROLES[2],
                         temperature=stages.stage_temperature(2, self.config), reporter=lambda *_: None)
                 write_stage(root, "plan", plan)
-                manifest_stage(root, "plan", model=r2.model, tokens=r2.total_tokens,
+                update_run_state(root, planInputHash=plan_input_hash)
+                manifest_stage(root, "plan", prdHash=prd_hash, model=r2.model, tokens=r2.total_tokens,
                                durationMs=round((time.perf_counter()-started)*1000, 1),
                                retries=r2.gate_retries, status="failed" if errors else "succeeded",
                                gate={"errors": errors})
@@ -450,7 +504,13 @@ class PipelineRunner:
                          anchors=len(ui_spec.anchor_values()),
                          pages=[p["key"] for p in ui_spec.pages],
                          messages=len(ui_spec.messages))
-                started=time.perf_counter(); cdir=root/"cases"/".checkpoints"; lock=threading.Lock(); modules=dict(old_state.get("modules",{})) if can_resume else {}
+                upstream_hash = hashlib.sha256(json.dumps({"analysis": analysis, "requirements": reqs,
+                    "plan": plan}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+                reuse_cases = can_resume and old_state.get("casesInputHash") == upstream_hash
+                if "1" in running_stages and not reuse_analysis or "2" in running_stages and not reuse_plan:
+                    reuse_cases = False
+                update_run_state(root, casesInputHash=upstream_hash)
+                started=time.perf_counter(); cdir=root/"cases"/".checkpoints"; lock=threading.Lock(); modules=dict(old_state.get("modules",{})) if reuse_cases else {}
                 def status(m,s):
                     with lock: modules[m]=s; update_run_state(root,stage="cases",status="running",modules=dict(modules))
                     if s in {"failed"}:
@@ -460,7 +520,7 @@ class PipelineRunner:
                     emit("module_finished" if s in {"failed","skipped"} else "module_progress",
                          stage="cases", module=m, percent=66, state=s)
                 def load(m):
-                    p=cdir/f"{m}.json"; return normalize_cases(json.loads(p.read_text(encoding="utf-8"))) if can_resume and modules.get(m) in {"succeeded","skipped"} and p.exists() else None
+                    p=cdir/f"{m}.json"; return normalize_cases(json.loads(p.read_text(encoding="utf-8"))) if reuse_cases and modules.get(m) in {"succeeded","skipped"} and p.exists() else None
                 def save(m,c):
                     atomic_write_text(cdir/f"{m}.json",json.dumps(c,ensure_ascii=False,indent=2)+"\n"); status(m,"succeeded")
                 def fail_save(m,text):
@@ -522,6 +582,7 @@ class PipelineRunner:
                 from prd2tc.reproduce import run_fingerprint
                 atomic_write_text(root/"reproduce.json", json.dumps(run_fingerprint(root),ensure_ascii=False,indent=2)+"\n")
             except Exception: pass
+            update_manifest(root, artifacts=artifact_inventory(root))
             return result
         except BaseException as exc:
             detail = format_exception(exc)

@@ -19,7 +19,7 @@
 
 设计原则：**能被程序生成的，绝不手写**。动作枚举原先散落在 6 处
 （`actions.py:1-22` 列出：`schema.py`、`stages.py` 注入文本、
-`prompts/04-case-constraints.md`、`docs/case-template.md`、`docs/pipeline.md`、
+`prompts/04-case-constraints.md`、`docs/case-spec.md`、`docs/pipeline.md`、
 `scripts/orchestrate.mjs`），现已收敛为 `ACTION_SPECS` 单一事实源
 （`actions.py:69`），提示词文本由 `render_actions_for_prompt()`（`actions.py:91-101`）派生。
 `tests/test_actions.py:114-123` 断言静态 prompt 不得再出现手写的完整动作枚举串。
@@ -36,7 +36,7 @@
 | `templates/test-plan.template.md` | — | 方案排版骨架（7 章） | `build_stage_2_user()` | 阶段 2 指令区 |
 | `templates/test-case.template.md` | — | 人读评审稿模板 | 代码中**无引用** | — |
 
-`test-case.template.md` 自述「字段规范见 `docs/case-template.md`（JSON 为机读标准，
+`test-case.template.md` 自述「字段规范见 `docs/case-spec.md`（JSON 为机读标准，
 本模板用于人读评审）」，即不进入 prompt；它也未打包进 `assets/templates/`
 （该目录只有 `test-plan.template.md`）。
 
@@ -374,7 +374,7 @@ if ui_spec is not None and parsed:
 | 无效 URL 路由 | 7/7 | 0/7 |
 | 评测加权总分 | 69.8 | 88.9 |
 
-（来源：`docs/case-quality-evaluation-v3.md:27-38`；`docs/prototype-truth-gap.md:47-53`
+（来源：历史质量评测记录；当前机制见 [quality-evaluation.md](quality-evaluation.md) 与 [ingestion.md](ingestion.md)。
 记录 143 个标识符在原型中的命中数为 0。）
 
 ### 4.4 阶段 3 之后的门禁
@@ -526,7 +526,7 @@ return result.content, result, errors
 
 由来：`_MIN_EXPECTED_LEN` 曾取 5，而 `03-test-cases.md` 内嵌示例的 `expected`
 是「跳转首页」——**照抄示例必被拦**。当时在 18 条真实样本上的实测
-（`docs/prompt-gate-optimization.md:455-465`）：
+（历史评测记录，现行规则与代码同步维护于本文）：
 
 | 规则 | 拦截 | 拦截率 |
 |---|---:|---:|
@@ -643,7 +643,7 @@ return resources.files(PACKAGE).joinpath(ASSETS_DIR, relative).read_text(encodin
   "keywords":["登录","注册","手机号","密码","停用","账号"],
   "requirement":"该模块需求要点摘要…",
   "design_logic":"为什么这么设计（P0 必带 @smoke、反向给明确断言…）",
-  "cases":[{…与 case-template.md 字段一致的用例…}]}]
+  "cases":[{…与 case-spec.md 字段一致的用例…}]}]
 ```
 
 `design_logic` 是**唯一承载「为什么」的字段**，在三处被消费：

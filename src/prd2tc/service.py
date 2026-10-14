@@ -9,8 +9,10 @@ from prd2tc import __version__, stages
 from prd2tc import ingest
 from prd2tc.config import Config
 from prd2tc.export.common import atomic_write_bytes
-from prd2tc.io import (atomic_write_text, now_iso, save_cases, save_requirements,
-                       save_traceability, write_stage, render_cases_md)
+from prd2tc.export import export_cases
+from prd2tc.io import (artifact_inventory, atomic_write_text, now_iso, save_cases,
+                       save_requirements, save_traceability, update_manifest,
+                       write_stage, render_cases_md)
 from prd2tc.llm import LLMCancelled, probe_provider
 from prd2tc.pipeline import GenerateRequest, PipelineRunner
 from prd2tc.traceability import build_traceability, validate_traceability
@@ -342,7 +344,8 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         session = store.get_session(session_id) if session_id else None
         runner_config = base_config
         if session:
-            runner_config = replace(base_config, provider=session["provider"], model=session["model"], api_base=session["apiBase"], api_key=session.get("apiKey", ""), temperature=float(session.get("temperature", base_config.temperature)), timeout=int(session.get("timeout", base_config.timeout)))
+            session_temperature = float(session.get("temperature", base_config.temperature))
+            runner_config = replace(base_config, provider=session["provider"], model=session["model"], api_base=session["apiBase"], api_key=session.get("apiKey", ""), temperature=session_temperature, stage_temperatures=(session_temperature,) * 3, timeout=int(session.get("timeout", base_config.timeout)))
         try:
             current = stage_name(req.stage); task = store.task(task_id) or {}
             # 凭证前置校验：把「会话已过期」与「从未配置」区分开，并给出可操作提示。
@@ -646,7 +649,7 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         model = body.get("model") or defaults.model; api_base = (body.get("apiBase") or defaults.api_base).rstrip("/")
         candidate = replace(defaults, provider=provider, model=model, api_base=api_base,
                             api_key=str(body.get("apiKey", "") or ""),
-                            temperature=float(body.get("temperature", defaults.temperature) or defaults.temperature),
+                            temperature=(float(body["temperature"]) if "temperature" in body and body["temperature"] is not None else defaults.temperature),
                             timeout=int(body.get("timeout", defaults.timeout) or defaults.timeout))
         probe = probe_provider(candidate)
         if not probe.ok:
@@ -731,11 +734,12 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
         if stage == "analysis":
             markdown = content.get("markdown")
             requirements = content.get("requirements")
-            if markdown is not None: write_stage(output, "analysis", str(markdown))
             if requirements is not None:
                 if not isinstance(requirements, list) or any(not r.get("id") or not r.get("module") for r in requirements): raise HTTPException(400, "结构化需求缺少 id/module")
-                current_md = (output/"analysis"/"需求分析报告.md").read_text(encoding="utf-8")
+                current_md = (str(markdown) if markdown is not None else
+                               (output/"analysis"/"需求分析报告.md").read_text(encoding="utf-8"))
                 save_requirements(output/"analysis"/"requirements.json", requirements, stages.modules_from_analysis(current_md, requirements))
+            if markdown is not None: write_stage(output, "analysis", str(markdown))
         elif stage == "plan":
             if not isinstance(content.get("markdown"), str): raise HTTPException(400, "方案草稿缺少 markdown")
             write_stage(output, "plan", content["markdown"])
@@ -746,6 +750,11 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
             reqs=store._json(output/"analysis"/"requirements.json").get("requirements",[]); matrix=build_traceability(reqs,cases); errors += validate_traceability(matrix)
             if errors: raise HTTPException(400, errors)
             save_cases(output/"cases"/"cases",cases); save_traceability(output/"cases"/"traceability.json",matrix); write_stage(output,"cases",render_cases_md(cases))
+            manifest = store._json(output / "run-manifest.json", {}) or {}
+            export_cases(cases_dir=output / "cases" / "cases", formats=["excel", "xmind"],
+                         root=output, product=str(manifest.get("product", "")),
+                         version=str(manifest.get("version", "")))
+        update_manifest(output, artifacts=artifact_inventory(output))
 
     @app.post("/api/v1/runs/{run_id}/stages/{stage}/approve")
     def approve_stage(run_id: str, stage: str, body: dict | None = None):
@@ -827,8 +836,10 @@ def create_app(config: Config | None = None, *, state_dir: str | Path = ".prd2tc
                 # 用例产物分散在 cases/cases、检查点、失败样本与追踪矩阵
                 for rel in ("cases/cases", "cases/.checkpoints", "cases/.failures",
                             "cases/traceability.json", "cases/用例集.md",
-                            "cases/用例集.xlsx", "cases/用例集.xmind"):
+                            ):
                     discarded.extend(_discard(output / rel))
+                for exported in (output / "cases").glob("*用例集.*"):
+                    discarded.extend(_discard(exported))
             else:
                 discarded.extend(_discard(output / name))
         # 下游阶段状态与模块状态一并清空，避免 UI 显示「已确认」而产物已被丢弃

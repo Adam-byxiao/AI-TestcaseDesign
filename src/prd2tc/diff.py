@@ -52,7 +52,7 @@ def diff_requirements(old: list[dict], new: list[dict]) -> dict:
         previous = old_by_id.get(rid)
         if previous is not None:
             matched_old.add(rid)
-            if fingerprint(previous) == fingerprint(current):
+            if fingerprint(previous) == fingerprint(current) and _metadata(previous) == _metadata(current):
                 result["unchanged"].append({"id": rid, "reason": "id/fingerprint unchanged"})
             else:
                 result["modified"].append({"id": rid, "before": previous, "after": current, "reason": "same id, content changed"})
@@ -64,8 +64,12 @@ def diff_requirements(old: list[dict], new: list[dict]) -> dict:
         if same:
             stable_id = str(same.get("id"))
             matched_old.add(stable_id)
-            result["unchanged"].append({"id": stable_id, "incomingId": rid,
-                                        "reason": "semantic match; preserve previous id"})
+            if _metadata(same) == _metadata(current):
+                result["unchanged"].append({"id": stable_id, "incomingId": rid,
+                                            "reason": "semantic match; preserve previous id"})
+            else:
+                result["modified"].append({"id": stable_id, "incomingId": rid,
+                    "before": same, "after": current, "reason": "semantic match, metadata changed"})
         else:
             result["added"].append({"id": rid, "after": current, "reason": "new requirement"})
     for rid, previous in old_by_id.items():
@@ -73,6 +77,10 @@ def diff_requirements(old: list[dict], new: list[dict]) -> dict:
             result["removed"].append({"id": rid, "before": previous, "reason": "missing from new requirements"})
     result["summary"] = {k: len(result[k]) for k in ("added", "modified", "removed", "unchanged")}
     return result
+
+
+def _metadata(req: dict) -> tuple:
+    return req.get("priority", "P1"), bool(req.get("excluded", False))
 
 
 def merge_incremental_cases(old_cases: list[dict], new_cases: list[dict], diff: dict) -> dict:

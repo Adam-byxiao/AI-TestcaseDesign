@@ -116,14 +116,17 @@ def _check_one(root: Path, artifact: Artifact) -> list[Problem]:
 
     # 空/极小的文件（含纯空白）视为未产出 —— `exists()` 会漏掉这种情况
     substantial = [p for p in paths if p.stat().st_size >= artifact.min_bytes]
+    if artifact.kind == "markdown":
+        substantial = [p for p in substantial if p.read_text(encoding="utf-8").strip()]
     if not substantial:
         sizes = ", ".join(f"{p.name}={p.stat().st_size}B" for p in paths[:3])
         return [Problem(artifact, "empty",
                         f"产物为空或过小（{sizes}），小于下限 {artifact.min_bytes}B",
                         artifact.fix)]
 
-    if artifact.kind in ("json", "json_glob"):
-        target = substantial[0]
+    if len(substantial) != len(paths):
+        return [Problem(artifact, "empty", "部分模块产物为空或过小", artifact.fix)]
+    for target in substantial if artifact.kind in ("json", "json_glob") else []:
         try:
             data = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -168,6 +171,13 @@ def check_one(root: Path, artifact: Artifact, *, prd_hash: str = "",
     problems = _check_one(root, artifact)
     if problems or not prd_hash or allow_stale:
         return problems
+    # 每阶段各自保留来源：重跑 analysis 不代表旧 plan 已属于新 PRD。
+    for name in (MANIFEST_NAME, LEGACY_MANIFEST_NAME):
+        path = root / name
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            recorded_hash = data.get("stages", {}).get(STAGE_NAMES[artifact.stage], {}).get("prdHash") or recorded_hash
+            break
     if recorded_hash and recorded_hash != prd_hash:
         # 产物属于另一份 PRD：这是**静默错配**的典型来源 ——
         # 改了 PRD 却直接 `--stage 3`，会用旧方案生成与当前 PRD 不匹配的用例。

@@ -118,7 +118,7 @@ prd2tc generate --prd PRD.md --attach ./prototype.html
 | 路径 | 适用场景 | 入口 |
 |---|---|---|
 | **CLI** | 线上 / CI / 批量 | `prd2tc`（`src/prd2tc/cli.py`） |
-| **服务模式** | 团队共用、给前端提供 API | `uvicorn 'prd2tc.service:create_app' --factory` |
+| **服务模式** | 本机工作区 API，供本地工作台连接 | `uvicorn 'prd2tc.service:create_app' --factory` |
 | **工作台** | 需要人工审阅、逐步确认、批量筛选 | `cd ui && npm start` |
 
 三者**共用同一个编排内核**（`src/prd2tc/pipeline.py` 的 `PipelineRunner.generate()`）——
@@ -191,7 +191,7 @@ output/<product>/<version>/
 ├── plan/测试方案.md
 └── cases/
     ├── 用例集.md               # 评审稿（含自然语言步骤）
-    ├── 用例集.xlsx / .xmind    # 可分发产物
+    ├── <product>-<version>-用例集.xlsx / .xmind  # 可分发产物
     ├── traceability.json      # 需求 ↔ 用例映射与覆盖状态
     ├── cases/<MODULE>.json    # 机读用例（结构化步骤，供自动化消费）
     ├── .checkpoints/          # 模块级检查点（--resume 复用）
@@ -354,11 +354,10 @@ prd2tc generate --prd <prd> --examples examples/ --examples-k 3
 
 | 项 | 现状 |
 |---|---|
-| 后端测试 | **671 个用例全绿**（33 个测试文件） |
-| 前端测试 | **81 个用例全绿**（10 个文件，vitest + jsdom） |
-| 用例质量评测 | 五维加权 **88.9 / 100（B+）** —— 达到「可直接用于评审与执行」 |
-| 契约合规率 | **100%**（340 个 target 标注逐条按「种类 + 值」独立复算） |
-| 追溯完整性 | 需求覆盖 100%，未知引用 0，重复映射 0 |
+| 后端测试 | 当前结果以本机运行 `python -m pytest tests -q -p no:cacheprovider` 为准 |
+| 前端测试 | Vitest 测试位于 `ui/`；执行 `npm test` |
+| 前端构建 | 执行 `npm run build`，TypeScript 检查与 Vite 生产构建均需通过 |
+| 用例质量评测 | `quality-evaluation.md` 中的数据来自特定样本，不能视为所有 PRD 的质量保证 |
 
 测试方法论的两条硬要求（详见 [development.md](docs/development.md)）：
 
@@ -374,14 +373,14 @@ prd2tc generate --prd <prd> --examples examples/ --examples-k 3
 ## 开源
 
 - **License**：MIT
-- **依赖**：零第三方运行时依赖；仅需 Python 3.10+ 与一个 OpenAI 兼容（或 Anthropic / Ollama）端点
+- **依赖**：核心 CLI 零第三方运行时依赖；服务端需安装 `.[service]`，前端需 Node.js/npm；真实生成需可访问的模型端点
 - **目录结构**：
 
   ```
   src/prd2tc/           核心包（CLI / 编排 / 摄取 / 门禁 / 导出 / 服务）
   src/prd2tc/assets/    安装包内置的 prompts 与 templates 副本
   prompts/  templates/  提示词与模板（仓库内优先）
-  tests/                后端测试（33 个文件）
+  tests/                后端测试
   ui/                   React + antd 工作台（含前端测试）
   examples/             示例 PRD 与示例库
   docs/                 设计与使用文档

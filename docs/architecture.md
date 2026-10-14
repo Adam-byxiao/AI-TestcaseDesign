@@ -1,7 +1,7 @@
 # prd2tc 总体架构
 
 > 基准：`prd2tc` 0.5.0（`src/prd2tc/__init__.py:7`）。本文所有结论均来自本仓库源码与测试，引用格式为 `相对路径:行号`。
-> 规模：`src/prd2tc/` 下 **37 个 Python 模块**（含 `export/` 子包 4 个），合计 **10743 行**（其中非空行 9383 行）；后端测试 33 个文件，前端 `ui/src/test/` 下 74 个用例。
+> 规模数据会随代码与测试变化；测试数量以当前分支实际执行结果为准。本文重点描述模块边界与数据流，不把历史行数当作质量指标。
 > 阅读顺序建议：先看 §1 定位与 §3 数据流，再回看 §2 模块地图与 §4 设计决策。
 
 ---
@@ -445,7 +445,7 @@ LLM 采样本身不可字节复现，因此项目把「确定性」收敛到**�
 
 1. **加检查函数**：放进 `gates.py`（阶段级：`check_analysis`/`check_plan`/`check_cases_text`）或 `validator.py`（字段级，供 `validate_case` 与 `prd2tc validate` 共用）；
 2. **接线**：阶段 1/2 直接把 gate 传给 `generate_with_feedback`（`stages.py:1188-1194`、`pipeline.py:421-425`）；阶段 3 用闭包 `gate(...)` 组合「通用校验 + 原型契约校验」（`stages.py:912-945`）；
-3. **同源要求**：新增约束必须**同时**更新三处，否则会形成「示例→门禁→重试」的死循环：提示词/示例（`prompts/03-test-cases.md`、`field_spec:126-154`）、门禁实现、文档登记表。`validator.py:32` 明确要求「改门禁时需同步登记」到 `docs/prompt-gate-optimization.md` 的约束登记表；`validator.py:145-147` 与 `:43-47` 各记录了一次因「示例未同步」而造成的死循环事故；
+3. **同源要求**：新增约束必须**同时**更新提示词/示例（`prompts/03-test-cases.md`、`field_spec:126-154`）、门禁实现与 `docs/prompts-and-gates.md`，否则会形成「示例→门禁→重试」的死循环。`validator.py:145-147` 与 `:43-47` 各记录了一次因「示例未同步」而造成的死循环事故；
 4. **保底出口**：新增门禁若默认致命，需要确认 `--allow-gate-fail`（仅告警）与 `--no-gate`（完全关闭）语义仍然合理（`cli.py:294`、`pipeline.py:405`/`:433`/`:484`）。
 
 **反例（不要这样做）**：把「模型引用了本批之外的需求」做成致命门禁。它看起来是范围校验，实际上因为 `module_context` 携带整个模块的 PRD 原文，越界属于预期行为；且修复提示词若用模块级清单，模型照做即被判越界、重试永不收敛（livelock）。详见 `docs/pipeline.md` 的「4.5 越界引用为什么只记录、不拦截（livelock 事故）」与 `docs/prompts-and-gates.md` §5.4。门禁的逐条清单与三层约束分工见 `docs/prompts-and-gates.md`。
@@ -470,7 +470,7 @@ LLM 采样本身不可字节复现，因此项目把「确定性」收敛到**�
 | `test_ingest.py` / `test_images.py` / `test_prototype.py` | 格式嗅探内容优先、DOCX/PDF 抽取、图片关联置信度、原型契约校验 | 附件抢占正文；143 个编造标识符 |
 | `test_service_api.py` / `test_realtime.py` | 上传/任务/审阅/重跑/导出接口、WS 快照推送、取消语义 | 会话失效后静默退化为空凭证 |
 
-前端侧 `ui/src/test/` 有 74 个用例，覆盖阶段编辑分页、产物内容展示、筛选面板与导出对话框等交互契约（`ui/src/test/*.test.tsx`）。
+前端侧 `ui/src/test/` 覆盖阶段编辑分页、产物内容展示、筛选面板与导出对话框等交互契约（`ui/src/test/*.test.tsx`）；用例数量以 `npm test` 输出为准。
 
 ---
 
@@ -481,7 +481,7 @@ LLM 采样本身不可字节复现，因此项目把「确定性」收敛到**�
 | # | 现象 | 依据 | 影响 |
 | --- | --- | --- | --- |
 | 1 | 两个模块对清单文件的主次定义相反 | `io.py:18-19` vs `artifacts.py:29-30` | 当前无功能影响（文件内容相同、读侧兜底）；单写其一时会产生分歧 |
-| 2 | 文档断链 | `README.md:3` 指向 `docs/developer-handoff.md`、`README.md:255` 指向 `docs/gate-troubleshooting.md`、`src/prd2tc/reproduce.py:1` 指向 `docs/reproducibility.md`；这三个文件不在 `docs/` 下（`docs/` 下另有若干并行补充的文档，引用时以实际存在的文件为准） | 只是断链，不影响运行 |
+| 2 | 历史文档引用 | 旧版本曾引用已移除的补充文档；当前公开文档以 README 与 `docs/` 实际文件为准 | 不影响运行 |
 | 3 | `README.md` 的部分描述落后于代码 | `README.md:222` 写「阶段 1/2/3 默认 0.2/0.3/0.5」，代码为 `{1:0.2, 2:0.3, 3:0.3}`（`stages.py:56`）；`:182`、`:242` 仍写「P0 必带 `@smoke`」，而代码已改为「`@smoke` 只能是 P0 的**真子集**」（`validator.py:159-166`） | 文档误导；以代码为准 |
 | 4 | 产物层注释与实际阶段预算不一致 | `tests/test_long_doc.py:138-139` 注释写 `max_tokens=8192 → budget = int(8192*0.85)`，但断言用的是 `stages.OUTPUT_BUDGET_RATIO`（当前 0.60） | 注释过期，测试本身仍正确 |
 | 5 | `artifacts.check_inputs` 未被 pipeline 调用 | `pipeline.py:383-392` 自行遍历 `STAGE_INPUTS`，`check_inputs` 仅被测试使用 | 死代码风险：两条入口将来可能漂移 |

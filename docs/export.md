@@ -623,7 +623,7 @@ openpyxl（连带 lxml / et-xmlfile）意味着：安装体积与部署复杂度
    索引再查 `cellXfs`；`test_excel_warn_fill_used_for_uncovered` 断言未覆盖行真的用到
    `STYLE_WARN`。只断言「常量已定义」会放过「定义了但从未引用」的缺陷。
 
-已记录的验收数据：前文档（内容并入本文件的 `docs/export-excel-xmind.md`）记录真实 Excel 打开后
+已记录的验收数据：历史验收记录已并入本文，记录真实 Excel 打开后
 `verify.xlsx OPEN-OK sheets=3`，三页为 `用例明细 11×13 / 需求覆盖 11×6 / 统计概览 7×3`，内容完整、
 无修复弹窗；更早的 openpyxl 回读为 22 行 × 13 列，含冻结窗格与 `A1:M22` 筛选区。定位该缺陷的方法是
 「以 openpyxl 生成的文件为对照，构造 hybrid 文件逐 part 替换，二分 `Workbooks.Open` 成败」，

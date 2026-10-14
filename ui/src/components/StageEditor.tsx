@@ -57,7 +57,7 @@ export default function StageEditor({runId,stage,refreshToken,onDirtyChange,onDr
     // 轮询只为感知外部变化；带 keepEdits 以免冲掉用户正在输入的内容
     const timer=window.setInterval(()=>load({keepEdits:true}),5000);
     return()=>window.clearInterval(timer);
-  },[runId,stage]);
+  },[runId,stage,refreshToken]);
   /** 按**稳定标识**改字段（不是页内序号，见 keyOf 的说明）。 */
   const change=(key:string,field:string,value:any)=>{setRows(current=>current.map((row,i)=>keyOf(row,i)===key?{...row,[field]:value}:row));setDirty(true)};
   /** 草稿体：`approve` 可直接把它作为请求体提交（服务端 approve 会先存草稿再应用）。 */

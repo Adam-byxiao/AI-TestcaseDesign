@@ -63,8 +63,12 @@ def stage_temperature(stage: int, cfg: Config) -> float:
     """
     if getattr(cfg, "repro", False):
         return 0.0
-    raw = os.environ.get(f"PRD2TC_TEMP_S{stage}") or os.environ.get("PRD2TC_TEMPERATURE")
-    return float(raw) if raw else _DEFAULT_TEMP[stage]
+    configured = getattr(cfg, "stage_temperatures", None)
+    if configured is not None:
+        return float(configured[stage - 1])
+    # Config.temperature is the explicit API value. Keep legacy defaults only
+    # for configurations created without a stage tuple (older callers).
+    return float(cfg.temperature) if cfg.temperature is not None else _DEFAULT_TEMP[stage]
 
 
 def split_prompt(asset: str) -> tuple[str, str]:

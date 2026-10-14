@@ -133,6 +133,7 @@ class Bundle:
     # 被排除的参考资料（接口/服务文档）与原型：留痕以便追溯「为什么没被纳入」
     references: list = field(default_factory=list)  # [Source]
     prototypes: list = field(default_factory=list)  # [Source]
+    prototype_assets: list = field(default_factory=list)  # HTML 原始字节，兼容上传/ZIP
     include_references: bool = False     # 是否强制并入参考资料（逃生阀）
 
     def images(self) -> list:
@@ -815,6 +816,7 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
                 src.role = "prototype"
                 src.note = "原型（仅解析为 UI 契约，不进正文）"
                 prototypes.append(src)
+                bundle.prototype_assets.append(Asset(name=name, data=data, mime="text/html", origin=origin, role="prototype"))
             elif kind in (KIND_MARKDOWN, KIND_TEXT):
                 text = decode_text(data)
                 src.textChars = len(text)
@@ -884,6 +886,8 @@ def _assemble(items: list[tuple[str, bytes, str, int]], warns: list,
             warns.append(f"{name} 解析失败：{exc}")
         bundle.sources.append(src)
 
+    bundle.prototypes = prototypes
+    bundle.references = references
     if not texts:
         if assets:
             # 纯图片 PRD：正文留空，全部靠视觉证据 —— 这是合法的多模态输入

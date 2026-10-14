@@ -118,11 +118,18 @@ def save_cases(cases_dir: Path, cases: list[dict]) -> list[Path]:
         c = dict(source)
         c.setdefault("status", "active")
         by_module[c["module"]].append(c)
+    cases_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for mod in sorted(by_module):
         p = cases_dir / f"{mod}.json"
         atomic_write_text(p, json.dumps(envelope(by_module[mod]), ensure_ascii=False, indent=2) + "\n")
         paths.append(p)
+    # 用例目录是一个快照：替换生成结果时必须移除已经不存在的模块，
+    # 否则旧模块会被 load_cases 继续合并进正式产物。
+    active = {p.name for p in paths}
+    for stale in cases_dir.glob("*.json"):
+        if stale.name not in active:
+            stale.unlink()
     return paths
 
 

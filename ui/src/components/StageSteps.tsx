@@ -76,6 +76,7 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
    *  必须直接带上这里的内容。只上报 `dirty` 标志是不够的：那样父级拿不到内容，
    *  未保存的编辑会被静默丢弃（这正是此前的缺陷）。 */
   const [drafts,setDrafts]=useState<Record<string,any>>({});
+  const [refreshTokens,setRefreshTokens]=useState<Record<string,string>>({});
   /** 已展开产物面板的阶段。
    *
    *  **必须是受控状态**：Collapse 若不受控，「查看产物」按钮就无法从外部展开它 ——
@@ -117,6 +118,10 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
       .then((result:any)=>{
         const discarded=(result?.discarded||[]).length;
         message.success(`已开始重跑${discarded?`（丢弃 ${discarded} 项旧产物）`:''}`);
+        const downstream=STAGE_INFO.slice(STAGE_INFO.findIndex(info=>info.key===s)).map(info=>info.key);
+        setDrafts(current=>{const next={...current};downstream.forEach(key=>delete next[key]);return next;});
+        setDirty(current=>{const next={...current};downstream.forEach(key=>delete next[key]);return next;});
+        setRefreshTokens(current=>({...current,[s]:`${Date.now()}`}));
         return onRefresh();
       })
       .catch((error:any)=>message.error(error?.response?.data?.detail||'重跑失败'))
@@ -180,8 +185,9 @@ export default function StageSteps({run,stage,onStageChange,onRefresh}:{
             key:'artifact',
             label:phase==='failed'?'查看失败输出':'查看 / 编辑产物',
             children:<StageEditor runId={run.taskId} stage={info.key}
+              refreshToken={refreshTokens[info.key]}
               onDirtyChange={(value)=>setDirty(current=>({...current,[info.key]:value}))}
-              onDraftChange={(payload)=>setDrafts(current=>({...current,[info.key]:payload}))}/>,
+              onDraftChange={(payload)=>setDrafts(current=>{const next={...current};if(payload===undefined)delete next[info.key];else next[info.key]=payload;return next;})}/>,
           }]}/>}
       </Card>;
     })}
